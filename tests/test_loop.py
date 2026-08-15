@@ -107,6 +107,19 @@ def test_duplicate_call_id_is_provider_error_without_execution(tmp_path):
     assert events[0]["payload"]["accepted"] is False
 
 
+def test_reused_call_id_on_later_turn_is_provider_error(tmp_path):
+    executor = FakeExecutor([ShellResult("ok", "", 0, False)])
+    responses = [
+        ModelResponse(tool_calls=(ToolCall("same", "shell", {"command": "one"}),)),
+        ModelResponse(tool_calls=(ToolCall("same", "shell", {"command": "two"}),)),
+    ]
+
+    _, result = run_loop(tmp_path, responses, executor=executor)
+
+    assert result["status:reason"] == "error:provider_error"
+    assert executor.calls == [("one", 10)]
+
+
 def test_model_text_is_not_success(tmp_path):
     _, result = run_loop(tmp_path, [ModelResponse(content="Flag{ok}")])
 
