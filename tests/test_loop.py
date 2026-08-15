@@ -209,6 +209,34 @@ def test_wrong_flag_continues_and_correct_flag_short_circuits(tmp_path):
     assert result["flag_submissions"] == 2
     terminal = read_events(loop.artifacts.events_path)[-1]
     assert terminal["payload"]["unprocessed_call_ids"] == ["x"]
+    tool_results = [
+        message["result"] for message in loop.messages if message["role"] == "tool"
+    ]
+    assert tool_results[0] == {"outcome": "incorrect"}
+    assert tool_results[1]["stdout"] == "after wrong"
+    assert tool_results[2] == {"outcome": "correct"}
+    verifier_outcomes = [
+        event["payload"]["outcome"]
+        for event in read_events(loop.artifacts.events_path)
+        if event["type"] == "verifier_result"
+    ]
+    assert verifier_outcomes == ["incorrect", "correct"]
+
+
+def test_case_mismatched_candidate_does_not_solve(tmp_path):
+    loop, result = run_loop(
+        tmp_path,
+        [
+            ModelResponse(
+                tool_calls=(ToolCall("f", "submit_flag", {"candidate": "flag{ok}"}),)
+            ),
+            ModelResponse(content="stop"),
+        ],
+    )
+
+    assert result["status:reason"] == "unsolved:model_stop"
+    assert result["flag_submissions"] == 1
+    assert loop.messages[-2]["result"] == {"outcome": "incorrect"}
 
 
 def test_nonzero_and_timeout_are_normal_but_executor_failure_is_error(tmp_path):
