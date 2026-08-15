@@ -55,6 +55,41 @@ def test_normalization_preserves_upstream_truncation_for_short_output():
     assert logged.truncated is True
 
 
+def test_canonical_byte_boundaries_are_exact():
+    at_limit = truncate_utf8("a" * MODEL_TOOL_OUTPUT_BYTES, MODEL_TOOL_OUTPUT_BYTES)
+    assert at_limit == ("a" * MODEL_TOOL_OUTPUT_BYTES, False)
+
+    over_limit = truncate_utf8(
+        "a" * (MODEL_TOOL_OUTPUT_BYTES + 1), MODEL_TOOL_OUTPUT_BYTES
+    )
+    assert over_limit[1] is True
+    assert len(over_limit[0].encode()) <= MODEL_TOOL_OUTPUT_BYTES
+    assert "truncated" in over_limit[0]
+    assert over_limit[0].startswith("a")
+    assert over_limit[0].endswith("a")
+
+    logged_over = truncate_utf8(
+        "b" * (LOGGED_TOOL_OUTPUT_BYTES + 1), LOGGED_TOOL_OUTPUT_BYTES
+    )
+    assert logged_over[1] is True
+    assert len(logged_over[0].encode()) <= LOGGED_TOOL_OUTPUT_BYTES
+    assert "truncated" in logged_over[0]
+    assert logged_over[0].startswith("b")
+    assert logged_over[0].endswith("b")
+
+    multibyte_exact = "α" * (MODEL_TOOL_OUTPUT_BYTES // 2)
+    assert truncate_utf8(multibyte_exact, MODEL_TOOL_OUTPUT_BYTES) == (
+        multibyte_exact,
+        False,
+    )
+    multibyte_over, truncated = truncate_utf8(
+        multibyte_exact + "α", MODEL_TOOL_OUTPUT_BYTES
+    )
+    assert truncated is True
+    assert len(multibyte_over.encode()) <= MODEL_TOOL_OUTPUT_BYTES
+    assert "truncated" in multibyte_over
+
+
 def test_default_limits_bound_multibyte_streams_independently():
     original = ShellResult(
         "α" * (MODEL_TOOL_OUTPUT_BYTES + 1),
