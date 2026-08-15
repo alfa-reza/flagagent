@@ -148,6 +148,30 @@ def test_event_failure_commits_serialization_error_without_later_events(
     assert loop.artifacts.events_path.read_text() == ""
 
 
+def test_terminal_commit_performs_exactly_one_result_replacement(tmp_path, monkeypatch):
+    loop = build_loop(tmp_path, [ModelResponse(content="stop")])
+    original_replace = __import__("os").replace
+    replacements = []
+
+    def recording_replace(source, destination):
+        replacements.append(str(destination))
+        return original_replace(source, destination)
+
+    monkeypatch.setattr("flagagent.artifacts.os.replace", recording_replace)
+
+    result = loop.run()
+
+    result_replacements = [
+        path for path in replacements if path.endswith("result.json")
+    ]
+    assert len(result_replacements) == 1
+    assert (
+        json.loads(loop.artifacts.result_path.read_text())["status:reason"]
+        == result["status:reason"]
+    )
+    assert loop.artifacts.result_path.exists()
+
+
 def test_transient_result_commit_failure_is_never_retried(tmp_path, monkeypatch):
     loop = build_loop(tmp_path, [ModelResponse(content="stop")])
     original_replace = __import__("os").replace
