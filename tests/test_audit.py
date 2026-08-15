@@ -37,7 +37,28 @@ def build_loop(
     )
 
 
+def test_run_metadata_is_not_rewritten_as_trajectory_state(tmp_path):
+    loop = build_loop(
+        tmp_path,
+        [
+            ModelResponse(tool_calls=(ToolCall("s", "shell", {"command": "x"}),)),
+            ModelResponse(content="done"),
+        ],
+        executor=FakeExecutor([ShellResult("out", "", 0, False)]),
+    )
+    loop.run()
+    stored = json.loads(loop.artifacts.run_path.read_text())
+
+    assert stored["schema_version"] == 1
+    assert stored["flagagent_version"] == "0.1.0"
+    assert stored["concept_version"] == "0.1.0"
+    assert stored["run_id"] == loop.artifacts.run_id
+    assert stored["limits"]["max_model_turns"] == 5
+    assert read_events(loop.artifacts.events_path)
+
+
 def test_exact_model_visible_shell_result_is_persisted(tmp_path):
+
     loop = build_loop(
         tmp_path,
         [
