@@ -69,6 +69,7 @@ def test_assistant_precedes_correlated_sequential_results(tmp_path):
 
 
 def test_unknown_and_invalid_calls_recover_without_execution(tmp_path):
+    executor = FakeExecutor([ShellResult("", "", 0, False)])
     responses = [
         ModelResponse(
             tool_calls=(
@@ -79,14 +80,26 @@ def test_unknown_and_invalid_calls_recover_without_execution(tmp_path):
         ModelResponse(content="done"),
     ]
 
-    loop, result = run_loop(tmp_path, responses)
+    loop, result = run_loop(tmp_path, responses, executor=executor)
 
     assert result["reason"] == "model_stop"
+    assert executor.calls == []
     assert [
         message["result"]["error"]["type"]
         for message in loop.messages
         if message["role"] == "tool"
     ] == ["unknown_tool", "invalid_arguments"]
+    events = read_events(loop.artifacts.events_path)
+    tool_calls = [event["payload"] for event in events if event["type"] == "tool_call"]
+    tool_results = [
+        event["payload"] for event in events if event["type"] == "tool_result"
+    ]
+    assert [item["call_id"] for item in tool_calls] == ["u", "i"]
+    assert [item["executed"] for item in tool_results] == [False, False]
+    assert [item["result"]["error"]["type"] for item in tool_results] == [
+        "unknown_tool",
+        "invalid_arguments",
+    ]
 
 
 def test_duplicate_call_id_is_provider_error_without_execution(tmp_path):
@@ -214,8 +227,14 @@ def test_nonzero_and_timeout_are_normal_but_executor_failure_is_error(tmp_path):
         ),
         ModelResponse(content="done"),
     ]
-    _, result = run_loop(tmp_path, responses, executor=executor)
+    loop, result = run_loop(tmp_path, responses, executor=executor)
     assert result["reason"] == "model_stop"
+    timeout_seen = loop.model.calls[1][0][-1]["result"]
+    assert timeout_seen["exit_code"] is None
+    assert timeout_seen["timed_out"] is True
+    model_seen = loop.model.calls[1][0][-2]["result"]
+    assert model_seen["exit_code"] == 2
+    assert model_seen["timed_out"] is False
 
     _, failed = run_loop(
         tmp_path / "failed",

@@ -1,4 +1,10 @@
-from flagagent.tools import ShellResult, normalize_shell_result, truncate_utf8
+from flagagent.tools import (
+    LOGGED_TOOL_OUTPUT_BYTES,
+    MODEL_TOOL_OUTPUT_BYTES,
+    ShellResult,
+    normalize_shell_result,
+    truncate_utf8,
+)
 
 
 def test_truncate_utf8_preserves_head_tail_and_byte_budget():
@@ -47,6 +53,34 @@ def test_normalization_preserves_upstream_truncation_for_short_output():
     assert logged.stdout == "short"
     assert model.truncated is True
     assert logged.truncated is True
+
+
+def test_default_limits_bound_multibyte_streams_independently():
+    original = ShellResult(
+        "α" * (MODEL_TOOL_OUTPUT_BYTES + 1),
+        "β" * (LOGGED_TOOL_OUTPUT_BYTES + 1),
+        0,
+        False,
+    )
+
+    model, logged = normalize_shell_result(original)
+
+    assert len(model.stdout.encode()) <= MODEL_TOOL_OUTPUT_BYTES
+    assert len(model.stderr.encode()) <= MODEL_TOOL_OUTPUT_BYTES
+    assert len(logged.stdout.encode()) <= LOGGED_TOOL_OUTPUT_BYTES
+    assert len(logged.stderr.encode()) <= LOGGED_TOOL_OUTPUT_BYTES
+    assert "truncated" in model.stdout
+    assert "truncated" in model.stderr
+    assert "truncated" not in logged.stdout
+    assert "truncated" in logged.stderr
+    assert model.truncated is True
+    assert logged.truncated is True
+    assert model.stdout.startswith("α")
+    assert model.stdout.endswith("α")
+    assert logged.stdout == original.stdout
+    assert len(logged.stdout) > len(model.stdout)
+    model.stdout.encode("utf-8")
+    logged.stderr.encode("utf-8")
 
 
 def test_exact_boundary_is_not_truncated():

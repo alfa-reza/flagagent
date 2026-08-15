@@ -109,6 +109,9 @@ class RunArtifacts:
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> "RunArtifacts":
         selected_id = run_id or cls.generate_run_id(now=now)
+        metadata_run_id = metadata.get("run_id")
+        if metadata_run_id != selected_id:
+            raise ValueError("metadata run_id must match the selected run id")
         directory = Path(root) / selected_id
         directory.mkdir(parents=True, exist_ok=False)
         artifacts: RunArtifacts | None = None

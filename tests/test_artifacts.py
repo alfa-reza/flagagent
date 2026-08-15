@@ -127,6 +127,17 @@ def test_result_commit_uses_replace_and_refuses_second_commit(tmp_path, monkeypa
         artifacts.commit_result(result)
 
 
+def test_create_rejects_metadata_run_id_mismatch(tmp_path):
+    mismatched = dict(metadata())
+    mismatched["run_id"] = "FA-00000000T000000Z-00000000"
+
+    with pytest.raises(ValueError, match="run_id"):
+        RunArtifacts.create(
+            tmp_path, mismatched, run_id=metadata()["run_id"], now=lambda: FIXED_TIME
+        )
+    assert not (tmp_path / metadata()["run_id"]).exists()
+
+
 def test_run_json_replacement_failure_leaves_no_metadata_or_events(
     tmp_path, monkeypatch
 ):
