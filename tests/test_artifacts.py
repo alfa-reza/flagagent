@@ -1,0 +1,143 @@
+import json
+from datetime import UTC, datetime
+from pathlib import Path
+
+import pytest
+
+from flagagent.artifacts import EventStreamPoisoned, RunArtifacts, read_events
+
+FIXED_TIME = datetime(2026, 8, 14, 16, 15, 30, tzinfo=UTC)
+
+
+def metadata():
+    return {
+        "schema_version": 1,
+        "run_id": "FA-20260814T161530Z-a13f4c2d",
+        "flagagent_version": "0.1.0",
+        "concept_version": "0.1.0",
+        "challenge": {"identity": "fixture", "description": "test"},
+        "started_at": "2026-08-14T16:15:30Z",
+        "limits": {"max_model_turns": 1},
+    }
+
+
+def test_create_run_artifacts_without_overwriting(tmp_path):
+    artifacts = RunArtifacts.create(
+        tmp_path,
+        metadata(),
+        run_id="FA-20260814T161530Z-a13f4c2d",
+        now=lambda: FIXED_TIME,
+    )
+
+    assert artifacts.workspace.is_dir()
+    assert artifacts.events_path.read_text() == ""
+    assert json.loads(artifacts.run_path.read_text()) == metadata()
+    assert not artifacts.result_path.exists()
+
+    with pytest.raises(FileExistsError):
+        RunArtifacts.create(
+            tmp_path,
+            metadata(),
+            run_id=artifacts.run_id,
+            now=lambda: FIXED_TIME,
+        )
+    assert json.loads(artifacts.run_path.read_text()) == metadata()
+
+
+def test_generated_run_id_matches_contract():
+    run_id = RunArtifacts.generate_run_id(
+        now=lambda: FIXED_TIME, token_hex=lambda _: "a13f4c2d"
+    )
+
+    assert run_id == "FA-20260814T161530Z-a13f4c2d"
+
+
+def test_events_are_sequenced_and_flushed(tmp_path):
+    artifacts = RunArtifacts.create(
+        tmp_path, metadata(), run_id=metadata()["run_id"], now=lambda: FIXED_TIME
+    )
+
+    first = artifacts.append_event("model_response", {"content": "hi"})
+    second = artifacts.append_event("tool_call", {"call_id": "call-1"})
+    artifacts.close()
+
+    assert first["seq"] == 1
+    assert second["seq"] == 2
+    assert [event["type"] for event in read_events(artifacts.events_path)] == [
+        "model_response",
+        "tool_call",
+    ]
+
+
+def test_reader_ignores_only_one_trailing_incomplete_line(tmp_path):
+    path = tmp_path / "events.jsonl"
+    path.write_text('{"seq":1}\n{"seq":2')
+
+    assert read_events(path) == [{"seq": 1}]
+
+    path.write_text('{"seq":1}\nnot-json\n{"seq":3}\n')
+    with pytest.raises(ValueError, match="interior"):
+        read_events(path)
+
+
+def test_valid_final_event_without_newline_is_committed(tmp_path):
+    path = tmp_path / "events.jsonl"
+    path.write_text('{"seq":1}')
+
+    assert read_events(path) == [{"seq": 1}]
+
+
+def test_event_failure_poisons_stream_without_later_append(tmp_path):
+    artifacts = RunArtifacts.create(
+        tmp_path, metadata(), run_id=metadata()["run_id"], now=lambda: FIXED_TIME
+    )
+
+    with pytest.raises(TypeError):
+        artifacts.append_event("error", {"bad": object()})
+    with pytest.raises(EventStreamPoisoned):
+        artifacts.append_event("error", {"safe": True})
+
+    assert artifacts.events_path.read_text() == ""
+
+
+def test_result_commit_uses_replace_and_refuses_second_commit(tmp_path, monkeypatch):
+    artifacts = RunArtifacts.create(
+        tmp_path, metadata(), run_id=metadata()["run_id"], now=lambda: FIXED_TIME
+    )
+    replacements = []
+    original_replace = __import__("os").replace
+
+    def recording_replace(source, destination):
+        replacements.append((Path(source), Path(destination)))
+        original_replace(source, destination)
+
+    monkeypatch.setattr("flagagent.artifacts.os.replace", recording_replace)
+    result = {
+        "schema_version": 1,
+        "run_id": artifacts.run_id,
+        "status": "unsolved",
+        "reason": "model_stop",
+    }
+
+    artifacts.commit_result(result)
+
+    assert json.loads(artifacts.result_path.read_text()) == result
+    assert replacements[-1][0].parent == replacements[-1][1].parent
+    with pytest.raises(FileExistsError):
+        artifacts.commit_result(result)
+
+
+def test_failed_result_replace_leaves_no_committed_result(tmp_path, monkeypatch):
+    artifacts = RunArtifacts.create(
+        tmp_path, metadata(), run_id=metadata()["run_id"], now=lambda: FIXED_TIME
+    )
+
+    def fail_replace(source, destination):
+        raise OSError("replace failed")
+
+    monkeypatch.setattr("flagagent.artifacts.os.replace", fail_replace)
+
+    with pytest.raises(OSError, match="replace failed"):
+        artifacts.commit_result({"status": "unsolved"})
+
+    assert not artifacts.result_path.exists()
