@@ -114,10 +114,57 @@ def test_reused_call_id_on_later_turn_is_provider_error(tmp_path):
         ModelResponse(tool_calls=(ToolCall("same", "shell", {"command": "two"}),)),
     ]
 
-    _, result = run_loop(tmp_path, responses, executor=executor)
+    loop, result = run_loop(tmp_path, responses, executor=executor)
 
     assert result["status:reason"] == "error:provider_error"
     assert executor.calls == [("one", 10)]
+    events = read_events(loop.artifacts.events_path)
+    second = [event for event in events if event["type"] == "model_response"][1]
+    assert second["payload"]["accepted"] is False
+    assert len([event for event in events if event["type"] == "tool_call"]) == 1
+
+
+class ComponentBoom(Exception):
+    pass
+
+
+def test_arbitrary_exception_subclasses_map_to_error_taxonomy(tmp_path):
+    class BoomModel:
+        def generate(self, messages, tools):
+            raise ComponentBoom("model boundary")
+
+    class BoomExecutor:
+        def execute(self, command, timeout_seconds):
+            raise ComponentBoom("executor boundary")
+
+    class BoomVerifier:
+        def check(self, candidate):
+            raise ComponentBoom("verifier boundary")
+
+    shell_response = ModelResponse(
+        tool_calls=(ToolCall("s", "shell", {"command": "x"}),)
+    )
+    flag_response = ModelResponse(
+        tool_calls=(ToolCall("f", "submit_flag", {"candidate": "guess"}),)
+    )
+
+    provider = run_loop(
+        tmp_path / "p", [ComponentBoom("model boundary")], executor=FakeExecutor([])
+    )
+    tool = run_loop(tmp_path / "t", [shell_response], executor=BoomExecutor())
+    verify = run_loop(tmp_path / "v", [flag_response], verifier=BoomVerifier())
+
+    assert provider[1]["status:reason"] == "error:provider_error"
+    assert tool[1]["status:reason"] == "error:tool_error"
+    assert verify[1]["status:reason"] == "error:verifier_error"
+    for loop in (provider[0], tool[0], verify[0]):
+        errors = [
+            event["payload"]
+            for event in read_events(loop.artifacts.events_path)
+            if event["type"] == "error"
+        ]
+        assert errors and set(errors[0]) <= {"reason", "operation", "call_id"}
+        assert loop.artifacts.result_path.exists()
 
 
 def test_model_text_is_not_success(tmp_path):

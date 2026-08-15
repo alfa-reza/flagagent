@@ -148,6 +148,27 @@ def test_event_failure_commits_serialization_error_without_later_events(
     assert loop.artifacts.events_path.read_text() == ""
 
 
+def test_transient_result_commit_failure_is_never_retried(tmp_path, monkeypatch):
+    loop = build_loop(tmp_path, [ModelResponse(content="stop")])
+    original_replace = __import__("os").replace
+    attempts = []
+
+    def flaky_replace(source, destination):
+        if str(destination).endswith("result.json"):
+            attempts.append(destination)
+            if len(attempts) == 1:
+                raise OSError("transient replace")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr("flagagent.artifacts.os.replace", flaky_replace)
+
+    with pytest.raises(OSError, match="transient replace"):
+        loop.run()
+
+    assert len(attempts) == 1
+    assert not loop.artifacts.result_path.exists()
+
+
 def test_solved_unsolved_error_and_no_committed_result_remain_distinct(
     tmp_path, monkeypatch
 ):
