@@ -191,10 +191,21 @@ class AgentLoop:
         ]
         self._started = self.monotonic()
         self._deadline = self._started + self.limits.wall_timeout_seconds
+        terminal_written = False
         try:
-            status, reason, unprocessed = self._run_active()
-            result = self._terminal(status, reason, unprocessed)
+            active = self._run_active()
+            active_status, active_reason, active_unprocessed = active
+            try:
+                result = self._terminal(
+                    active_status, active_reason, active_unprocessed
+                )
+                terminal_written = True
+            except (OSError, TypeError, ValueError):
+                terminal_written = True
+                raise
         except (OSError, TypeError, ValueError):
+            if terminal_written:
+                raise
             result = self._result("error", "serialization_error")
             self.artifacts.commit_result(result)
         finally:
@@ -210,7 +221,7 @@ class AgentLoop:
             self._model_calls += 1
             try:
                 response = self.model.generate(self.messages, TOOL_DEFINITIONS)
-            except (OSError, RuntimeError, TypeError, ValueError):
+            except Exception:
                 if self._expired():
                     return "unsolved", "wall_limit", []
                 return self._error("provider_error", "model")
@@ -310,7 +321,7 @@ class AgentLoop:
                 self.limits.max_model_tool_output_bytes,
                 self.limits.max_logged_tool_output_bytes,
             )
-        except (OSError, RuntimeError, TypeError, ValueError):
+        except Exception:
             if self._expired():
                 return "unsolved", "wall_limit", []
             return self._error("tool_error", "executor", call_id)
@@ -337,7 +348,7 @@ class AgentLoop:
             outcome = self.verifier.check(stripped)
             if outcome not in {"correct", "incorrect"}:
                 raise ValueError("unsupported verifier outcome")
-        except (OSError, RuntimeError, TypeError, ValueError):
+        except Exception:
             if self._expired():
                 return "unsolved", "wall_limit", []
             return self._error("verifier_error", "verifier", call_id)

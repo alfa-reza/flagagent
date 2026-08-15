@@ -127,6 +127,28 @@ def test_result_commit_uses_replace_and_refuses_second_commit(tmp_path, monkeypa
         artifacts.commit_result(result)
 
 
+def test_run_json_replacement_failure_leaves_no_metadata_or_events(
+    tmp_path, monkeypatch
+):
+    original_replace = __import__("os").replace
+
+    def fail_run_json_replace(source, destination):
+        if str(destination).endswith("run.json"):
+            raise OSError("run.json replace failed")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr("flagagent.artifacts.os.replace", fail_run_json_replace)
+    run_dir = tmp_path / metadata()["run_id"]
+
+    with pytest.raises(OSError, match="run.json replace failed"):
+        RunArtifacts.create(
+            tmp_path, metadata(), run_id=metadata()["run_id"], now=lambda: FIXED_TIME
+        )
+
+    assert not (run_dir / "run.json").exists()
+    assert not (run_dir / "events.jsonl").exists()
+
+
 def test_failed_result_replace_leaves_no_committed_result(tmp_path, monkeypatch):
     artifacts = RunArtifacts.create(
         tmp_path, metadata(), run_id=metadata()["run_id"], now=lambda: FIXED_TIME
