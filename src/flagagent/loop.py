@@ -132,10 +132,23 @@ class AgentLoop:
             {"role": "tool", "call_id": call_id, "name": name, "result": result}
         )
 
+    def _result(self, status: str, reason: str) -> dict[str, Any]:
+        return {
+            "schema_version": 1,
+            "run_id": self.artifacts.run_id,
+            "status": status,
+            "reason": reason,
+            "status:reason": f"{status}:{reason}",
+            "finished_at": _utc_timestamp(self.utc_now()),
+            "duration_seconds": max(0.0, self.monotonic() - self._started),
+            "model_calls": self._model_calls,
+            "tool_calls": self._tool_calls,
+            "flag_submissions": self._flag_submissions,
+        }
+
     def _terminal(
         self, status: str, reason: str, unprocessed: list[str]
     ) -> dict[str, Any]:
-        duration = max(0.0, self.monotonic() - self._started)
         self.artifacts.append_event(
             "terminal_decision",
             {
@@ -145,18 +158,7 @@ class AgentLoop:
                 "unprocessed_call_ids": unprocessed,
             },
         )
-        result = {
-            "schema_version": 1,
-            "run_id": self.artifacts.run_id,
-            "status": status,
-            "reason": reason,
-            "status:reason": f"{status}:{reason}",
-            "finished_at": _utc_timestamp(self.utc_now()),
-            "duration_seconds": duration,
-            "model_calls": self._model_calls,
-            "tool_calls": self._tool_calls,
-            "flag_submissions": self._flag_submissions,
-        }
+        result = self._result(status, reason)
         self.artifacts.commit_result(result)
         return result
 
@@ -189,9 +191,14 @@ class AgentLoop:
         ]
         self._started = self.monotonic()
         self._deadline = self._started + self.limits.wall_timeout_seconds
-        status, reason, unprocessed = self._run_active()
-        result = self._terminal(status, reason, unprocessed)
-        self.artifacts.close()
+        try:
+            status, reason, unprocessed = self._run_active()
+            result = self._terminal(status, reason, unprocessed)
+        except (OSError, TypeError, ValueError):
+            result = self._result("error", "serialization_error")
+            self.artifacts.commit_result(result)
+        finally:
+            self.artifacts.close()
         return result
 
     def _run_active(self) -> tuple[str, str, list[str]]:
