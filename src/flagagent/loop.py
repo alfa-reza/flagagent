@@ -1,3 +1,4 @@
+import contextlib
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -13,6 +14,7 @@ from flagagent.tools import (
     MODEL_TOOL_OUTPUT_BYTES,
     TOOL_DEFINITIONS,
     Executor,
+    SandboxError,
     Verifier,
     normalize_shell_result,
     validate_tool_arguments,
@@ -176,6 +178,10 @@ class AgentLoop:
             "started_at": _utc_timestamp(self.utc_now()),
             "limits": self.limits.to_dict(),
         }
+        provenance = getattr(self.executor, "sandbox_provenance", None)
+        if provenance is not None:
+            with contextlib.suppress(Exception):
+                metadata["sandbox"] = provenance()
         self.artifacts = RunArtifacts.create(
             self.runs_root,
             metadata,
@@ -193,7 +199,7 @@ class AgentLoop:
         self._deadline = self._started + self.limits.wall_timeout_seconds
         terminal_written = False
         try:
-            active = self._run_active()
+            active = self._prepare_or_run()
             active_status, active_reason, active_unprocessed = active
             try:
                 result = self._terminal(
@@ -209,8 +215,35 @@ class AgentLoop:
             result = self._result("error", "serialization_error")
             self.artifacts.commit_result(result)
         finally:
+            self._cleanup_executor()
             self.artifacts.close()
         return result
+
+    def _prepare_or_run(self) -> tuple[str, str, list[str]]:
+        prepare = getattr(self.executor, "prepare", None)
+        if prepare is not None:
+            try:
+                prepare(self.artifacts.workspace, self.artifacts.run_id)
+            except SandboxError:
+                return self._error("sandbox_error", "sandbox")
+            lifecycle = getattr(self.executor, "sandbox_lifecycle", None)
+            if lifecycle is not None:
+                with contextlib.suppress(Exception):
+                    self.artifacts.append_event("sandbox_lifecycle", lifecycle())
+        return self._run_active()
+
+    def _cleanup_executor(self) -> None:
+        cleanup = getattr(self.executor, "cleanup", None)
+        if cleanup is None:
+            return
+        try:
+            cleanup(self.artifacts.run_id)
+        except Exception as error:
+            with contextlib.suppress(Exception):
+                self.artifacts.append_event(
+                    "sandbox_cleanup_failed",
+                    {"error_type": type(error).__name__},
+                )
 
     def _run_active(self) -> tuple[str, str, list[str]]:
         while True:
@@ -321,6 +354,10 @@ class AgentLoop:
                 self.limits.max_model_tool_output_bytes,
                 self.limits.max_logged_tool_output_bytes,
             )
+        except SandboxError:
+            if self._expired():
+                return "unsolved", "wall_limit", []
+            return self._error("sandbox_error", "sandbox", call_id)
         except Exception:
             if self._expired():
                 return "unsolved", "wall_limit", []
