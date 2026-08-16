@@ -1,5 +1,5 @@
 ---
-description: "Read-only FlagAgent v0.1 compliance gate for checking implementation, diffs, plans, and milestone evidence against the frozen Concept, approved PRD, invariants, scope, and M0/M1/M2 acceptance criteria."
+description: "Read-only FlagAgent v0.1.0 compliance gate for checking implementation, diffs, plans, and milestone evidence against the frozen Concept, approved PRD, invariants, scope, and M0/M1/M2 acceptance criteria."
 mode: subagent
 model: omniroute/oc-reviewer
 steps: 20

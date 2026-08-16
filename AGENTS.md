@@ -2,7 +2,7 @@
 
 FlagAgent v0.1.0 is a small, model-independent CTF agent harness for legal and authorized CTFs, security labs, benchmarks, and sandboxed experiments.
 
-This is an operational guide for coding agents, not the architecture source of truth.
+This file is the operational guide for coding agents. It is not the architecture source of truth or a milestone PRD.
 
 ## Authority
 
@@ -16,9 +16,9 @@ Instruction precedence:
 
 Before substantial implementation, read the relevant Concept sections, active PRD, current code/tests, and Git state.
 
-Do not silently change or reinterpret the frozen Concept/PRD. Report contradictions with evidence, impact, and the smallest proposed correction. Do not invent missing milestone requirements.
+Do not silently change the frozen Concept or reinterpret an approved PRD. Report contradictions with evidence, impact, and the smallest proposed correction.
 
-The human orchestrator is the final authority for architecture, scope, and releases.
+Do not invent milestone requirements. The human orchestrator is the final authority for architecture, scope, milestone acceptance, and releases.
 
 ## Workspace
 
@@ -26,23 +26,21 @@ The human orchestrator is the final authority for architecture, scope, and relea
 project-flagagent/
 ├── FlagAgent/              # writable product Git repository
 └── donors/                 # read-only references
-    ├── mini-swe-agent/
-    ├── pi/
     ├── ctf-agent/
-    └── nyuctf_agents/
+    ├── mini-swe-agent/
+    ├── nyuctf_agents/
+    └── pi/
 ```
 
 Only `FlagAgent/` is writable by default.
 
 Never edit, reformat, generate files in, commit in, reset, clean, or change branches inside `../donors/`. Never treat the parent workspace as one Git repository.
 
-Inspect donors only for concrete questions. Prefer understanding a mechanism and implementing the smallest FlagAgent version over copying code.
+Inspect donors only for concrete questions. Prefer understanding a mechanism and implementing the smallest FlagAgent version over copying source.
 
 `opencode.jsonc` and `.opencode/` are development-control configuration. Change them only when explicitly requested.
 
-## v0.1.0 Scope
-
-Work only on the assigned milestone and approved PRD.
+## v0.1.0 Contract
 
 Frozen baseline:
 
@@ -52,27 +50,41 @@ Frozen baseline:
 - one Agent container per real Run;
 - one authoritative verifier;
 - product tools only `shell` and `submit_flag`;
-- fresh non-interactive process per `shell` call;
+- fresh non-interactive process per real `shell` call;
 - JSON/JSONL run artifacts;
-- no resume/checkpoint, planner/executor, product multi-agent, or PTY/session manager;
+- no resume/checkpoint, product planner/executor, product multi-agent, or PTY/session manager;
 - one real provider/model path is sufficient for M2.
-
-Do not add provider routers, generic plugin systems, RAG, databases, event buses, autonomous retry frameworks, browser agents, or generalized target frameworks unless required by the current PRD.
 
 OpenCode subagents, plugins, and Skills are development aids, not FlagAgent product-runtime architecture.
 
+Do not add provider routers, generic plugin systems, RAG, databases, event buses, autonomous retry frameworks, browser agents, or generalized target frameworks unless required by the active PRD.
+
+## Current Phase — M1
+
+M0 is the deterministic semantic baseline. Preserve its tested behavior unless an approved requirement explicitly changes it.
+
+M1 implementation begins only with an approved `PRD-M1`.
+
+M1 replaces the fake execution boundary with Docker CLI / Docker Engine **without redesigning `AgentLoop`**.
+
+M1 must prove the active PRD's containment requirements, including execution placement, fresh-process semantics, bounded output collection, time/resource limits, networking, security defaults, provenance, labels, and cleanup.
+
+Do not add Docker Compose or the Docker Python SDK unless the approved PRD and evidence require them.
+
+Do not implement M2 provider/model functionality during M1.
+
 ## Critical Invariants
 
-Preserve the Concept invariants:
+Preserve these invariants:
 
 - unknown/hallucinated product tools never execute;
 - real model-generated commands and challenge workloads never intentionally execute directly on the host;
-- control/provider/verifier secrets and Docker credentials stay outside Agent/Target containers;
+- provider/verifier/control secrets and Docker credentials stay outside Agent/Target containers;
 - only the authoritative verifier establishes `solved`;
-- provider-specific response objects stay behind the model boundary;
+- provider-specific objects stay behind the model boundary;
 - model-visible execution is reconstructable from persisted evidence;
 - persist the exact normalized/truncated tool result shown to the model;
-- bound stdout/stderr while collecting it;
+- bound stdout/stderr while collecting real command output;
 - non-zero command exit is normal evidence, not automatically `tool_error`;
 - verifier `incorrect` is distinct from verifier infrastructure failure;
 - preserve `solved`, `unsolved`, `error`, and no committed result;
@@ -80,28 +92,44 @@ Preserve the Concept invariants:
 - security relaxations are explicit, Run-scoped, and recorded;
 - never silently broaden networking or fall back to Internet access.
 
-Docker is the v0.1.0 containment baseline, not perfect isolation.
+Docker is a containment baseline, not perfect isolation.
 
-## Milestones
+## M1 Docker Guardrails
 
-**M0 — Prove the Loop:** deterministic/fake model, executor, and verifier. Prove runtime semantics, ordering/correlation, verifier authority, limits, persistence, and terminal outcomes. Prefer standard-library runtime code where practical.
+Do not weaken containment for convenience.
 
-**M1 — Prove Containment:** replace fake execution with Docker CLI / Docker Engine without redesigning `AgentLoop`. Prove execution placement, process semantics, bounds, networking, security defaults, provenance, and cleanup. Do not add Compose or Docker SDK without PRD/evidence.
+By default Agent/Target execution must not receive:
 
-**M2 — Prove Usefulness:** add only one real provider/model path, one versioned/hashed solver prompt, and one frozen smoke set. Generalize provider variation only after a second provider proves the need.
+- privileged mode;
+- Docker socket access;
+- host networking;
+- unrelated writable host mounts;
+- framework/provider/verifier secrets;
+- extra Linux capabilities;
+- seccomp disablement.
 
-Do not skip milestone gates.
+Use explicit CPU, memory, and PID limits as required by the PRD; do not assume Docker supplies useful resource limits by default.
+
+Retain Docker's default security posture where the PRD does not explicitly require a relaxation. Any relaxation must be explicit, Run-scoped, and recorded.
+
+Do not automatically execute arbitrary challenge Dockerfiles, Compose files, Makefiles, scripts, or provisioning artifacts with host-level privileges.
+
+Do not claim stronger network or sandbox isolation than tests actually prove.
+
+Cleanup must target only resources belonging to the relevant Run. Never use broad cleanup such as `docker system prune` in normal development/tests.
 
 ## Engineering
 
-Prefer the smallest explicit Python implementation that satisfies the current PRD and tests.
+Prefer the smallest explicit Python implementation satisfying the current PRD and tests.
 
 - abstract proven variation, not hypothetical variation;
 - avoid speculative classes, registries, services, layers, and directories;
 - avoid unrelated refactors;
-- preserve deterministic ordering;
+- preserve deterministic ordering and established M0 semantics;
 - update deterministic tests with behavior changes;
-- prefer executable verification over LLM judgement.
+- prefer executable verification over LLM judgement;
+- keep Docker-specific mechanics behind the smallest boundary needed to preserve `AgentLoop`;
+- do not create a generic sandbox/backend framework for one backend.
 
 Baseline:
 
@@ -111,9 +139,12 @@ uv + committed uv.lock
 Hatchling
 pytest + pytest-cov
 Ruff targeting Python 3.12
+Docker CLI / Docker Engine for M1
 ```
 
-Keep runtime dependencies empty until a current milestone needs one. When adding one, justify it, update `pyproject.toml`, update `uv.lock` through `uv`, and verify. Never manually edit `uv.lock`.
+Keep runtime dependencies empty unless the active milestone has a concrete need.
+
+When adding a dependency, justify it, update `pyproject.toml` and `uv.lock` through `uv`, and verify. Never manually edit `uv.lock`.
 
 Common commands:
 
@@ -127,34 +158,52 @@ uv run ruff format --check .
 uv build
 ```
 
-Run the smallest relevant check first; coverage/build are required only when relevant. Never claim a check passed unless its successful result was observed.
+Run the smallest relevant check first, then broader applicable checks. Coverage/build are required only when relevant.
 
-## OpenCode Subagents
+Never claim a command, test, Docker property, or containment behavior passed unless its result was actually observed.
 
-Use the narrowest specialist that adds real value:
+## OpenCode Delegation
+
+The primary Plan/Build agent owns orchestration, integration, final diff inspection, final verification, Git commits/pushes, and handoff.
+
+For FlagAgent, **`general` is the preferred implementation subagent for substantive bounded coding slices**.
+
+Each `general` task should:
+
+- cover one coherent responsibility;
+- name relevant PRD acceptance criteria when available;
+- point to only likely relevant files/context;
+- implement and run focused validation;
+- never commit or push;
+- return changed files, validation, assumptions, and remaining risks.
+
+Prefer several coherent bounded tasks over giving one subagent an entire milestone. Do not delegate trivial edits merely to create activity.
+
+Other subagents:
 
 - `locator` — exact files/symbols/references/tests;
-- `explore` — architecture/control/data flow;
-- `scout` — official external docs/upstreams/APIs/changelogs;
-- `diagnostician` — reproduce failures and establish root cause;
-- `fixer` — bounded implementation after outcome/diagnosis is clear;
-- `tester` — verification without editing;
+- `explore` — architecture, execution flow, dependencies;
+- `scout` — official external docs/upstreams for concrete version-sensitive questions;
+- `diagnostician` — reproduce non-obvious failures and establish root cause;
+- `fixer` — narrow corrective implementation after diagnosis/scope is clear;
+- `tester` — independent verification without editing;
 - `reviewer` — correctness/regression/security/maintainability review;
-- `critic` — adversarial plan/design/architecture review;
-- `general` — only when no narrower specialist fits;
+- `critic` — adversarial plan/design review;
 - `flagagent-gate` — final read-only Concept/PRD/milestone compliance.
 
-Use subagents for specialization, independent review, parallel research, or context isolation—not ceremony.
+Use subagents for real specialization, independent review, or context isolation—not ceremony.
 
-Subagents do not own Git history. The primary agent integrates, verifies, commits, and pushes.
+Subagents do not own Git history.
 
-## Installed Skills and Plugins
+## Skills and Plugins
 
-**Superpowers:** use relevant skills for non-trivial design, planning, TDD, debugging, verification, review, or worktree isolation. Do not mechanically run the full workflow for trivial changes. Skills never override the human, Concept, PRD, or repository boundaries.
+**Superpowers:** use relevant skills when they materially help with non-trivial planning, TDD, debugging, verification, review, or worktree isolation. Do not run the full methodology mechanically for trivial changes.
 
-Use Git worktrees only when isolation/parallelism provides real value.
+**Graphify:** use only when difficult cross-file architecture/dependency tracing is not efficiently answered by normal search plus `locator`/`explore`.
 
-**Graphify:** use for difficult cross-file architecture/dependency tracing when normal search plus `locator`/`explore` is insufficient. Do not use it by default for simple lookups. Do not run Graphify install/uninstall, rewrite agent configuration, or intentionally commit generated Graphify output unless explicitly requested or later adopted by the repository.
+Do not let plugins rewrite project configuration or commit generated artifacts unless explicitly requested.
+
+Skills/plugins never override the human, Concept, approved PRD, or security boundaries.
 
 ## Donors and Licensing
 
@@ -165,36 +214,34 @@ research
 → understand
 → compare with exact FlagAgent need
 → reuse concept when sufficient
-→ selectively adapt only when justified
+→ selectively adapt source only when justified
 → verify provenance/license
 → test FlagAgent behavior
 ```
 
-Before source adaptation, establish exact upstream repository, commit SHA, source path/component, license/provenance, reuse mode, and FlagAgent destination.
+For M1, `ctf-agent` is useful for CTF container lifecycle/tooling lessons, but do not inherit permissive competition-oriented sandbox defaults.
 
-v0.1.0 source reuse is MIT-only unless the human changes the policy. When donor source first enters FlagAgent, add/update `THIRD_PARTY_NOTICES.md`.
+Before adapting donor source, establish exact upstream repository, commit SHA, source path/component, license/provenance, reuse mode, and FlagAgent destination.
 
-AGPL/incompatible projects such as BoxPwnr are research/concept references only under the current policy.
+v0.1.0 source reuse is MIT-only unless the human explicitly changes the policy.
 
-## Docker and Security
+For actual source adaptation, update `THIRD_PARTY_NOTICES.md` and commit provenance before adaptation:
 
-Do not weaken containment for convenience.
+```text
+chore(license): record <donor> provenance
+```
 
-By default Agent/Target execution must not receive privileged mode, Docker socket access, host networking, unrelated writable host mounts, framework/provider/verifier secrets, extra Linux capabilities, or seccomp disablement.
+Do not create provenance commits for concept-only learning or independent rewrites.
 
-Challenge-specific relaxations must be explicit, Run-scoped, and recorded.
-
-Do not automatically run arbitrary challenge Dockerfiles, Compose files, Makefiles, scripts, or provisioning artifacts with host-level privileges.
-
-Cleanup must target only resources belonging to the relevant Run. Never use broad cleanup such as `docker system prune` in normal development/tests.
+AGPL/incompatible projects such as BoxPwnr are research/concept references only.
 
 ## Git and GitHub
 
-Git history is an engineering artifact. Keep it incremental, understandable, and recoverable.
+Git history is an engineering artifact. Keep it incremental and recoverable.
 
-The **primary agent may commit and push verified FlagAgent checkpoints without a separate instruction for every checkpoint**. Subagents remain non-committing.
+The primary agent may commit and push verified FlagAgent checkpoints without a separate instruction for every checkpoint. Subagents remain non-committing.
 
-Before work/checkpoints, inspect as appropriate:
+Before work/checkpoints:
 
 ```bash
 git status
@@ -203,36 +250,9 @@ git diff
 git log --oneline -n 10
 ```
 
-Inspect `git remote -v` before the first push in a session when the remote is not already known.
+Do not alter Git identity/signing, remotes, repository visibility, branch protection, or GitHub settings unless explicitly requested.
 
-Do not alter Git identity/signing, remotes, visibility, branch protection, or GitHub settings unless explicitly requested.
-
-### Commits
-
-Commit after a coherent, reviewable unit of work is complete and relevant verification passes.
-
-A normal checkpoint should:
-
-- represent one logical change;
-- leave the repository usable;
-- include related tests/docs;
-- exclude unrelated changes;
-- make sense independently from later commits.
-
-Do not commit every edit or intentionally push broken/half-implemented work merely as a save point. Use WIP checkpoints only when explicitly requested.
-
-Before committing:
-
-```bash
-git diff
-git diff --staged
-git status
-git diff --check
-```
-
-Stage only files belonging to the checkpoint.
-
-### Conventional Commits
+Commit after a coherent, reviewable unit is complete and relevant verification passes.
 
 Use Conventional Commits 1.0.0:
 
@@ -245,65 +265,58 @@ Preferred types: `feat`, `fix`, `test`, `refactor`, `docs`, `build`, `ci`, `perf
 Examples:
 
 ```text
-feat(loop): add ordered tool execution
-test(verifier): cover incorrect flag handling
-fix(docker): enforce command timeout
-docs: document M1 containment evidence
-build: update pytest development dependency
+feat(docker): add run-scoped agent container
+test(docker): prove fresh exec semantics
+fix(docker): bound command output collection
+docs: record M1 containment evidence
+chore(license): record ctf-agent provenance
 ```
 
-Use `!` or `BREAKING CHANGE:` only for a real breaking change. Do not invent issue numbers, authors, co-authors, signatures, or trailers.
-
-### Verification and Push
-
-Before a normal code checkpoint, run the relevant subset:
+Before committing:
 
 ```bash
-uv run pytest
-uv run ruff check .
-uv run ruff format --check .
+git diff
+git diff --staged
+git status
 git diff --check
 ```
 
-Also use `uv lock --check` for dependency changes and `uv build` for build/package changes.
+Stage only files belonging to the checkpoint.
 
-Push after a meaningful verified checkpoint: a coherent task slice, milestone/PRD phase, validated risky change, session focus change, or explicit human request.
-
-Push the current development branch to its configured remote; set upstream when needed.
+Push after meaningful verified checkpoints. Do not intentionally push broken/half-implemented state merely as a save point.
 
 Do not push donor repositories. Do not create tags/releases, merge PRs, or publish packages unless explicitly requested.
 
-Never force-push or rewrite pushed history by default. Never run `git reset --hard`, `git clean -fd`, `git push --force`, or `git push --force-with-lease` unless explicitly requested after explaining the impact.
-
-Prefer small meaningful commits over giant commits or noisy micro-commits. Keep secrets, local environments, generated noise, and machine-specific artifacts out of Git.
+Never run `git reset --hard`, `git clean -fd`, force-push, or rewrite pushed history unless explicitly requested after explaining the impact.
 
 After a successful push, report the branch and latest commit SHA.
 
-## Workflow
+## M1 Workflow
 
 ```text
-read Concept + active PRD
-→ inspect code/tests/Git
-→ research concrete unknowns
-→ bounded plan when needed
-→ implement current scope
-→ deterministic verification
-→ inspect diff
-→ reviewer/critic when useful
+read Concept + approved PRD-M1
+→ inspect M0 implementation/tests/Git
+→ research only concrete unknowns
+→ bounded plan
+→ delegate substantive coding slices to general
+→ primary integrates
+→ targeted deterministic/Docker verification
+→ tester
+→ reviewer
 → flagagent-gate
 → fix material findings
 → rerun affected checks
-→ commit coherent checkpoint
-→ push checkpoint
+→ commit/push coherent checkpoints
 → report evidence
+→ STOP at M1 gate
 ```
 
-`flagagent-gate` is additional evidence, not a replacement for executable tests, verifier results, or Docker observations.
+`flagagent-gate` supplements deterministic evidence; it does not replace pytest, Docker inspection, resource observations, network probes, verifier results, or other executable checks.
 
-Stop at the milestone gate.
+Do not proceed to M2 merely because M1 appears complete.
 
 ## Definition of Done
 
-A task is done when applicable requirements are satisfied, relevant deterministic checks pass, dependency state is consistent, security/verifier invariants remain intact, no donor/unrelated files changed, material review findings are resolved/reported, coherent work is committed with Conventional Commits, required checkpoints are pushed, and the handoff reports verification, commit SHA(s), pushed branch, and remaining uncertainty.
+A task is done when applicable requirements are satisfied, relevant deterministic/Docker checks pass, M0 semantics remain intact unless explicitly changed, containment claims have observed evidence, dependency state is consistent, no donor/unrelated files changed, material review findings are resolved/reported, coherent work is committed and pushed as required, and the handoff reports verification, Docker evidence, commit SHA(s), branch, and remaining uncertainty.
 
 When uncertain, prefer evidence and the smallest reversible change over speculative architecture.
