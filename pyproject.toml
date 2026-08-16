@@ -17,6 +17,9 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "docker: requires Docker Engine for container integration tests",
+]
 
 [tool.ruff]
 target-version = "py312"

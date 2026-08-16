@@ -4,7 +4,12 @@ from pathlib import Path
 
 import pytest
 
-from flagagent.artifacts import EventStreamPoisoned, RunArtifacts, read_events
+from flagagent.artifacts import (
+    EventStreamPoisoned,
+    RunArtifacts,
+    read_events,
+    validate_run_id,
+)
 
 FIXED_TIME = datetime(2026, 8, 14, 16, 15, 30, tzinfo=UTC)
 
@@ -50,6 +55,67 @@ def test_generated_run_id_matches_contract():
     )
 
     assert run_id == "FA-20260814T161530Z-a13f4c2d"
+
+
+# ---------------------------------------------------------------------------
+# run ID trust-boundary validation
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "bad_id",
+    [
+        "",  # empty
+        "FA/../escape",  # path separator + traversal
+        "FA/x",  # path separator
+        "FA\\x",  # windows path separator
+        "FA:x",  # colon (Docker name:tag delimiter)
+        "FA x",  # whitespace
+        "FA\tx",
+        "FA\nx",
+        "FA@sha256:abc",  # Docker digest/spec delimiter
+        "FA=x",  # label delimiter
+        "FA,x",  # Docker list delimiter
+        ".hidden",  # leading separator
+        "-lead",
+        "FA..x",  # traversal run even without separators
+        "FA/x:y z",  # combined
+        "F" * 200,  # too long for container/network name prefixes
+        123,  # wrong type
+        None,
+    ],
+)
+def test_create_rejects_unsafe_run_ids_before_artifact_creation(tmp_path, bad_id):
+    before = sorted(p.name for p in tmp_path.iterdir())
+    with pytest.raises(ValueError, match="run id"):
+        RunArtifacts.create(
+            tmp_path,
+            {**metadata(), "run_id": bad_id},
+            run_id=bad_id,
+            now=lambda: FIXED_TIME,
+        )
+    # nothing was created on disk — rejection happens before artifact creation
+    assert sorted(p.name for p in tmp_path.iterdir()) == before
+
+
+@pytest.mark.parametrize(
+    "safe_id",
+    ["FA-20260814T161530Z-a13f4c2d", "FA-TEST-abcd1234", "fa.1_x-2", "A1", "a"],
+)
+def test_create_accepts_safe_run_ids(tmp_path, safe_id):
+    artifacts = RunArtifacts.create(
+        tmp_path,
+        {**metadata(), "run_id": safe_id},
+        run_id=safe_id,
+        now=lambda: FIXED_TIME,
+    )
+    assert artifacts.run_id == safe_id
+    assert artifacts.workspace.is_dir()
+
+
+def test_generated_run_ids_satisfy_validation():
+    run_id = RunArtifacts.generate_run_id()
+    assert validate_run_id(run_id) == run_id
 
 
 def test_events_are_sequenced_and_flushed(tmp_path):
