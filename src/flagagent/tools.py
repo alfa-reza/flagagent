@@ -1,5 +1,6 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, Literal, Protocol
 
 MODEL_TOOL_OUTPUT_BYTES = 16 * 1024
@@ -130,6 +131,17 @@ def normalize_shell_result(
     return _normalize_view(result, model_limit), _normalize_view(result, logged_limit)
 
 
+class SandboxError(RuntimeError):
+    """Sandbox infrastructure failure, distinct from ordinary command failure.
+
+    Raised by an executor when the execution sandbox cannot be prepared or is
+    unusable (for example a missing container or a Docker control failure).
+    AgentLoop maps this to ``error:sandbox_error``. Ordinary non-zero shell exit,
+    command timeout, and non-sandbox executor exceptions remain normal tool
+    evidence or ``tool_error``.
+    """
+
+
 class Executor(Protocol):
     def execute(self, command: str, timeout_seconds: float) -> ShellResult: ...
 
@@ -138,7 +150,12 @@ class Executor(Protocol):
 class FakeExecutor:
     script: Sequence[ShellResult | Exception]
     calls: list[tuple[str, float]] = field(default_factory=list, init=False)
+    prepared: list[tuple[Path, str]] = field(default_factory=list, init=False)
+    cleaned: list[str] = field(default_factory=list, init=False)
     _index: int = field(default=0, init=False)
+
+    def prepare(self, workspace: Path, run_id: str) -> None:
+        self.prepared.append((workspace, run_id))
 
     def execute(self, command: str, timeout_seconds: float) -> ShellResult:
         self.calls.append((command, timeout_seconds))
@@ -151,6 +168,9 @@ class FakeExecutor:
         if not isinstance(item, ShellResult):
             raise TypeError("executor returned an invalid result")
         return item
+
+    def cleanup(self, run_id: str) -> None:
+        self.cleaned.append(run_id)
 
 
 VerifierOutcome = Literal["correct", "incorrect"]

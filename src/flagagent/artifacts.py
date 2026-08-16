@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import secrets
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
@@ -11,6 +12,30 @@ from typing import Any, Self
 
 class EventStreamPoisoned(RuntimeError):
     pass
+
+
+# Run IDs become artifact directory names and Docker container/network names,
+# so the grammar must exclude path separators, colon (Docker name:tag
+# delimiter), '@' digest delimiters, '=', ',', whitespace, leading
+# separators/dots, and '..' traversal runs — before any artifact or Docker
+# resource is created.
+_RUN_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+def validate_run_id(run_id: str) -> str:
+    """Validate a run ID at the trust boundary; raise ``ValueError`` if unsafe.
+
+    Accepts only a short single token of ASCII alphanumerics, ``.``, ``_``,
+    and ``-`` starting with an alphanumeric character.  Generated IDs and
+    existing safe IDs pass unchanged.
+    """
+    if (
+        not isinstance(run_id, str)
+        or ".." in run_id
+        or not _RUN_ID_PATTERN.fullmatch(run_id)
+    ):
+        raise ValueError(f"invalid run id: {run_id!r}")
+    return run_id
 
 
 def _timestamp(value: datetime) -> str:
@@ -109,6 +134,7 @@ class RunArtifacts:
         now: Callable[[], datetime] = lambda: datetime.now(UTC),
     ) -> "RunArtifacts":
         selected_id = run_id or cls.generate_run_id(now=now)
+        validate_run_id(selected_id)
         metadata_run_id = metadata.get("run_id")
         if metadata_run_id != selected_id:
             raise ValueError("metadata run_id must match the selected run id")
