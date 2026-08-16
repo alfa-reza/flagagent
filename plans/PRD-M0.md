@@ -1,7 +1,7 @@
 # FlagAgent v0.1.0 — PRD M0: Prove the Loop
 
-> **Status:** DRAFT — requires human approval before implementation  
-> **Release:** v0.1.0  
+> **Status:** DONE  
+> **Release:** v0.1.0 
 > **Milestone:** M0 — Prove the Loop  
 > **Document role:** Product / behavioral requirements for M0 implementation  
 > **Architecture source of truth:** `plans/Flagagent-v0.1.0.md`  
