@@ -1,0 +1,43 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+
+  "references": {
+    "mini-swe-agent": {
+      "path": "../donors/mini-swe-agent",
+      "description": "Primary concept reference for minimal single-agent loops, linear trajectories, and simple model/environment boundaries."
+    },
+
+    "pi": {
+      "path": "../donors/pi",
+      "description": "Primary reference for clean model, agent, tool, and runtime boundaries. Do not copy the full framework."
+    },
+
+    "ctf-agent": {
+      "path": "../donors/ctf-agent",
+      "description": "CTF-specific reference for solver behavior, challenge workflows, coordination lessons, and competition-oriented patterns."
+    },
+
+    "nyuctf-agents": {
+      "path": "../donors/nyuctf_agents",
+      "description": "CTF research reference for baseline agents, Docker execution, and comparison against planner/executor architectures."
+    }
+  },
+
+  "permission": {
+    "edit": {
+      "*": "allow",
+      "$HOME/Projects/project-flagagent/donors/**": "deny"
+    },
+
+    "bash": {
+      "*": "ask",
+      "git status*": "allow",
+      "git diff*": "allow",
+      "git log*": "allow",
+      "git show*": "allow",
+      "git rev-parse*": "allow",
+      "rg *": "allow",
+      "grep *": "allow"
+    }
+  }
+}
