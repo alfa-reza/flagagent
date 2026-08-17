@@ -40,6 +40,7 @@ from flagagent.model import ModelResponse, ToolCall
 from flagagent.providers import (
     ProviderError,
     _build_client,
+    _client_for_budget,
     _to_json,
     _usage_field,
 )
@@ -243,13 +244,12 @@ class ResponsesModel:
             "store": False,
             "include": ["reasoning.encrypted_content"],
         }
+        client = self.client
         if self._remaining_budget is not None:
-            if self._remaining_budget <= 0:
-                raise ProviderError("responses request budget exhausted")
-            kwargs["timeout"] = self._remaining_budget
-            kwargs["max_retries"] = 0
+            client, extra = _client_for_budget(self.client, self._remaining_budget)
+            kwargs.update(extra)
         try:
-            response = self.client.responses.create(**kwargs)
+            response = client.responses.create(**kwargs)
         except Exception as error:
             raise ProviderError("responses request failed") from error
         try:

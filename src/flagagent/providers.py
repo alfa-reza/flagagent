@@ -50,6 +50,20 @@ def _build_client(api_key: str, base_url: str | None) -> OpenAI:
     return OpenAI(api_key=api_key, base_url=base_url)
 
 
+def _client_for_budget(client: Any, budget: float) -> tuple[Any, dict[str, Any]]:
+    """Return ``(client, extra_kwargs)`` for a budget-bounded request.
+
+    Official OpenAI/Anthropic SDK clients expose ``with_options``; the returned
+    client carries ``timeout``/``max_retries=0`` and ``extra_kwargs`` is empty
+    so ``create`` never receives ``max_retries``.  Injected test doubles without
+    ``with_options`` receive ``timeout``/``max_retries`` as create kwargs.
+    """
+    with_options = getattr(client, "with_options", None)
+    if callable(with_options):
+        return with_options(timeout=budget, max_retries=0), {}
+    return client, {"timeout": budget, "max_retries": 0}
+
+
 def _to_json(value: Any) -> str:
     return json.dumps(value, ensure_ascii=False, allow_nan=False)
 
@@ -202,13 +216,14 @@ class ChatCompletionsModel:
             "messages": request_messages,
             "tools": request_tools,
         }
+        client = self.client
         if self._remaining_budget is not None:
             if self._remaining_budget <= 0:
                 raise ProviderError("chat completions request budget exhausted")
-            kwargs["timeout"] = self._remaining_budget
-            kwargs["max_retries"] = 0
+            client, extra = _client_for_budget(self.client, self._remaining_budget)
+            kwargs.update(extra)
         try:
-            response = self.client.chat.completions.create(**kwargs)
+            response = client.chat.completions.create(**kwargs)
         except Exception as error:
             raise ProviderError("chat completions request failed") from error
         try:
