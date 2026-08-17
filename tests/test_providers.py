@@ -249,6 +249,16 @@ def test_set_remaining_bounds_request_timeout_and_disables_retries():
     assert call["max_retries"] == 0
 
 
+def test_exhausted_budget_does_not_call_provider():
+    model, completions = _model([_response(content="never")])
+    model.set_remaining(0)
+
+    with pytest.raises(ProviderError, match="budget exhausted"):
+        model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+    assert completions.calls == []
+
+
 def test_default_retries_left_in_place_without_set_remaining():
     response = _response(content="ok")
     model, completions = _model([response])
