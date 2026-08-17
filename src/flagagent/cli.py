@@ -20,6 +20,7 @@ from flagagent.prompt import SOLVER_PROMPT, SOLVER_PROMPT_SHA256, SOLVER_PROMPT_
 from flagagent.providers import ChatCompletionsModel
 from flagagent.responses import ResponsesModel
 from flagagent.tools import ExactStringVerifier
+from flagagent.writeup import write_writeup
 
 PROTOCOLS = {
     "openai-chat": (ChatCompletionsModel, "OPENAI_API_KEY"),
@@ -136,6 +137,11 @@ def _run(args: argparse.Namespace) -> int:
             api_base=api_base,
         )
         result = loop.run()
+        try:
+            write_writeup(loop.artifacts.directory)
+        except (OSError, TypeError, ValueError) as error:
+            print(f"writeup failed: {error}", file=sys.stderr)
+            return 1
         print(f"run={loop.artifacts.directory}")
         print(result["status:reason"])
         return 0 if result["status"] != "error" else 1
