@@ -33,6 +33,7 @@ class ChallengeInput:
     description: str
     source_dir: Path | None = None
     target_context: str | None = None
+    network_mode: str = "none"
 
     def __post_init__(self) -> None:
         if not isinstance(self.identity, str) or not self.identity:
@@ -43,6 +44,8 @@ class ChallengeInput:
             raise TypeError("challenge source_dir must be a Path")
         if self.target_context is not None and not isinstance(self.target_context, str):
             raise TypeError("challenge target_context must be a string")
+        if self.network_mode not in {"none", "local"}:
+            raise ValueError("challenge network_mode must be none or local")
 
 
 @dataclass(frozen=True)
