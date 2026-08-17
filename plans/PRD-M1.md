@@ -1,6 +1,6 @@
 # FlagAgent v0.1.0 — PRD M1: Prove Containment
 
-> **Status:** DRAFT — human approval required before implementation  
+> **Status:** DONE  
 > **Milestone:** M1 — Prove Containment  
 > **Source of truth:** `plans/Flagagent-v0.1.0.md`  
 > **Previous gate:** M0 — Prove the Loop  
