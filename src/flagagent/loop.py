@@ -253,6 +253,9 @@ class AgentLoop:
                 return "unsolved", "model_turn_limit", []
             self._model_calls += 1
             try:
+                set_remaining = getattr(self.model, "set_remaining", None)
+                if set_remaining is not None:
+                    set_remaining(self._remaining())
                 response = self.model.generate(self.messages, TOOL_DEFINITIONS)
             except Exception:
                 if self._expired():

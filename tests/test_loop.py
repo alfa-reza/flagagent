@@ -351,3 +351,32 @@ def test_result_counters_match_processed_calls(tmp_path):
     assert result["model_calls"] == 1
     assert result["tool_calls"] == 3
     assert result["flag_submissions"] == 1
+
+
+def test_loop_passes_remaining_budget_to_adapter_seam(tmp_path):
+    recorded = []
+
+    class _BudgetAdapter:
+        def set_remaining(self, remaining):
+            recorded.append(remaining)
+
+        def generate(self, messages, tools):
+            return ModelResponse(content="stop")
+
+    loop = AgentLoop(
+        model=_BudgetAdapter(),
+        executor=FakeExecutor([]),
+        verifier=ExactStringVerifier("Flag{ok}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(
+            max_model_turns=10, wall_timeout_seconds=100, command_timeout_seconds=10
+        ),
+        runs_root=tmp_path,
+        monotonic=Clock(),
+        utc_now=lambda: NOW,
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    result = loop.run()
+
+    assert result["status:reason"] == "unsolved:model_stop"
+    assert recorded == [100.0]
