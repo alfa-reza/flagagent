@@ -22,11 +22,7 @@ from flagagent.responses import ResponsesModel
 from flagagent.tools import ExactStringVerifier
 from flagagent.writeup import write_writeup
 
-PROTOCOLS = {
-    "openai-chat": (ChatCompletionsModel, "OPENAI_API_KEY"),
-    "openai-responses": (ResponsesModel, "OPENAI_API_KEY"),
-    "anthropic": (AnthropicMessagesModel, "ANTHROPIC_API_KEY"),
-}
+PROTOCOL_NAMES = ("openai-chat", "openai-responses", "anthropic")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -34,7 +30,7 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
     run = subparsers.add_parser("run")
     run.add_argument("--challenge", type=Path, required=True)
-    run.add_argument("--protocol", choices=tuple(PROTOCOLS), required=True)
+    run.add_argument("--protocol", choices=PROTOCOL_NAMES, required=True)
     run.add_argument("--model", required=True)
     run.add_argument("--api-base")
     run.add_argument("--api-key-env")
@@ -137,13 +133,13 @@ def _run(args: argparse.Namespace) -> int:
             api_base=api_base,
         )
         result = loop.run()
+        print(f"run={loop.artifacts.directory}")
+        print(result["status:reason"])
         try:
             write_writeup(loop.artifacts.directory)
         except (OSError, TypeError, ValueError) as error:
             print(f"writeup failed: {error}", file=sys.stderr)
             return 1
-        print(f"run={loop.artifacts.directory}")
-        print(result["status:reason"])
         return 0 if result["status"] != "error" else 1
     except (OSError, TypeError, ValueError) as error:
         print(str(error), file=sys.stderr)
