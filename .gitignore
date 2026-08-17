@@ -23,3 +23,6 @@ runs/
 .env
 .env.*
 !.env.example
+
+# Development-agent workspace
+.superpowers/
