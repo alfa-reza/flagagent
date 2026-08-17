@@ -189,7 +189,17 @@ class AnthropicMessagesModel:
     def generate(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
     ) -> ModelResponse:
-        request_messages = _to_anthropic_messages(messages)
+        system_prompt = next(
+            (
+                message.get("content", "")
+                for message in messages
+                if message.get("role") == "system"
+            ),
+            None,
+        )
+        request_messages = _to_anthropic_messages(
+            [message for message in messages if message.get("role") != "system"]
+        )
         request_tools = [_to_anthropic_tool(tool) for tool in tools]
         kwargs: dict[str, Any] = {
             "model": self.model,
@@ -197,6 +207,8 @@ class AnthropicMessagesModel:
             "messages": request_messages,
             "tools": request_tools,
         }
+        if system_prompt is not None:
+            kwargs["system"] = system_prompt
         client = self.client
         if self._remaining_budget is not None:
             if self._remaining_budget <= 0:

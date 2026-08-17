@@ -216,9 +216,19 @@ class ResponsesModel:
     ) -> ModelResponse:
         if self._remaining_budget is not None and self._remaining_budget <= 0:
             raise ProviderError("responses request budget exhausted")
+        instructions = next(
+            (
+                message.get("content", "")
+                for message in messages
+                if message.get("role") == "system"
+            ),
+            None,
+        )
         new_messages = messages[self._processed_count :]
         for message in new_messages:
             role = message.get("role")
+            if role == "system":
+                continue
             if role == "user":
                 self._built_input.append(
                     {"role": "user", "content": message.get("content", "")}
@@ -244,6 +254,8 @@ class ResponsesModel:
             "store": False,
             "include": ["reasoning.encrypted_content"],
         }
+        if instructions is not None:
+            kwargs["instructions"] = instructions
         client = self.client
         if self._remaining_budget is not None:
             client, extra = _client_for_budget(self.client, self._remaining_budget)

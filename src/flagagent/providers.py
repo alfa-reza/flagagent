@@ -92,8 +92,8 @@ def _to_chat_tool_call(call: dict[str, Any]) -> dict[str, Any]:
 
 def _to_chat_message(message: dict[str, Any]) -> dict[str, Any]:
     role = message["role"]
-    if role == "user":
-        return {"role": "user", "content": message.get("content", "")}
+    if role in {"system", "user"}:
+        return {"role": role, "content": message.get("content", "")}
     if role == "assistant":
         tool_calls = message.get("tool_calls") or []
         chat_message: dict[str, Any] = {
