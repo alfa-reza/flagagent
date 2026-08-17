@@ -4,7 +4,7 @@
   "references": {
     "mini-swe-agent": {
       "path": "../donors/mini-swe-agent",
-      "description": "Primary concept reference for minimal single-agent loops, linear trajectories, and simple model/environment boundaries."
+      "description": "Primary reference for minimal single-agent loops, linear trajectories, and simple model/environment boundaries."
     },
 
     "pi": {
@@ -14,16 +14,28 @@
 
     "ctf-agent": {
       "path": "../donors/ctf-agent",
-      "description": "CTF-specific reference for solver behavior, challenge workflows, coordination lessons, and competition-oriented patterns."
+      "description": "CTF-specific reference for solver behavior, challenge workflows, provider integration, tooling, and competition-oriented lessons."
     },
 
     "nyuctf-agents": {
       "path": "../donors/nyuctf_agents",
-      "description": "CTF research reference for baseline agents, Docker execution, and comparison against planner/executor architectures."
+      "description": "CTF research reference for baseline agents, Docker execution, prompts, evaluation, and comparison against planner/executor architectures."
+    },
+
+    "boxpwnr": {
+      "path": "../donors/BoxPwnr",
+      "description": "Research-only CTF agent reference for solver, prompt, evaluation, trace, and Git-history lessons. AGPL source must not be copied or adapted into FlagAgent."
+    },
+
+    "swe-rex": {
+      "path": "../donors/SWE-ReX",
+      "description": "Execution-runtime reference for sandbox, process, session, and interactivity mechanisms. Inspect only when a concrete FlagAgent requirement makes it relevant."
     }
   },
 
   "permission": {
+    "external_directory": "allow",
+
     "edit": {
       "*": "allow",
       "$HOME/Projects/project-flagagent/donors/**": "deny"
