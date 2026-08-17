@@ -1,8 +1,8 @@
-# FlagAgent M1 sandbox image.
+# FlagAgent M2 sandbox image.
 #
-# Minimal Ubuntu 24.04 LTS with a non-root ``agent`` user.  Tagged as
-# ``flagagent-sandbox:dev`` and used as the Agent container root filesystem.
-# CTF tooling is intentionally deferred to later milestones.
+# Ubuntu 24.04 LTS with a non-root ``agent`` user and only the tools required
+# by the frozen M2 smoke fixtures: Python for file decoding and netcat for the
+# audited local TCP target.
 #
 # The ``agent`` user reuses UID/GID 1000 so it can read/write the host
 # workspace bind-mount owned by the reference host user (UID 1000).
@@ -21,6 +21,10 @@ RUN if id ubuntu >/dev/null 2>&1; then \
         groupadd --gid 1000 agent \
         && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash agent; \
     fi
+
+RUN apt-get update \
+    && apt-get install --no-install-recommends --yes python3 netcat-openbsd \
+    && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /workspace
 

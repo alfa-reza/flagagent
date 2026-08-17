@@ -30,6 +30,17 @@ def test_parser_exposes_run_command():
     assert args.protocol == "openai-chat"
 
 
+def test_load_challenge_rejects_descriptor_symlink(tmp_path):
+    root = tmp_path / "challenge"
+    root.mkdir()
+    target = tmp_path / "descriptor.json"
+    target.write_text("{}")
+    (root / "challenge.json").symlink_to(target)
+
+    with pytest.raises(ValueError, match="regular file"):
+        load_challenge(root)
+
+
 def test_load_challenge_preserves_network_mode(tmp_path):
     root = write_challenge(tmp_path / "challenge", network_mode="local")
 

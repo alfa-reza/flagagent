@@ -1,0 +1,6 @@
+{
+  "identity": "layered-file",
+  "description": "Inspect files in the workspace. Decode the provided evidence with two base64-decoding steps, then submit the resulting flag.",
+  "expected_flag": "Flag{layered_file_ok}",
+  "network_mode": "none"
+}
