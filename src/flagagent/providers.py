@@ -27,6 +27,7 @@ Design constraints (PRD-M2):
 """
 
 import json
+import math
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -185,8 +186,11 @@ class ChatCompletionsModel:
         (including the M0 ``ScriptedModel``) are unaffected.
         """
         if isinstance(remaining, bool) or not isinstance(remaining, (int, float)):
-            return
-        self._remaining_budget = float(remaining)
+            raise TypeError("remaining budget must be a number")
+        value = float(remaining)
+        if not math.isfinite(value):
+            raise ValueError("remaining budget must be a finite number")
+        self._remaining_budget = value
 
     def generate(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
@@ -198,7 +202,9 @@ class ChatCompletionsModel:
             "messages": request_messages,
             "tools": request_tools,
         }
-        if self._remaining_budget and self._remaining_budget > 0:
+        if self._remaining_budget is not None:
+            if self._remaining_budget <= 0:
+                raise ProviderError("chat completions request budget exhausted")
             kwargs["timeout"] = self._remaining_budget
             kwargs["max_retries"] = 0
         try:
