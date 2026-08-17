@@ -1,6 +1,6 @@
 # FlagAgent v0.1.0 — PRD M2: Prove Usefulness
 
-> **Status:** DRAFT — requires human approval before implementation  
+> **Status:** APPROVED
 > **Release:** v0.1.0  
 > **Milestone:** M2 — Prove Usefulness  
 > **Source of truth:** `plans/Flagagent-v0.1.0.md`  
