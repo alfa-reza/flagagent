@@ -59,19 +59,17 @@ OpenCode subagents, plugins, and Skills are development aids, not FlagAgent prod
 
 Do not add provider routers, generic plugin systems, RAG, databases, event buses, autonomous retry frameworks, browser agents, or generalized target frameworks unless required by the active PRD.
 
-## Current Phase — M1
+## Current Phase — M2
 
-M0 is the deterministic semantic baseline. Preserve its tested behavior unless an approved requirement explicitly changes it.
+M0 is the deterministic semantic baseline and M1 is the completed containment baseline. Preserve their tested behavior unless an approved requirement explicitly changes it.
 
-M1 implementation begins only with an approved `PRD-M1`.
+M2 implementation begins only with the approved `PRD-M2`.
 
-M1 replaces the fake execution boundary with Docker CLI / Docker Engine **without redesigning `AgentLoop`**.
-
-M1 must prove the active PRD's containment requirements, including execution placement, fresh-process semantics, bounded output collection, time/resource limits, networking, security defaults, provenance, labels, and cleanup.
+M2 adds only the real provider/model, minimal CLI, frozen smoke fixtures, prompt provenance, deterministic write-up, and release usability required by `PRD-M2`.
 
 Do not add Docker Compose or the Docker Python SDK unless the approved PRD and evidence require them.
 
-Do not implement M2 provider/model functionality during M1.
+Do not proceed to post-v0.1.0 architecture during M2.
 
 ## Critical Invariants
 
