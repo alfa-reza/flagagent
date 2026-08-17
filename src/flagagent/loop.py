@@ -1,10 +1,16 @@
 import contextlib
+import hashlib
 import math
+import os
+import shutil
+import stat
+import tempfile
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlsplit, urlunsplit
 
 from flagagent import __version__
 from flagagent.artifacts import RunArtifacts
@@ -25,12 +31,18 @@ from flagagent.tools import (
 class ChallengeInput:
     identity: str
     description: str
+    source_dir: Path | None = None
+    target_context: str | None = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.identity, str) or not self.identity:
             raise ValueError("challenge identity must be a non-empty string")
         if not isinstance(self.description, str):
             raise TypeError("challenge description must be a string")
+        if self.source_dir is not None and not isinstance(self.source_dir, Path):
+            raise TypeError("challenge source_dir must be a Path")
+        if self.target_context is not None and not isinstance(self.target_context, str):
+            raise TypeError("challenge target_context must be a string")
 
 
 @dataclass(frozen=True)
@@ -78,6 +90,119 @@ def _utc_timestamp(value: datetime) -> str:
     return value.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _snapshot_source_files(
+    source_dir: Path | None,
+) -> tuple[list[tuple[Path, Path]], str | None, Any | None]:
+    if source_dir is None:
+        return [], None, None
+    temporary = tempfile.TemporaryDirectory(prefix="flagagent-source-")
+    files: list[tuple[Path, Path]] = []
+    try:
+        root_fd = os.open(
+            source_dir,
+            os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
+    except OSError as error:
+        temporary.cleanup()
+        raise ValueError("challenge source_dir must be a directory") from error
+
+    def visit(directory_fd: int, relative: Path) -> None:
+        try:
+            entries = list(os.scandir(directory_fd))
+        except OSError as error:
+            raise ValueError("challenge source cannot be read") from error
+        for entry in sorted(entries, key=lambda item: item.name):
+            entry_relative = relative / entry.name
+            if entry_relative.is_absolute() or ".." in entry_relative.parts:
+                raise ValueError("challenge source path is unsafe")
+            try:
+                entry_stat = os.stat(
+                    entry.name, dir_fd=directory_fd, follow_symlinks=False
+                )
+            except OSError as error:
+                raise ValueError("challenge source cannot be inspected") from error
+            mode = entry_stat.st_mode
+            if stat.S_ISLNK(mode):
+                raise ValueError("challenge source contains a symlink")
+            if stat.S_ISDIR(mode):
+                try:
+                    child_fd = os.open(
+                        entry.name,
+                        os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=directory_fd,
+                    )
+                except OSError as error:
+                    raise ValueError("challenge source directory changed") from error
+                try:
+                    visit(child_fd, entry_relative)
+                finally:
+                    os.close(child_fd)
+            elif stat.S_ISREG(mode):
+                snapshot = Path(temporary.name) / entry_relative
+                snapshot.parent.mkdir(parents=True, exist_ok=True)
+                try:
+                    source_fd = os.open(
+                        entry.name,
+                        os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                        dir_fd=directory_fd,
+                    )
+                except OSError as error:
+                    raise ValueError("challenge source file changed") from error
+                try:
+                    if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+                        raise ValueError("challenge source contains a special file")
+                    with os.fdopen(source_fd, "rb") as source_handle:
+                        source_fd = -1
+                        with snapshot.open("wb") as snapshot_handle:
+                            shutil.copyfileobj(
+                                source_handle, snapshot_handle, 1024 * 1024
+                            )
+                finally:
+                    if source_fd >= 0:
+                        os.close(source_fd)
+                files.append((snapshot, entry_relative))
+            else:
+                raise ValueError("challenge source contains a special file")
+
+    try:
+        visit(root_fd, Path())
+    except BaseException:
+        os.close(root_fd)
+        temporary.cleanup()
+        raise
+    os.close(root_fd)
+
+    digest = hashlib.sha256(b"FLAGAGENT-SOURCE-V1")
+    for snapshot, relative in sorted(files, key=lambda item: item[1].as_posix()):
+        relative_bytes = relative.as_posix().encode("utf-8")
+        size = snapshot.stat().st_size
+        digest.update(len(relative_bytes).to_bytes(8, "big"))
+        digest.update(relative_bytes)
+        digest.update(size.to_bytes(8, "big"))
+        with snapshot.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
+    return files, digest.hexdigest(), temporary
+
+
+def _stage_source_files(workspace: Path, files: list[tuple[Path, Path]]) -> None:
+    for source, relative in files:
+        destination = workspace / relative
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(source, destination)
+
+
+def _sanitize_api_base(value: str | None) -> str | None:
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value:
+        raise ValueError("api_base must be a non-empty string")
+    parsed = urlsplit(value)
+    if parsed.username or parsed.password or parsed.query or parsed.fragment:
+        raise ValueError("api_base must not contain credentials or query data")
+    return urlunsplit((parsed.scheme, parsed.netloc, parsed.path, "", ""))
+
+
 @dataclass
 class AgentLoop:
     model: Model
@@ -89,14 +214,39 @@ class AgentLoop:
     monotonic: Callable[[], float]
     utc_now: Callable[[], datetime]
     run_id: str | None = None
+    system_prompt: str | None = None
+    prompt_version: str | None = None
+    prompt_sha256: str | None = None
+    model_identity: str | None = None
+    protocol: str | None = None
+    api_base: str | None = None
 
     def __post_init__(self) -> None:
+        if self.system_prompt is None:
+            if self.prompt_version is not None or self.prompt_sha256 is not None:
+                raise ValueError("prompt metadata requires a system prompt")
+        else:
+            if not isinstance(self.system_prompt, str) or not self.system_prompt:
+                raise ValueError("system_prompt must be a non-empty string")
+            if not isinstance(self.prompt_version, str) or not self.prompt_version:
+                raise ValueError("prompt_version is required with a system prompt")
+            if not isinstance(self.prompt_sha256, str) or not self.prompt_sha256:
+                raise ValueError("prompt_sha256 is required with a system prompt")
+            expected_sha256 = hashlib.sha256(
+                self.system_prompt.encode("utf-8")
+            ).hexdigest()
+            if self.prompt_sha256 != expected_sha256:
+                raise ValueError("prompt_sha256 does not match system_prompt")
         self.messages: list[dict[str, Any]] = []
         self.artifacts: RunArtifacts
         self._model_calls = 0
         self._tool_calls = 0
         self._flag_submissions = 0
         self._seen_call_ids: set[str] = set()
+        self._input_tokens: int | None = None
+        self._output_tokens: int | None = None
+        self._source_files: list[tuple[Path, Path]] = []
+        self._source_temporary: Any | None = None
 
     def _remaining(self) -> float:
         return max(0.0, self._deadline - self.monotonic())
@@ -135,7 +285,7 @@ class AgentLoop:
         )
 
     def _result(self, status: str, reason: str) -> dict[str, Any]:
-        return {
+        result = {
             "schema_version": 1,
             "run_id": self.artifacts.run_id,
             "status": status,
@@ -147,6 +297,11 @@ class AgentLoop:
             "tool_calls": self._tool_calls,
             "flag_submissions": self._flag_submissions,
         }
+        if self._input_tokens is not None:
+            result["input_tokens"] = self._input_tokens
+        if self._output_tokens is not None:
+            result["output_tokens"] = self._output_tokens
+        return result
 
     def _terminal(
         self, status: str, reason: str, unprocessed: list[str]
@@ -165,20 +320,50 @@ class AgentLoop:
         return result
 
     def run(self) -> dict[str, Any]:
+        source_error: ValueError | None = None
+        try:
+            self._source_files, source_sha256, self._source_temporary = (
+                _snapshot_source_files(self.challenge.source_dir)
+            )
+        except ValueError as error:
+            self._source_files = []
+            source_sha256 = None
+            source_error = error
+        api_base = _sanitize_api_base(self.api_base)
         selected_id = self.run_id or RunArtifacts.generate_run_id(now=self.utc_now)
-        metadata = {
+        challenge_metadata: dict[str, Any] = {
+            "identity": self.challenge.identity,
+            "description": self.challenge.description,
+        }
+        if self.challenge.target_context is not None:
+            challenge_metadata["target_context"] = self.challenge.target_context
+        if source_sha256 is not None:
+            challenge_metadata["source_sha256"] = source_sha256
+        metadata: dict[str, Any] = {
             "schema_version": 1,
             "run_id": selected_id,
             "flagagent_version": __version__,
             "concept_version": "0.1.0",
-            "challenge": {
-                "identity": self.challenge.identity,
-                "description": self.challenge.description,
-            },
+            "challenge": challenge_metadata,
             "started_at": _utc_timestamp(self.utc_now()),
             "limits": self.limits.to_dict(),
         }
+        if self.system_prompt is not None:
+            metadata["prompt"] = {
+                "version": self.prompt_version,
+                "sha256": self.prompt_sha256,
+            }
+        if any(
+            value is not None
+            for value in (self.model_identity, self.protocol, api_base)
+        ):
+            metadata["model"] = {
+                "name": self.model_identity,
+                "protocol": self.protocol,
+                "base_url": api_base,
+            }
         provenance = getattr(self.executor, "sandbox_provenance", None)
+
         if provenance is not None:
             with contextlib.suppress(Exception):
                 metadata["sandbox"] = provenance()
@@ -188,17 +373,28 @@ class AgentLoop:
             run_id=selected_id,
             now=self.utc_now,
         )
-        self.messages = [
+        user_content = self.challenge.description
+        if self.challenge.target_context:
+            user_content = (
+                f"{user_content}\n\nTarget context:\n{self.challenge.target_context}"
+            )
+        self.messages = []
+        if self.system_prompt is not None:
+            self.messages.append({"role": "system", "content": self.system_prompt})
+        self.messages.append(
             {
                 "role": "user",
-                "content": self.challenge.description,
+                "content": user_content,
                 "challenge_identity": self.challenge.identity,
             }
-        ]
+        )
         self._started = self.monotonic()
         self._deadline = self._started + self.limits.wall_timeout_seconds
         terminal_written = False
         try:
+            if source_error is not None:
+                raise source_error
+            _stage_source_files(self.artifacts.workspace, self._source_files)
             active = self._prepare_or_run()
             active_status, active_reason, active_unprocessed = active
             try:
@@ -217,6 +413,9 @@ class AgentLoop:
         finally:
             self._cleanup_executor()
             self.artifacts.close()
+            if self._source_temporary is not None:
+                self._source_temporary.cleanup()
+                self._source_temporary = None
         return result
 
     def _prepare_or_run(self) -> tuple[str, str, list[str]]:
@@ -265,6 +464,7 @@ class AgentLoop:
                 return "unsolved", "wall_limit", []
             if not isinstance(response, ModelResponse):
                 return self._error("provider_error", "model")
+            self._add_usage(response.usage)
             duplicate = self._duplicate_id(response)
             accepted = duplicate is None
             self.artifacts.append_event(
@@ -292,6 +492,19 @@ class AgentLoop:
                 return terminal
             if self._model_calls >= self.limits.max_model_turns:
                 return "unsolved", "model_turn_limit", []
+
+    def _add_usage(self, usage: Any) -> None:
+        if not isinstance(usage, dict):
+            return
+        for name, attribute in (
+            ("input_tokens", "_input_tokens"),
+            ("output_tokens", "_output_tokens"),
+        ):
+            value = usage.get(name)
+            if isinstance(value, bool) or not isinstance(value, int):
+                continue
+            current = getattr(self, attribute)
+            setattr(self, attribute, value if current is None else current + value)
 
     def _duplicate_id(self, response: ModelResponse) -> str | None:
         current: set[str] = set()
