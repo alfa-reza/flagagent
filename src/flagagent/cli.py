@@ -55,6 +55,8 @@ def load_challenge(root: Path) -> tuple[ChallengeInput, str]:
     if not root.is_dir() or root.is_symlink():
         raise ValueError("challenge must be a directory")
     descriptor = root / "challenge.json"
+    if descriptor.is_symlink() or not descriptor.is_file():
+        raise ValueError("challenge.json must be a regular file")
     try:
         payload = json.loads(descriptor.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as error:
