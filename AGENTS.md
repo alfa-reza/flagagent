@@ -1,320 +1,126 @@
 # FlagAgent Repository Instructions
 
-FlagAgent v0.1.0 is a small, model-independent CTF agent harness for legal and authorized CTFs, security labs, benchmarks, and sandboxed experiments.
+FlagAgent is a small, model-independent agent harness for authorized CTFs, security labs, benchmarks, and sandboxed experiments.
 
-This file is the operational guide for coding agents. It is not the architecture source of truth or a milestone PRD.
+This file contains durable repository-level guidance for coding agents. Keep changes consistent with the current code, tests, and public documentation.
 
-## Authority
+## Development Principles
 
-Instruction precedence:
+Prefer simple, explicit, maintainable solutions.
 
-1. latest explicit human instruction;
-2. `plans/Flagagent-v0.1.0.md`;
-3. active approved milestone PRD under `plans/`;
-4. this `AGENTS.md`;
-5. implementation details.
+- **KISS:** choose the simplest implementation that satisfies the concrete requirement.
+- **YAGNI:** do not add features, abstractions, dependencies, configuration, or extensibility for hypothetical future needs.
+- **DRY:** avoid meaningful duplication, but do not introduce abstraction solely to eliminate small or incidental repetition.
+- Prefer deterministic verification over assumptions or LLM judgement.
+- Read relevant code and tests before changing behavior.
+- Avoid unrelated refactors while implementing a focused change.
+- Preserve existing behavior unless the task intentionally changes it.
 
-Before substantial implementation, read the relevant Concept sections, active PRD, current code/tests, and Git state.
+Abstract proven variation, not anticipated variation.
 
-Do not silently change the frozen Concept or reinterpret an approved PRD. Report contradictions with evidence, impact, and the smallest proposed correction.
+## Repository Structure
 
-Do not invent milestone requirements. The human orchestrator is the final authority for architecture, scope, milestone acceptance, and releases.
+- `src/flagagent/` — FlagAgent implementation.
+- `tests/` — deterministic and Docker-backed tests.
+- `challenges/` — project-owned challenge fixtures.
+- `images/` — project-owned Docker images.
 
-## Workspace
+Use `README.md` as the source for user-facing behavior, supported features, setup, security limitations, and usage.
 
-```text
-project-flagagent/
-├── FlagAgent/              # writable product Git repository
-└── donors/                 # read-only references
-    ├── ctf-agent/
-    ├── mini-swe-agent/
-    ├── nyuctf_agents/
-    └── pi/
-```
+## Development and Verification
 
-Only `FlagAgent/` is writable by default.
+FlagAgent requires Python 3.12 or newer and uses `uv`.
 
-Never edit, reformat, generate files in, commit in, reset, clean, or change branches inside `../donors/`. Never treat the parent workspace as one Git repository.
-
-Inspect donors only for concrete questions. Prefer understanding a mechanism and implementing the smallest FlagAgent version over copying source.
-
-`opencode.jsonc` and `.opencode/` are development-control configuration. Change them only when explicitly requested.
-
-## v0.1.0 Contract
-
-Frozen baseline:
-
-- one Run = one attempt;
-- one active model and one `AgentLoop`;
-- one linear conversation;
-- one Agent container per real Run;
-- one authoritative verifier;
-- product tools only `shell` and `submit_flag`;
-- fresh non-interactive process per real `shell` call;
-- JSON/JSONL run artifacts;
-- no resume/checkpoint, product planner/executor, product multi-agent, or PTY/session manager;
-- one real provider/model path is sufficient for M2.
-
-OpenCode subagents, plugins, and Skills are development aids, not FlagAgent product-runtime architecture.
-
-Do not add provider routers, generic plugin systems, RAG, databases, event buses, autonomous retry frameworks, browser agents, or generalized target frameworks unless required by the active PRD.
-
-## Current Phase — M2
-
-M0 is the deterministic semantic baseline and M1 is the completed containment baseline. Preserve their tested behavior unless an approved requirement explicitly changes it.
-
-M2 implementation begins only with the approved `PRD-M2`.
-
-M2 adds only the real provider/model, minimal CLI, frozen smoke fixtures, prompt provenance, deterministic write-up, and release usability required by `PRD-M2`.
-
-Do not add Docker Compose or the Docker Python SDK unless the approved PRD and evidence require them.
-
-Do not proceed to post-v0.1.0 architecture during M2.
-
-## Critical Invariants
-
-Preserve these invariants:
-
-- unknown/hallucinated product tools never execute;
-- real model-generated commands and challenge workloads never intentionally execute directly on the host;
-- provider/verifier/control secrets and Docker credentials stay outside Agent/Target containers;
-- only the authoritative verifier establishes `solved`;
-- provider-specific objects stay behind the model boundary;
-- model-visible execution is reconstructable from persisted evidence;
-- persist the exact normalized/truncated tool result shown to the model;
-- bound stdout/stderr while collecting real command output;
-- non-zero command exit is normal evidence, not automatically `tool_error`;
-- verifier `incorrect` is distinct from verifier infrastructure failure;
-- preserve `solved`, `unsolved`, `error`, and no committed result;
-- local targets and challenge-provided provisioning are untrusted by default;
-- security relaxations are explicit, Run-scoped, and recorded;
-- never silently broaden networking or fall back to Internet access.
-
-Docker is a containment baseline, not perfect isolation.
-
-## M1 Docker Guardrails
-
-Do not weaken containment for convenience.
-
-By default Agent/Target execution must not receive:
-
-- privileged mode;
-- Docker socket access;
-- host networking;
-- unrelated writable host mounts;
-- framework/provider/verifier secrets;
-- extra Linux capabilities;
-- seccomp disablement.
-
-Use explicit CPU, memory, and PID limits as required by the PRD; do not assume Docker supplies useful resource limits by default.
-
-Retain Docker's default security posture where the PRD does not explicitly require a relaxation. Any relaxation must be explicit, Run-scoped, and recorded.
-
-Do not automatically execute arbitrary challenge Dockerfiles, Compose files, Makefiles, scripts, or provisioning artifacts with host-level privileges.
-
-Do not claim stronger network or sandbox isolation than tests actually prove.
-
-Cleanup must target only resources belonging to the relevant Run. Never use broad cleanup such as `docker system prune` in normal development/tests.
-
-## Engineering
-
-Prefer the smallest explicit Python implementation satisfying the current PRD and tests.
-
-- abstract proven variation, not hypothetical variation;
-- avoid speculative classes, registries, services, layers, and directories;
-- avoid unrelated refactors;
-- preserve deterministic ordering and established M0 semantics;
-- update deterministic tests with behavior changes;
-- prefer executable verification over LLM judgement;
-- keep Docker-specific mechanics behind the smallest boundary needed to preserve `AgentLoop`;
-- do not create a generic sandbox/backend framework for one backend.
-
-Baseline:
-
-```text
-Python >= 3.12
-uv + committed uv.lock
-Hatchling
-pytest + pytest-cov
-Ruff targeting Python 3.12
-Docker CLI / Docker Engine for M1
-```
-
-Keep runtime dependencies empty unless the active milestone has a concrete need.
-
-When adding a dependency, justify it, update `pyproject.toml` and `uv.lock` through `uv`, and verify. Never manually edit `uv.lock`.
-
-Common commands:
+Common checks:
 
 ```bash
 uv sync
 uv lock --check
 uv run pytest
-uv run pytest --cov=flagagent --cov-report=term-missing
+uv run pytest -m docker
 uv run ruff check .
 uv run ruff format --check .
 uv build
-```
-
-Run the smallest relevant check first, then broader applicable checks. Coverage/build are required only when relevant.
-
-Never claim a command, test, Docker property, or containment behavior passed unless its result was actually observed.
-
-## OpenCode Delegation
-
-The primary Plan/Build agent owns orchestration, integration, final diff inspection, final verification, Git commits/pushes, and handoff.
-
-For FlagAgent, **`general` is the preferred implementation subagent for substantive bounded coding slices**.
-
-Each `general` task should:
-
-- cover one coherent responsibility;
-- name relevant PRD acceptance criteria when available;
-- point to only likely relevant files/context;
-- implement and run focused validation;
-- never commit or push;
-- return changed files, validation, assumptions, and remaining risks.
-
-Prefer several coherent bounded tasks over giving one subagent an entire milestone. Do not delegate trivial edits merely to create activity.
-
-Other subagents:
-
-- `locator` — exact files/symbols/references/tests;
-- `explore` — architecture, execution flow, dependencies;
-- `scout` — official external docs/upstreams for concrete version-sensitive questions;
-- `diagnostician` — reproduce non-obvious failures and establish root cause;
-- `fixer` — narrow corrective implementation after diagnosis/scope is clear;
-- `tester` — independent verification without editing;
-- `reviewer` — correctness/regression/security/maintainability review;
-- `critic` — adversarial plan/design review;
-- `flagagent-gate` — final read-only Concept/PRD/milestone compliance.
-
-Use subagents for real specialization, independent review, or context isolation—not ceremony.
-
-Subagents do not own Git history.
-
-## Skills and Plugins
-
-**Superpowers:** use relevant skills when they materially help with non-trivial planning, TDD, debugging, verification, review, or worktree isolation. Do not run the full methodology mechanically for trivial changes.
-
-**Graphify:** use only when difficult cross-file architecture/dependency tracing is not efficiently answered by normal search plus `locator`/`explore`.
-
-Do not let plugins rewrite project configuration or commit generated artifacts unless explicitly requested.
-
-Skills/plugins never override the human, Concept, approved PRD, or security boundaries.
-
-## Donors and Licensing
-
-No donor is copied wholesale.
-
-```text
-research
-→ understand
-→ compare with exact FlagAgent need
-→ reuse concept when sufficient
-→ selectively adapt source only when justified
-→ verify provenance/license
-→ test FlagAgent behavior
-```
-
-For M1, `ctf-agent` is useful for CTF container lifecycle/tooling lessons, but do not inherit permissive competition-oriented sandbox defaults.
-
-Before adapting donor source, establish exact upstream repository, commit SHA, source path/component, license/provenance, reuse mode, and FlagAgent destination.
-
-v0.1.0 source reuse is MIT-only unless the human explicitly changes the policy.
-
-For actual source adaptation, update `THIRD_PARTY_NOTICES.md` and commit provenance before adaptation:
-
-```text
-chore(license): record <donor> provenance
-```
-
-Do not create provenance commits for concept-only learning or independent rewrites.
-
-AGPL/incompatible projects such as BoxPwnr are research/concept references only.
-
-## Git and GitHub
-
-Git history is an engineering artifact. Keep it incremental and recoverable.
-
-The primary agent may commit and push verified FlagAgent checkpoints without a separate instruction for every checkpoint. Subagents remain non-committing.
-
-Before work/checkpoints:
-
-```bash
-git status
-git branch --show-current
-git diff
-git log --oneline -n 10
-```
-
-Do not alter Git identity/signing, remotes, repository visibility, branch protection, or GitHub settings unless explicitly requested.
-
-Commit after a coherent, reviewable unit is complete and relevant verification passes.
-
-Use Conventional Commits 1.0.0:
-
-```text
-<type>[optional scope]: <description>
-```
-
-Preferred types: `feat`, `fix`, `test`, `refactor`, `docs`, `build`, `ci`, `perf`, `chore`.
-
-Examples:
-
-```text
-feat(docker): add run-scoped agent container
-test(docker): prove fresh exec semantics
-fix(docker): bound command output collection
-docs: record M1 containment evidence
-chore(license): record ctf-agent provenance
-```
-
-Before committing:
-
-```bash
-git diff
-git diff --staged
-git status
 git diff --check
 ```
 
-Stage only files belonging to the checkpoint.
+Run the smallest relevant checks first, followed by broader applicable checks.
 
-Push after meaningful verified checkpoints. Do not intentionally push broken/half-implemented state merely as a save point.
+Docker-backed tests require Docker Engine.
 
-Do not push donor repositories. Do not create tags/releases, merge PRs, or publish packages unless explicitly requested.
+Never claim that a test, command, security property, or Docker behavior passed unless it was actually observed.
 
-Never run `git reset --hard`, `git clean -fd`, force-push, or rewrite pushed history unless explicitly requested after explaining the impact.
+When behavior changes, add or update deterministic tests when that behavior can reasonably be tested.
 
-After a successful push, report the branch and latest commit SHA.
+Preserve documented runtime semantics: non-zero shell exits and incorrect flag submissions are execution evidence, not automatically harness errors.
 
-## M1 Workflow
+## Dependencies
 
-```text
-read Concept + approved PRD-M1
-→ inspect M0 implementation/tests/Git
-→ research only concrete unknowns
-→ bounded plan
-→ delegate substantive coding slices to general
-→ primary integrates
-→ targeted deterministic/Docker verification
-→ tester
-→ reviewer
-→ flagagent-gate
-→ fix material findings
-→ rerun affected checks
-→ commit/push coherent checkpoints
-→ report evidence
-→ STOP at M1 gate
-```
+Add dependencies only for a concrete requirement.
 
-`flagagent-gate` supplements deterministic evidence; it does not replace pytest, Docker inspection, resource observations, network probes, verifier results, or other executable checks.
+Prefer the Python standard library or existing dependencies when they adequately solve the task. Do not add dependencies speculatively.
 
-Do not proceed to M2 merely because M1 appears complete.
+When changing dependencies:
+
+1. update `pyproject.toml`;
+2. update `uv.lock` using `uv`;
+3. run the relevant checks.
+
+Do not edit `uv.lock` manually.
+
+## Security Invariants
+
+FlagAgent is intended only for legal and authorized CTFs, security labs, benchmarks, and sandboxed experiments.
+
+Preserve the repository's containment and trust boundaries:
+
+- model-generated challenge commands must not intentionally execute directly on the host;
+- provider and verifier secrets must remain outside Agent and Target containers;
+- unknown model-requested tools must never execute;
+- only the authoritative verifier may establish a solved result;
+- security relaxations must be explicit rather than silent;
+- do not silently broaden container networking or host access;
+- do not automatically execute untrusted challenge provisioning with host privileges.
+
+Docker is a containment baseline, not a perfect isolation boundary.
+
+Do not weaken security controls merely to make a test or challenge work.
+
+## Code and Documentation
+
+Follow existing code style and local patterns before introducing new ones.
+
+Keep implementation, tests, and public documentation consistent. Update the relevant documentation when user-facing behavior changes.
+
+Do not introduce speculative frameworks, generic plugin systems, architectural layers, or generalized abstractions unless a concrete requirement justifies them.
+
+## Third-Party Code
+
+Treat external repositories as references unless source reuse is explicitly justified.
+
+Before copying or adapting third-party source, verify its provenance, license, compatibility, and attribution requirements.
+
+Do not copy code from sources whose licensing is incompatible with FlagAgent.
+
+## Git Safety
+
+Keep changes focused and reviewable.
+
+Use Conventional Commits when creating commits.
+
+Do not modify Git identity, remotes, repository settings, repository visibility, or branch protection unless explicitly requested.
+
+Do not run destructive operations such as `git reset --hard`, `git clean -fd`, force-pushes, or history rewrites without explicit authorization.
 
 ## Definition of Done
 
-A task is done when applicable requirements are satisfied, relevant deterministic/Docker checks pass, M0 semantics remain intact unless explicitly changed, containment claims have observed evidence, dependency state is consistent, no donor/unrelated files changed, material review findings are resolved/reported, coherent work is committed and pushed as required, and the handoff reports verification, Docker evidence, commit SHA(s), branch, and remaining uncertainty.
+A change is complete when:
 
-When uncertain, prefer evidence and the smallest reversible change over speculative architecture.
+- the requested behavior is implemented;
+- relevant deterministic checks pass;
+- security boundaries remain intact;
+- dependency state is consistent;
+- documentation is updated when required; and
+- the final diff contains no unrelated changes.
+
+When uncertain, prefer evidence and the smallest reversible change.
