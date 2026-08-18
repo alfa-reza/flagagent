@@ -18,13 +18,18 @@ A challenge only counts as solved when the trusted verifier accepts a submitted 
 
 ## How it works
 
-```mermaid
-flowchart LR
-    Challenge --> Loop["Agent loop"]
-    Loop <--> Model["Model API"]
-    Loop <-->|"shell"| Sandbox["Docker sandbox"]
-    Loop <-->|"submit_flag"| Verifier
-    Loop --> Artifacts["Run artifacts"]
+```text
+Challenge
+   │
+   ▼
+Agent Loop ────── Model API
+   │
+   ├── shell ─── Docker Sandbox
+   │
+   └── submit_flag ─── Verifier
+   │
+   ▼
+Run Artifacts
 ```
 
 The agent has two tools:
