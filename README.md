@@ -1,124 +1,112 @@
-# FlagAgent
+<div align="center">
 
-FlagAgent is a small single-agent harness for authorized CTFs, security labs, benchmarks, and sandboxed experiments. A model can inspect a challenge through `shell`, submit a candidate through `submit_flag`, and is marked solved only when the trusted verifier accepts it.
+# 🚩 FlagAgent
 
-## v0.1.0 status
+**A small, inspectable LLM agent harness for CTFs, security labs, and reproducible security experiments.**
 
-M0 and M1 are complete. M2 implementation provides the first usable CLI and real-provider adapters for:
+[![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![License](https://img.shields.io/badge/License-AGPL_v3-green.svg)](LICENSE)
 
-- OpenAI-compatible Chat Completions
-- OpenAI-compatible Responses
-- Anthropic-compatible Messages
-- OpenRouter through the OpenAI-compatible Chat Completions path
+</div>
 
-This release is a narrow baseline, not a full CTF distribution or a perfect security boundary. Docker is the containment baseline and shares the host kernel.
+FlagAgent gives a language model a small interface for solving security challenges: run commands in a contained environment, inspect the results, and submit a candidate flag.
 
-Use FlagAgent only against systems and challenges you are authorized to test.
+A challenge only counts as solved when the trusted verifier accepts a submitted flag. Each run is recorded so the model's actions and the final result can be inspected afterwards.
 
-## Requirements
+> [!IMPORTANT]
+> FlagAgent is intended for CTFs, security labs, benchmarks, and systems you are explicitly authorized to test. Do not use it against systems without permission.
 
-The supported reference environment is:
+## How it works
+
+```mermaid
+flowchart LR
+    Challenge --> Loop["Agent loop"]
+    Loop <--> Model["Model API"]
+    Loop <-->|"shell"| Sandbox["Docker sandbox"]
+    Loop <-->|"submit_flag"| Verifier
+    Loop --> Artifacts["Run artifacts"]
+```
+
+The agent has two tools:
+
+- `shell` runs a command inside the Docker sandbox and returns its result.
+- `submit_flag` sends a candidate to the trusted verifier.
+
+Only a verifier-accepted submission marks the run as solved.
+
+## Quick start
+
+### Requirements
 
 - Linux
-- Python 3.12 or newer
-- `uv`
-- Docker Engine with the Docker CLI
+- Python 3.12+
+- [uv](https://docs.astral.sh/uv/)
+- Docker Engine and the Docker CLI
 
-The release gate is tested with Docker Engine 29.7.2 on Linux. Docker Desktop, Podman, macOS, and Windows are not part of the v0.1.0 containment claim.
-
-## Install from a checkout
+Clone the repository and install the project:
 
 ```bash
+git clone https://github.com/alfa-reza/flagagent.git
+cd flagagent
 uv sync
 ```
 
-Build the project-owned sandbox and local target images:
+Build the agent sandbox:
 
 ```bash
 docker build -t flagagent-sandbox:dev images/sandbox
-docker build -t flagagent-target:dev images/target
 ```
 
-The sandbox runs as the non-root `agent` user. The frozen smoke set uses only the Ubuntu base utilities, Python, and `netcat-openbsd`.
-
-## Configure a provider
-
-OpenAI Chat Completions and Responses use `OPENAI_API_KEY` by default:
+Set an API key. For example:
 
 ```bash
-export OPENAI_API_KEY='your-key'
+export OPENAI_API_KEY="your-key"
 ```
 
-Anthropic uses `ANTHROPIC_API_KEY` by default:
-
-```bash
-export ANTHROPIC_API_KEY='your-key'
-```
-
-OpenRouter uses the OpenAI-compatible Chat Completions adapter:
-
-```bash
-export OPENROUTER_API_KEY='your-key'
-```
+Run the included file challenge:
 
 ```bash
 uv run flagagent run \
   --challenge challenges/layered-file \
   --protocol openai-chat \
-  --model openai/gpt-4o-mini \
+  --model your-model
+```
+
+FlagAgent prints the run directory and terminal result when the attempt finishes. The full run is stored under `runs/`.
+
+## Model APIs
+
+FlagAgent currently exposes three protocol paths:
+
+| CLI value | Protocol |
+| --- | --- |
+| `openai-chat` | OpenAI-compatible Chat Completions |
+| `openai-responses` | OpenAI Responses |
+| `anthropic` | Anthropic Messages |
+
+`--api-base` can point an adapter at a compatible endpoint, while `--api-key-env` selects the environment variable containing its API key.
+
+<details>
+<summary>OpenRouter example</summary>
+
+```bash
+export OPENROUTER_API_KEY="your-key"
+
+uv run flagagent run \
+  --challenge challenges/layered-file \
+  --protocol openai-chat \
+  --model provider/model \
   --api-base https://openrouter.ai/api/v1 \
   --api-key-env OPENROUTER_API_KEY
 ```
 
-Use a direct OpenAI endpoint by omitting `--api-base` and `--api-key-env`, or select another supported protocol:
+</details>
 
-```bash
-uv run flagagent run \
-  --challenge challenges/layered-file \
-  --protocol openai-responses \
-  --model your-model
-```
+Provider credentials stay on the control side and are not passed into the agent or target containers.
 
-```bash
-uv run flagagent run \
-  --challenge challenges/layered-file \
-  --protocol anthropic \
-  --model your-model
-```
+## Challenges
 
-Provider credentials stay on the trusted control side. They are not passed to the Agent or Target containers and are not written to Run artifacts.
-
-## Frozen smoke challenges
-
-The repository contains two project-owned fixtures.
-
-### Layered file
-
-```bash
-uv run flagagent run \
-  --challenge challenges/layered-file \
-  --protocol openai-chat \
-  --model your-model
-```
-
-The Agent receives one evidence file in its writable workspace. The challenge requires two base64 decoding steps and a verifier-backed submission. It uses `network_mode: none`.
-
-### Local marker
-
-```bash
-uv run flagagent run \
-  --challenge challenges/local-marker \
-  --protocol openai-chat \
-  --model your-model
-```
-
-The Agent can connect to the project-owned audited target at `target:9999` through a Run-scoped internal Docker network. The target returns the deterministic M1 marker `flagagent-target-ok`. It uses `network_mode: local`.
-
-The smoke fixtures are release evidence, not a claim of broad CTF coverage.
-
-## Custom file challenges
-
-A custom challenge is a directory containing `challenge.json` and, optionally, a `files/` directory:
+A challenge is a directory containing a `challenge.json` descriptor and, optionally, files for the agent to inspect:
 
 ```text
 my-challenge/
@@ -127,7 +115,7 @@ my-challenge/
     └── evidence.bin
 ```
 
-Minimal descriptor:
+A minimal descriptor looks like this:
 
 ```json
 {
@@ -138,58 +126,86 @@ Minimal descriptor:
 }
 ```
 
-Optional `target_context` is prompt context for the audited `local` target mode. Challenge files must be regular files; symlinks, special files, and arbitrary provisioning files are rejected. `expected_flag` remains control-side and is not copied into the Agent workspace.
+Then run it like any other challenge:
+
+```bash
+uv run flagagent run \
+  --challenge path/to/my-challenge \
+  --protocol openai-chat \
+  --model your-model
+```
+
+The expected flag stays on the trusted control side and is not copied into the agent workspace.
+
+Two network modes are currently supported:
+
+- `none` gives the agent no challenge network.
+- `local` connects the agent to a run-scoped internal Docker network with the project-owned target fixture.
+
+The repository includes two small smoke challenges:
+
+- `challenges/layered-file`
+- `challenges/local-marker`
+
+They exercise the harness itself; they are not a benchmark of general CTF capability.
+
+<details>
+<summary>Run the local target challenge</summary>
+
+Build the project-owned target image:
+
+```bash
+docker build -t flagagent-target:dev images/target
+```
+
+Then run:
+
+```bash
+uv run flagagent run \
+  --challenge challenges/local-marker \
+  --protocol openai-chat \
+  --model your-model
+```
+
+The target is reachable from the agent at `target:9999` over a run-scoped internal Docker network.
+
+</details>
 
 ## Run artifacts
 
-Each Run is one attempt under `runs/<run-id>/`:
+Every attempt gets its own directory:
 
 ```text
-run.json       immutable configuration and provenance
-events.jsonl   normalized model/tool/verifier trajectory
-result.json    authoritative terminal result
-writeup.md     deterministic human-readable summary
-workspace/     Run-local writable challenge workspace
+runs/<run-id>/
+├── run.json
+├── events.jsonl
+├── result.json
+├── writeup.md
+└── workspace/
 ```
 
-`run.json`, `events.jsonl`, and `result.json` are authoritative. `writeup.md` is derived from them and does not make another model request.
+| Path | Purpose |
+| --- | --- |
+| `run.json` | Run configuration and provenance |
+| `events.jsonl` | Model, tool, verifier, and lifecycle events |
+| `result.json` | Authoritative terminal result |
+| `writeup.md` | Human-readable summary derived from the run |
+| `workspace/` | Writable workspace used by the agent |
 
-Terminal statuses are:
+`result.json` distinguishes `solved`, `unsolved`, and `error`, so a solver failure is separate from a harness or infrastructure failure.
 
-- `solved`: the authoritative verifier accepted a candidate.
-- `unsolved`: the harness ended normally without a verified flag.
-- `error`: the harness or infrastructure failed, such as a provider, sandbox, verifier, or serialization error.
+## Security model
 
-A missing or invalid `result.json` means that no committed terminal result exists; it is not automatically an `error` or `unsolved` Run.
+FlagAgent treats model-generated commands as untrusted.
 
-## Security and execution limits
+Commands run inside a run-scoped Docker container with a non-root user, dropped Linux capabilities, `no-new-privileges`, explicit resource limits, and no host networking by default. The host Docker socket and provider credentials are not exposed to the agent.
 
-- Model commands execute inside one Run-scoped Docker Agent container.
-- Each `shell` call starts a fresh non-interactive process in that container.
-- Workspace filesystem state persists; shell-local state does not.
-- The Agent is non-root, has no Docker socket, uses no host networking by default, and receives no provider/verifier secrets.
-- CPU, memory, PID, command-time, wall-time, and model-visible output limits are explicit.
-- Unknown tools never execute.
-- Non-zero command exits and incorrect flag submissions are normal evidence.
-- Challenge Dockerfiles, Compose files, Makefiles, and provisioning scripts are not automatically executed.
+For `network_mode: local`, FlagAgent creates a run-scoped internal Docker network for the agent and the project-owned target container. No target port is published to the host.
 
-## Known limitations
+> [!WARNING]
+> Docker is a containment boundary, not a hardened virtual machine. Containers share the host kernel. Use FlagAgent only with workloads and systems you are authorized to run or test.
 
-v0.1.0 intentionally does not provide:
-
-- PTY or persistent interactive sessions
-- provider routing, fallback, or automatic retries beyond the selected SDK behavior
-- automatic retry/best-of-N solving
-- multi-agent or planner/executor workflows
-- resume/checkpoint support
-- external Internet/VPN/CTFd integration
-- automatic tool installation or a full Kali/CTF image
-- streaming UI, TUI, database storage, or benchmark infrastructure
-- advanced exploit write-ups
-
-Only the concrete provider/model combinations tested for the release should be advertised as supported.
-
-## Development checks
+## Development
 
 ```bash
 uv sync
@@ -202,8 +218,8 @@ uv build
 git diff --check
 ```
 
-Docker-backed tests require Docker Engine. Paid provider calls are release evidence and are not part of the ordinary deterministic test suite.
+Docker-backed tests require Docker Engine.
 
 ## License
 
-FlagAgent is released under the GNU Affero General Public License v3.0. See [LICENSE](LICENSE).
+FlagAgent is released under the [GNU Affero General Public License v3.0](LICENSE).
