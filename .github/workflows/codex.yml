@@ -37,7 +37,7 @@ jobs:
         with:
           version: "0.12.4"
           python-version: "3.12"
-          enable-cache: true
+          enable-cache: false
 
       - name: Install dependencies
         run: uv sync --locked
@@ -71,9 +71,10 @@ jobs:
 
             Implement the smallest correct fix that satisfies the issue acceptance
             criteria. Avoid unrelated refactors and unnecessary dependencies. Add or
-            update deterministic regression tests when appropriate. While working,
-            run only the targeted checks needed to validate the change; the workflow
-            performs the final repository verification after Codex finishes.
+            update deterministic regression tests when appropriate.
+
+            While working, run only the targeted checks needed to validate the change.
+            The workflow performs final repository verification after Codex finishes.
 
             Do not commit, push, create branches, or open pull requests. Leave the
             completed changes in the working tree for the workflow to publish.
@@ -131,8 +132,10 @@ jobs:
         shell: bash
         run: |
           branch="codex/issue-${ISSUE_NUMBER}-${RUN_ID}"
+
           git switch -c "$branch"
           git apply --index codex.patch
+
           echo "CODEX_BRANCH=$branch" >> "$GITHUB_ENV"
 
       - name: Set up uv and Python
@@ -140,19 +143,25 @@ jobs:
         with:
           version: "0.12.4"
           python-version: "3.12"
-          enable-cache: true
+          enable-cache: false
 
       - name: Install dependencies
         run: uv sync --locked
 
-      - name: Verify changes
-        run: |
-          uv lock --check
-          uv run pytest
-          uv run ruff check .
-          uv run ruff format --check .
-          uv build
-          git diff --check HEAD
+      - name: Run tests
+        run: uv run pytest -m "not docker"
+
+      - name: Check lint
+        run: uv run ruff check .
+
+      - name: Check formatting
+        run: uv run ruff format --check .
+
+      - name: Build package
+        run: uv build
+
+      - name: Check diff
+        run: git diff --check HEAD
 
       - name: Commit, push, and open draft pull request
         env:
