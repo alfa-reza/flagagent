@@ -25,7 +25,9 @@ def run_solved(tmp_path):
         executor=FakeExecutor([ShellResult("evidence", "", 0, False)]),
         verifier=ExactStringVerifier("Flag{ok}"),
         challenge=ChallengeInput("fixture", "solve it"),
-        limits=Limits(max_model_turns=5, wall_timeout_seconds=100, command_timeout_seconds=10),
+        limits=Limits(
+            max_model_turns=5, wall_timeout_seconds=100, command_timeout_seconds=10
+        ),
         runs_root=tmp_path,
         monotonic=lambda: 0,
         utc_now=lambda: __import__("datetime").datetime.now(__import__("datetime").UTC),
@@ -56,7 +58,11 @@ def test_writeup_is_derived_from_structured_artifacts(tmp_path):
 def test_writeup_does_not_include_expected_flag_or_credentials(tmp_path):
     loop = run_solved(tmp_path)
     run_json = json.loads(loop.artifacts.run_path.read_text())
-    run_json["model"] = {"name": "model", "protocol": "openai-chat", "base_url": "https://example.test"}
+    run_json["model"] = {
+        "name": "model",
+        "protocol": "openai-chat",
+        "base_url": "https://example.test",
+    }
     loop.artifacts.run_path.write_text(json.dumps(run_json))
 
     text = write_writeup(loop.artifacts.directory).read_text()

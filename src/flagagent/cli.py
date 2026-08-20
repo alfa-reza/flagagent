@@ -60,7 +60,13 @@ def load_challenge(root: Path) -> tuple[ChallengeInput, str]:
         raise ValueError("challenge.json must be valid JSON") from error
     if not isinstance(payload, dict):
         raise TypeError("challenge.json must contain an object")
-    allowed = {"identity", "description", "expected_flag", "network_mode", "target_context"}
+    allowed = {
+        "identity",
+        "description",
+        "expected_flag",
+        "network_mode",
+        "target_context",
+    }
     if set(payload) - allowed:
         raise ValueError("challenge.json contains unsupported fields")
     identity = _require_string(payload, "identity")
@@ -75,7 +81,7 @@ def load_challenge(root: Path) -> tuple[ChallengeInput, str]:
     if target_context is not None and not isinstance(target_context, str):
         raise TypeError("challenge target_context must be a string")
     files = root / "files"
-    if files.exists() and (files.is_symlink() or not files.is_dir()):
+    if files.is_symlink() or (files.exists() and not files.is_dir()):
         raise ValueError("challenge files must be a directory")
     source_dir = files if files.exists() else None
     return (

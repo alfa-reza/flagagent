@@ -39,7 +39,9 @@ def _render_actions(events: list[dict[str, Any]]) -> list[str]:
     return lines or ["- no tool actions recorded"]
 
 
-def _render(run: dict[str, Any], events: list[dict[str, Any]], result: dict[str, Any]) -> str:
+def _render(
+    run: dict[str, Any], events: list[dict[str, Any]], result: dict[str, Any]
+) -> str:
     challenge = run.get("challenge", {})
     model = run.get("model", {})
     prompt = run.get("prompt", {})

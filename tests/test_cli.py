@@ -23,7 +23,15 @@ def test_parser_exposes_run_command():
     parser = build_parser()
 
     args = parser.parse_args(
-        ["run", "--challenge", "challenge", "--protocol", "openai-chat", "--model", "model"]
+        [
+            "run",
+            "--challenge",
+            "challenge",
+            "--protocol",
+            "openai-chat",
+            "--model",
+            "model",
+        ]
     )
 
     assert args.command == "run"
@@ -39,6 +47,41 @@ def test_load_challenge_rejects_descriptor_symlink(tmp_path):
 
     with pytest.raises(ValueError, match="regular file"):
         load_challenge(root)
+
+
+def test_load_challenge_rejects_files_symlink(tmp_path):
+    root = write_challenge(tmp_path / "challenge")
+    target = tmp_path / "real_files"
+    target.mkdir()
+    (root / "files").symlink_to(target)
+
+    with pytest.raises(ValueError, match="files must be a directory"):
+        load_challenge(root)
+
+
+def test_load_challenge_rejects_broken_files_symlink(tmp_path):
+    root = write_challenge(tmp_path / "challenge")
+    (root / "files").symlink_to(tmp_path / "missing_target")
+
+    with pytest.raises(ValueError, match="files must be a directory"):
+        load_challenge(root)
+
+
+def test_load_challenge_accepts_absent_files(tmp_path):
+    root = write_challenge(tmp_path / "challenge")
+
+    challenge, _ = load_challenge(root)
+
+    assert challenge.source_dir is None
+
+
+def test_load_challenge_accepts_real_files_directory(tmp_path):
+    root = write_challenge(tmp_path / "challenge")
+    (root / "files").mkdir()
+
+    challenge, _ = load_challenge(root)
+
+    assert challenge.source_dir == root / "files"
 
 
 def test_load_challenge_preserves_network_mode(tmp_path):
@@ -63,8 +106,19 @@ def test_load_challenge_returns_control_data_without_expected_flag_in_input(tmp_
     "payload",
     [
         {"description": "missing identity"},
-        {"identity": "x", "description": "x", "expected_flag": "x", "network_mode": "bad"},
-        {"identity": "x", "description": "x", "expected_flag": "x", "network_mode": "none", "extra": 1},
+        {
+            "identity": "x",
+            "description": "x",
+            "expected_flag": "x",
+            "network_mode": "bad",
+        },
+        {
+            "identity": "x",
+            "description": "x",
+            "expected_flag": "x",
+            "network_mode": "none",
+            "extra": 1,
+        },
     ],
 )
 def test_invalid_descriptor_fails_before_model(tmp_path, payload):
@@ -133,7 +187,12 @@ def test_main_uses_explicit_protocol_and_key_env(monkeypatch, tmp_path):
             return ModelResponse(content="stop")
 
     monkeypatch.setattr("flagagent.cli.ChatCompletionsModel", FakeModel)
-    monkeypatch.setattr("flagagent.cli.DockerExecutor", lambda **kwargs: __import__("flagagent.tools", fromlist=["FakeExecutor"]).FakeExecutor([]))
+    monkeypatch.setattr(
+        "flagagent.cli.DockerExecutor",
+        lambda **kwargs: __import__(
+            "flagagent.tools", fromlist=["FakeExecutor"]
+        ).FakeExecutor([]),
+    )
 
     exit_code = main(
         [
