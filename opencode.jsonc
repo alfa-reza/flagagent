@@ -1,0 +1,18 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "provider": {
+    "9router": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "MyRouter",
+      "options": {
+        "baseURL": "{env:OPENCODE_BASE_URL}",
+        "apiKey": "{env:OPENCODE_API_KEY}"
+      },
+      "models": {
+        "github-actions": {
+          "name": "Opencode Github Actions Fallback Combos"
+        }
+      }
+    }
+  }
+}
