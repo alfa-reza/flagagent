@@ -120,7 +120,7 @@ def _normalize_anthropic_usage(usage: Any) -> dict[str, int] | None:
 
 def _parse_anthropic_response(response: Any) -> ModelResponse:
     stop_reason = getattr(response, "stop_reason", None)
-    if stop_reason is not None and stop_reason not in ("end_turn", "tool_use"):
+    if stop_reason not in ("end_turn", "tool_use"):
         raise ProviderError("messages response has non-normal stop reason")
     content_list = getattr(response, "content", None)
     if not isinstance(content_list, list) or not content_list:
