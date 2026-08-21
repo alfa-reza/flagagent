@@ -290,7 +290,9 @@ def test_anthropic_adapter_translates_system_message():
             create=lambda **kwargs: (
                 calls.append(kwargs)
                 or types.SimpleNamespace(
-                    content=[types.SimpleNamespace(type="text", text="ok")], usage=None
+                    content=[types.SimpleNamespace(type="text", text="ok")],
+                    usage=None,
+                    stop_reason="end_turn",
                 )
             )
         )
