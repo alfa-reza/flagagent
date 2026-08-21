@@ -41,6 +41,14 @@ def test_load_challenge_rejects_descriptor_symlink(tmp_path):
         load_challenge(root)
 
 
+def test_load_challenge_rejects_broken_files_symlink(tmp_path):
+    root = write_challenge(tmp_path / "challenge")
+    (root / "files").symlink_to(tmp_path / "missing-target")
+
+    with pytest.raises(ValueError, match="directory"):
+        load_challenge(root)
+
+
 def test_load_challenge_preserves_network_mode(tmp_path):
     root = write_challenge(tmp_path / "challenge", network_mode="local")
 
