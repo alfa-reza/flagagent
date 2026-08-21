@@ -17,9 +17,9 @@ def _tool_call(call_id, name, arguments_json):
     )
 
 
-def _response(content=None, tool_calls=None, usage=None):
+def _response(content=None, tool_calls=None, usage=None, finish_reason="stop"):
     message = types.SimpleNamespace(content=content, tool_calls=tool_calls)
-    choice = types.SimpleNamespace(message=message, finish_reason="stop")
+    choice = types.SimpleNamespace(message=message, finish_reason=finish_reason)
     return types.SimpleNamespace(choices=[choice], usage=usage)
 
 
@@ -332,4 +332,45 @@ def test_nan_arguments_raise_provider_error_for_strict_json():
     model, _ = _model([response])
 
     with pytest.raises(ProviderError, match="strict JSON"):
+        model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+
+def test_finish_reason_stop_is_normal_text_response():
+    response = _response(content="done", finish_reason="stop")
+    model, _ = _model([response])
+
+    result = model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+    assert isinstance(result, ModelResponse)
+    assert result.content == "done"
+    assert result.tool_calls == ()
+
+
+def test_finish_reason_tool_calls_is_normal_tool_call_response():
+    response = _response(
+        tool_calls=[_tool_call("c1", "shell", json.dumps({"command": "ls"}))],
+        finish_reason="tool_calls",
+    )
+    model, _ = _model([response])
+
+    result = model.generate([{"role": "user", "content": "go"}], TOOL_DEFINITIONS)
+
+    assert result.content == ""
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].call_id == "c1"
+
+
+def test_finish_reason_length_raises_provider_error():
+    response = _response(content="partial", finish_reason="length")
+    model, _ = _model([response])
+
+    with pytest.raises(ProviderError, match="finish reason is not normal"):
+        model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+
+def test_finish_reason_content_filter_raises_provider_error():
+    response = _response(content="", finish_reason="content_filter")
+    model, _ = _model([response])
+
+    with pytest.raises(ProviderError, match="finish reason is not normal"):
         model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
