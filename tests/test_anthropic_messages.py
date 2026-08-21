@@ -55,8 +55,10 @@ def _tool_use_block(call_id, name, input_dict):
     )
 
 
-def _response(content=None, usage=None):
-    return types.SimpleNamespace(content=content or [], usage=usage)
+def _response(content=None, usage=None, stop_reason="end_turn"):
+    return types.SimpleNamespace(
+        content=content or [], usage=usage, stop_reason=stop_reason
+    )
 
 
 def _model(script, model="test-model"):
@@ -126,6 +128,7 @@ def test_ordered_tool_use_normalization():
             _tool_use_block("call-2", "submit_flag", {"candidate": "Flag{x}"}),
         ],
         usage=types.SimpleNamespace(input_tokens=5, output_tokens=3),
+        stop_reason="tool_use",
     )
     model, _ = _model([response])
 
@@ -319,7 +322,7 @@ def test_sdk_error_raises_provider_error():
     ],
 )
 def test_malformed_response_raises_provider_error(content):
-    response = types.SimpleNamespace(content=content, usage=None)
+    response = types.SimpleNamespace(content=content, usage=None, stop_reason="end_turn")
     model, _ = _model([response])
 
     with pytest.raises(ProviderError):
@@ -335,6 +338,7 @@ def test_text_before_tool_use_response_is_valid():
             _text_block("thinking"),
             _tool_use_block("c1", "shell", {"command": "ls"}),
         ],
+        stop_reason="tool_use",
     )
     model, _ = _model([response])
 
@@ -351,6 +355,7 @@ def test_text_after_tool_use_raises_provider_error():
             _tool_use_block("c1", "shell", {"command": "ls"}),
             _text_block("after"),
         ],
+        stop_reason="tool_use",
     )
     model, _ = _model([response])
 
@@ -365,6 +370,7 @@ def test_text_between_tool_uses_raises_provider_error():
             _tool_use_block("c1", "shell", {"command": "ls"}),
             _text_block("after"),
         ],
+        stop_reason="tool_use",
     )
     model, _ = _model([response])
 
@@ -466,3 +472,55 @@ def test_user_message_strips_extra_fields():
     model.generate(messages, TOOL_DEFINITIONS)
 
     assert msgs.calls[0]["messages"] == [{"role": "user", "content": "solve it"}]
+
+
+def test_end_turn_stop_reason_returns_normal_response():
+    response = _response(content=[_text_block("done")], stop_reason="end_turn")
+    model, _ = _model([response])
+
+    result = model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+    assert isinstance(result, ModelResponse)
+    assert result.content == "done"
+    assert result.tool_calls == ()
+
+
+def test_tool_use_stop_reason_returns_tool_calls():
+    response = _response(
+        content=[_tool_use_block("c1", "shell", {"command": "ls"})],
+        stop_reason="tool_use",
+    )
+    model, _ = _model([response])
+
+    result = model.generate([{"role": "user", "content": "go"}], TOOL_DEFINITIONS)
+
+    assert len(result.tool_calls) == 1
+    assert result.tool_calls[0].call_id == "c1"
+    assert result.tool_calls[0].name == "shell"
+
+
+def test_max_tokens_stop_reason_raises_provider_error():
+    response = _response(content=[_text_block("partial")], stop_reason="max_tokens")
+    model, _ = _model([response])
+
+    with pytest.raises(ProviderError, match="non-normal stop reason"):
+        model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+
+@pytest.mark.parametrize("stop_reason", [None, "stop_sequence"])
+def test_non_normal_stop_reason_raises_provider_error(stop_reason):
+    response = _response(content=[_text_block("partial")], stop_reason=stop_reason)
+    model, _ = _model([response])
+
+    with pytest.raises(ProviderError, match="non-normal stop reason"):
+        model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+
+def test_missing_stop_reason_raises_provider_error():
+    response = types.SimpleNamespace(
+        content=[_text_block("partial")], usage=None
+    )
+    model, _ = _model([response])
+
+    with pytest.raises(ProviderError, match="non-normal stop reason"):
+        model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
