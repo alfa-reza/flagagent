@@ -342,6 +342,7 @@ class AgentLoop:
 
     def run(self) -> dict[str, Any]:
         source_error: InvalidChallengeSourceError | None = None
+        source_serialization_error: ValueError | None = None
         try:
             self._source_files, source_sha256, self._source_temporary = (
                 _snapshot_source_files(self.challenge.source_dir)
@@ -350,6 +351,10 @@ class AgentLoop:
             self._source_files = []
             source_sha256 = None
             source_error = error
+        except ValueError as error:
+            self._source_files = []
+            source_sha256 = None
+            source_serialization_error = error
         api_base = _sanitize_api_base(self.api_base)
         selected_id = self.run_id or RunArtifacts.generate_run_id(now=self.utc_now)
         challenge_metadata: dict[str, Any] = {
@@ -417,6 +422,8 @@ class AgentLoop:
                 result = self._result("error", "invalid_challenge_source")
                 self.artifacts.commit_result(result)
                 return result
+            if source_serialization_error is not None:
+                raise source_serialization_error
             _stage_source_files(self.artifacts.workspace, self._source_files)
             active = self._prepare_or_run()
             active_status, active_reason, active_unprocessed = active
