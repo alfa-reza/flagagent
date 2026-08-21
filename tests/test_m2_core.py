@@ -1,5 +1,6 @@
 import hashlib
 import json
+import os
 import types
 from datetime import UTC, datetime
 
@@ -203,6 +204,67 @@ def test_source_staging_failure_does_not_prepare_executor(tmp_path, monkeypatch)
     assert executor.prepared == []
 
 
+def test_snapshot_generic_value_error_remains_serialization_error(
+    tmp_path, monkeypatch
+):
+    executor = PreparingExecutor([])
+
+    def fail_snapshot(_source_dir):
+        raise ValueError("boom")
+
+    monkeypatch.setattr("flagagent.loop._snapshot_source_files", fail_snapshot)
+    loop = make_loop(
+        tmp_path / "runs",
+        ScriptedModel([ModelResponse(content="stop")]),
+        executor=executor,
+        challenge=ChallengeInput(
+            "files", "inspect files", source_dir=tmp_path / "source"
+        ),
+    )
+    result = loop.run()
+
+    assert result["status:reason"] == "error:serialization_error"
+    assert executor.prepared == []
+
+    def fail_invalid(_source_dir):
+        from flagagent.loop import InvalidChallengeSourceError
+
+        raise InvalidChallengeSourceError("bad source")
+
+    monkeypatch.setattr("flagagent.loop._snapshot_source_files", fail_invalid)
+    executor2 = PreparingExecutor([])
+    loop2 = make_loop(
+        tmp_path / "runs2",
+        ScriptedModel([ModelResponse(content="stop")]),
+        executor=executor2,
+        challenge=ChallengeInput(
+            "files", "inspect files", source_dir=tmp_path / "source"
+        ),
+    )
+    result2 = loop2.run()
+
+    assert result2["status:reason"] == "error:invalid_challenge_source"
+    assert executor2.prepared == []
+
+    def fail_unicode(_source_dir):
+        raise UnicodeEncodeError("utf-8", "x", 0, 1, "surrogate")
+
+    monkeypatch.setattr("flagagent.loop._snapshot_source_files", fail_unicode)
+    executor3 = PreparingExecutor([])
+    loop3 = make_loop(
+        tmp_path / "runs3",
+        ScriptedModel([ModelResponse(content="stop")]),
+        executor=executor3,
+        challenge=ChallengeInput(
+            "files", "inspect files", source_dir=tmp_path / "source"
+        ),
+    )
+    result3 = loop3.run()
+
+    assert result3["status:reason"] == "error:serialization_error"
+    assert executor3.prepared == []
+
+
 def test_symlinked_challenge_file_is_rejected_before_prepare(tmp_path):
     source = tmp_path / "source"
     source.mkdir()
@@ -219,7 +281,27 @@ def test_symlinked_challenge_file_is_rejected_before_prepare(tmp_path):
 
     result = loop.run()
 
-    assert result["status:reason"] == "error:serialization_error"
+    assert result["status:reason"] == "error:invalid_challenge_source"
+    assert executor.prepared == []
+    assert loop.artifacts.result_path.exists()
+
+
+def test_special_file_challenge_source_is_rejected_before_prepare(tmp_path):
+    source = tmp_path / "source"
+    source.mkdir()
+    pipe = source / "fifo"
+    os.mkfifo(pipe)
+    executor = PreparingExecutor([])
+    loop = make_loop(
+        tmp_path / "runs",
+        ScriptedModel([ModelResponse(content="stop")]),
+        executor=executor,
+        challenge=ChallengeInput("files", "inspect files", source_dir=source),
+    )
+
+    result = loop.run()
+
+    assert result["status:reason"] == "error:invalid_challenge_source"
     assert executor.prepared == []
     assert loop.artifacts.result_path.exists()
 
