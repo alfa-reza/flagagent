@@ -265,6 +265,8 @@ class ResponsesModel:
         except Exception as error:
             raise ProviderError("responses request failed") from error
         try:
+            if getattr(response, "status", None) == "incomplete":
+                raise ProviderError("responses incomplete")
             output = getattr(response, "output", None)
             content, tool_calls, replay_items = _parse_responses_output(output)
             usage = _normalize_responses_usage(getattr(response, "usage", None))
