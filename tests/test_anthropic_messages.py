@@ -128,6 +128,7 @@ def test_ordered_tool_use_normalization():
             _tool_use_block("call-2", "submit_flag", {"candidate": "Flag{x}"}),
         ],
         usage=types.SimpleNamespace(input_tokens=5, output_tokens=3),
+        stop_reason="tool_use",
     )
     model, _ = _model([response])
 
@@ -321,7 +322,7 @@ def test_sdk_error_raises_provider_error():
     ],
 )
 def test_malformed_response_raises_provider_error(content):
-    response = types.SimpleNamespace(content=content, usage=None)
+    response = types.SimpleNamespace(content=content, usage=None, stop_reason="end_turn")
     model, _ = _model([response])
 
     with pytest.raises(ProviderError):
@@ -337,6 +338,7 @@ def test_text_before_tool_use_response_is_valid():
             _text_block("thinking"),
             _tool_use_block("c1", "shell", {"command": "ls"}),
         ],
+        stop_reason="tool_use",
     )
     model, _ = _model([response])
 
@@ -353,6 +355,7 @@ def test_text_after_tool_use_raises_provider_error():
             _tool_use_block("c1", "shell", {"command": "ls"}),
             _text_block("after"),
         ],
+        stop_reason="tool_use",
     )
     model, _ = _model([response])
 
@@ -367,6 +370,7 @@ def test_text_between_tool_uses_raises_provider_error():
             _tool_use_block("c1", "shell", {"command": "ls"}),
             _text_block("after"),
         ],
+        stop_reason="tool_use",
     )
     model, _ = _model([response])
 
