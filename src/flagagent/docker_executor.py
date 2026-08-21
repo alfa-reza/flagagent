@@ -140,6 +140,7 @@ class DockerExecutor:
     _network_id: str | None = field(default=None, init=False, repr=False)
     _network_name: str | None = field(default=None, init=False, repr=False)
     _resolved_image_id: str | None = field(default=None, init=False, repr=False)
+    _effective_user: str | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.network_mode not in ("none", "local"):
@@ -149,6 +150,18 @@ class DockerExecutor:
             )
 
     # -- lifecycle -----------------------------------------------------------
+
+    def _resolve_effective_user(self, workspace: Path) -> str:
+        try:
+            st = workspace.stat()
+        except OSError:
+            return AGENT_USER
+        uid, gid = int(st.st_uid), int(st.st_gid)
+        if uid == 0 or gid == 0:
+            raise SandboxError(
+                "unsupported host UID/GID 0: running sandbox as root is not allowed"
+            )
+        return f"{uid}:{gid}"
 
     def prepare(self, workspace: Path, run_id: str) -> None:
         """Create and start the Run-scoped Agent sandbox.
@@ -164,6 +177,7 @@ class DockerExecutor:
             validate_run_id(run_id)
         except ValueError as error:
             raise SandboxError(f"invalid run id: {run_id!r}") from error
+        self._effective_user = self._resolve_effective_user(workspace)
         self._container_name = self._container_name_for(run_id)
         if self.network_mode == "local":
             self._prepare_local(workspace, run_id)
@@ -236,6 +250,7 @@ class DockerExecutor:
         Engine/rootful observation.  Called before ``RunArtifacts.create``.
         """
         engine = self._docker_engine_info()
+        user = self._effective_user if self._effective_user is not None else AGENT_USER
         return {
             "backend": "docker",
             "image": self.image,
@@ -243,7 +258,7 @@ class DockerExecutor:
             "memory": self.memory,
             "cpus": self.cpus,
             "pids_limit": self.pids_limit,
-            "container_user": AGENT_USER,
+            "container_user": user,
             "security_relaxations": [],
             "docker_engine": engine["version"],
             "rootless": engine["rootless"],
@@ -431,6 +446,7 @@ class DockerExecutor:
         network = (
             "none" if self.network_mode == "none" else self._network_name_for(run_id)
         )
+        effective = self._effective_user if self._effective_user is not None else AGENT_USER
         return [
             self.docker_bin,
             "run",
@@ -439,7 +455,7 @@ class DockerExecutor:
             self._container_name_for(run_id),
             "--init",
             "--user",
-            AGENT_USER,
+            effective,
             "-w",
             WORKSPACE_TARGET,
             "-v",
@@ -674,12 +690,14 @@ class DockerExecutor:
             self._container_id = None
             self._container_name = None
             self._resolved_image_id = None
+            self._effective_user = None
             err = self._remove_container(cid)
             if err:
                 errors.append(f"agent({cid}): {err}")
         else:
             self._container_name = None
             self._resolved_image_id = None
+            self._effective_user = None
         if self._target_id is not None:
             tid = self._target_id
             self._target_id = None

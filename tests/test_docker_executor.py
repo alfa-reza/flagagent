@@ -638,11 +638,12 @@ def test_container_has_security_posture(docker_exec):
     cap_add = _docker_inspect_json(cid, "{{json .HostConfig.CapAdd}}")
 
     assert privileged == "false"
-    assert user == AGENT_USER
+    assert user == executor._effective_user
+    assert user == executor.sandbox_provenance()["container_user"]
+    assert user not in ("0", "0:0", "root", "root:root")
     assert "no-new-privileges" in security_opt
     assert "ALL" in cap_drop
     assert cap_add == [] or cap_add is None
-    # seccomp is not disabled: no profile override, Docker default stays active
     assert not [opt for opt in security_opt if "seccomp" in opt.lower()]
 
 
@@ -962,3 +963,157 @@ def test_container_cannot_reach_docker_socket(docker_exec):
         "ls /var/run/docker.sock 2>/dev/null && echo FOUND || echo ABSENT", 10
     )
     assert "ABSENT" in result.stdout
+
+# ---------------------------------------------------------------------------
+# Regression: workspace UID/GID mapping (issue #8, no Docker required)
+# ---------------------------------------------------------------------------
+
+
+def test_run_args_use_numeric_user_when_workspace_owner_differs(monkeypatch):
+    """_run_args fallback path is not the fix target; prepare maps to 1001 via host IDs."""
+    from unittest.mock import MagicMock
+
+    from flagagent.docker_executor import DockerExecutor
+
+    executor = DockerExecutor()
+    fake_stat = MagicMock()
+    fake_stat.st_uid = 2001
+    fake_stat.st_gid = 2001
+    with monkeypatch.context() as m:
+        m.setattr(Path, "stat", lambda self: fake_stat)
+        ws = Path("/tmp/fake-ws-2001")
+        user = executor._resolve_effective_user(ws)
+        assert user == "2001:2001"
+        executor._effective_user = user
+        args = executor._run_args(ws, RUN_ID)
+        assert _value(args, "--user") == "2001:2001"
+        # fallback for missing workspace stays agent
+        assert DockerExecutor()._run_args(Path("/nonexistent-flagagent-ws"), RUN_ID).count("agent") >= 1
+        assert _value(DockerExecutor()._run_args(Path("/nonexistent-flagagent-ws"), RUN_ID), "--user") == AGENT_USER
+
+
+def test_prepare_maps_host_ids_to_numeric_user(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from flagagent.docker_executor import DockerExecutor
+
+    fake_stat = MagicMock()
+    fake_stat.st_uid = 1001
+    fake_stat.st_gid = 1001
+
+    def fake_run(args, **kwargs):
+        if args[1] == "run":
+            return _FakeCompleted(stdout="cid123\n")
+        if "{{.State.Running}}" in args:
+            return _FakeCompleted(stdout="true\n")
+        if "{{.Image}}" in args:
+            return _FakeCompleted(stdout="sha256:img\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(Path, "stat", lambda self: fake_stat)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = DockerExecutor()
+    executor.prepare(Path("/tmp/ws"), RUN_ID)
+    assert executor._effective_user == "1001:1001"
+    assert executor.sandbox_provenance()["container_user"] == "1001:1001"
+
+
+def test_prepare_mismatch_uid_uses_numeric_user(monkeypatch):
+    from unittest.mock import MagicMock
+
+    from flagagent.docker_executor import DockerExecutor
+
+    fake_stat = MagicMock()
+    fake_stat.st_uid = 2001
+    fake_stat.st_gid = 2001
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[1] == "run":
+            return _FakeCompleted(stdout="cid123\n")
+        if "{{.State.Running}}" in args:
+            return _FakeCompleted(stdout="true\n")
+        if "{{.Image}}" in args:
+            return _FakeCompleted(stdout="sha256:img\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(Path, "stat", lambda self: fake_stat)
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = DockerExecutor()
+    executor.prepare(Path("/tmp/ws"), RUN_ID)
+    assert executor._effective_user == "2001:2001"
+    assert executor.sandbox_provenance()["container_user"] == "2001:2001"
+    run_args = next(c for c in calls if len(c) > 1 and c[1] == "run")
+    assert _value(run_args, "--user") == "2001:2001"
+
+
+def test_prepare_rejects_root_workspace_owner(monkeypatch):
+    from unittest.mock import MagicMock
+
+    fake_stat = MagicMock()
+    fake_stat.st_uid = 0
+    fake_stat.st_gid = 0
+    monkeypatch.setattr(Path, "stat", lambda self: fake_stat)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _FakeCompleted())
+    executor = DockerExecutor()
+    with pytest.raises(SandboxError, match="unsupported.*UID"):
+        executor.prepare(Path("/tmp/ws"), RUN_ID)
+    assert executor._container_id is None
+
+
+def test_prepare_rejects_gid_zero(monkeypatch):
+    from unittest.mock import MagicMock
+
+    fake_stat = MagicMock()
+    fake_stat.st_uid = 1001
+    fake_stat.st_gid = 0
+    monkeypatch.setattr(Path, "stat", lambda self: fake_stat)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _FakeCompleted())
+    executor = DockerExecutor()
+    with pytest.raises(SandboxError, match="unsupported.*UID"):
+        executor.prepare(Path("/tmp/ws"), RUN_ID)
+
+
+def test_sandbox_provenance_before_prepare_reports_agent(monkeypatch):
+    from flagagent.docker_executor import DockerExecutor
+
+    assert DockerExecutor().sandbox_provenance()["container_user"] == AGENT_USER
+
+
+def test_prepare_root_rejection_maps_via_agentloop(monkeypatch, tmp_path):
+    from unittest.mock import MagicMock
+
+    from flagagent.docker_executor import DockerExecutor
+
+    fake_stat = MagicMock()
+    fake_stat.st_uid = 0
+    fake_stat.st_gid = 0
+    monkeypatch.setattr(Path, "stat", lambda self: fake_stat)
+    executor = DockerExecutor()
+    # Simulate loop path: prepare is called after RunArtifacts.create
+    # so rejection should raise SandboxError (loop maps to error:sandbox_error)
+    with pytest.raises(SandboxError, match="unsupported.*UID"):
+        executor.prepare(Path(tmp_path) / "ws", RUN_ID)
+
+
+@docker
+def test_workspace_writable_for_host_uid(docker_exec):
+    """Regression: /workspace is writable when host UID != 1000 (here 1001)."""
+    executor, _, _ = docker_exec
+    result = executor.execute("touch /workspace/test.txt && echo ok", 10)
+    assert result.exit_code == 0
+    assert "ok" in result.stdout
+    check = executor.execute("test -f /workspace/test.txt && echo present", 10)
+    assert "present" in check.stdout
+
+
+@docker
+def test_prepare_provenance_matches_docker_user(docker_exec):
+    executor, _, _ = docker_exec
+    cid = executor._container_id
+    user = _docker_inspect(cid, "{{.Config.User}}")
+    assert user == executor._effective_user
+    assert user == executor.sandbox_provenance()["container_user"]
+    assert user != "0"
+    assert user != "0:0"
