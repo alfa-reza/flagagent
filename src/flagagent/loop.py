@@ -27,6 +27,10 @@ from flagagent.tools import (
 )
 
 
+class InvalidChallengeSourceError(ValueError):
+    pass
+
+
 @dataclass(frozen=True)
 class ChallengeInput:
     identity: str
@@ -107,26 +111,32 @@ def _snapshot_source_files(
         )
     except OSError as error:
         temporary.cleanup()
-        raise ValueError("challenge source_dir must be a directory") from error
+        raise InvalidChallengeSourceError(
+            "challenge source_dir must be a directory"
+        ) from error
 
     def visit(directory_fd: int, relative: Path) -> None:
         try:
             entries = list(os.scandir(directory_fd))
         except OSError as error:
-            raise ValueError("challenge source cannot be read") from error
+            raise InvalidChallengeSourceError(
+                "challenge source cannot be read"
+            ) from error
         for entry in sorted(entries, key=lambda item: item.name):
             entry_relative = relative / entry.name
             if entry_relative.is_absolute() or ".." in entry_relative.parts:
-                raise ValueError("challenge source path is unsafe")
+                raise InvalidChallengeSourceError("challenge source path is unsafe")
             try:
                 entry_stat = os.stat(
                     entry.name, dir_fd=directory_fd, follow_symlinks=False
                 )
             except OSError as error:
-                raise ValueError("challenge source cannot be inspected") from error
+                raise InvalidChallengeSourceError(
+                    "challenge source cannot be inspected"
+                ) from error
             mode = entry_stat.st_mode
             if stat.S_ISLNK(mode):
-                raise ValueError("challenge source contains a symlink")
+                raise InvalidChallengeSourceError("challenge source contains a symlink")
             if stat.S_ISDIR(mode):
                 try:
                     child_fd = os.open(
@@ -135,7 +145,9 @@ def _snapshot_source_files(
                         dir_fd=directory_fd,
                     )
                 except OSError as error:
-                    raise ValueError("challenge source directory changed") from error
+                    raise InvalidChallengeSourceError(
+                        "challenge source directory changed"
+                    ) from error
                 try:
                     visit(child_fd, entry_relative)
                 finally:
@@ -150,10 +162,14 @@ def _snapshot_source_files(
                         dir_fd=directory_fd,
                     )
                 except OSError as error:
-                    raise ValueError("challenge source file changed") from error
+                    raise InvalidChallengeSourceError(
+                        "challenge source file changed"
+                    ) from error
                 try:
                     if not stat.S_ISREG(os.fstat(source_fd).st_mode):
-                        raise ValueError("challenge source contains a special file")
+                        raise InvalidChallengeSourceError(
+                            "challenge source contains a special file"
+                        )
                     with os.fdopen(source_fd, "rb") as source_handle:
                         source_fd = -1
                         with snapshot.open("wb") as snapshot_handle:
@@ -165,7 +181,9 @@ def _snapshot_source_files(
                         os.close(source_fd)
                 files.append((snapshot, entry_relative))
             else:
-                raise ValueError("challenge source contains a special file")
+                raise InvalidChallengeSourceError(
+                    "challenge source contains a special file"
+                )
 
     try:
         visit(root_fd, Path())
@@ -323,15 +341,20 @@ class AgentLoop:
         return result
 
     def run(self) -> dict[str, Any]:
-        source_error: ValueError | None = None
+        source_error: InvalidChallengeSourceError | None = None
+        source_serialization_error: ValueError | None = None
         try:
             self._source_files, source_sha256, self._source_temporary = (
                 _snapshot_source_files(self.challenge.source_dir)
             )
-        except ValueError as error:
+        except InvalidChallengeSourceError as error:
             self._source_files = []
             source_sha256 = None
             source_error = error
+        except ValueError as error:
+            self._source_files = []
+            source_sha256 = None
+            source_serialization_error = error
         api_base = _sanitize_api_base(self.api_base)
         selected_id = self.run_id or RunArtifacts.generate_run_id(now=self.utc_now)
         challenge_metadata: dict[str, Any] = {
@@ -396,7 +419,11 @@ class AgentLoop:
         terminal_written = False
         try:
             if source_error is not None:
-                raise source_error
+                result = self._result("error", "invalid_challenge_source")
+                self.artifacts.commit_result(result)
+                return result
+            if source_serialization_error is not None:
+                raise source_serialization_error
             _stage_source_files(self.artifacts.workspace, self._source_files)
             active = self._prepare_or_run()
             active_status, active_reason, active_unprocessed = active
