@@ -365,6 +365,82 @@ def test_cleanup_failure_does_not_rewrite_result_with_provenance(tmp_path):
 docker = pytest.mark.docker
 
 
+def test_agentloop_persisted_provenance_matches_effective_user(tmp_path):
+    """Regression: AgentLoop persisted sandbox provenance must reflect the
+    effective runtime user resolved during prepare, not the pre-prepare
+    AGENT_USER fallback.
+
+    Simulates a 1001:1001 host: sandbox_provenance before prepare returns
+    AGENT_USER, after prepare it returns 1001:1001. Persisted run.json must
+    contain 1001:1001.
+    """
+
+    class DynamicProvenanceExecutor(FakeExecutor):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self._effective: str | None = None
+
+        def prepare(self, workspace: Path, run_id: str) -> None:
+            super().prepare(workspace, run_id)
+            self._effective = "1001:1001"
+
+        def sandbox_provenance(self):
+            if self._effective is None:
+                return {
+                    "backend": "docker",
+                    "image": "test:dev",
+                    "network_mode": "none",
+                    "container_user": AGENT_USER,
+                }
+            return {
+                "backend": "docker",
+                "image": "test:dev",
+                "network_mode": "none",
+                "container_user": self._effective,
+            }
+
+        def sandbox_lifecycle(self):
+            return {"agent_container_id": "cid123", "image_id": "sha256:abc"}
+
+    executor = DynamicProvenanceExecutor([])
+    loop = build_loop(tmp_path, [ModelResponse(content="stop")], executor=executor)
+    result = loop.run()
+    assert result["status:reason"] == "unsolved:model_stop"
+    run_json = json.loads(loop.artifacts.run_path.read_text())
+    assert run_json["sandbox"]["container_user"] == "1001:1001"
+
+
+def test_agentloop_stat_failure_is_sandbox_error_before_model(tmp_path, monkeypatch):
+    """When workspace ownership cannot be inspected, prepare must fail with
+    SandboxError before any model execution."""
+    from flagagent.tools import SandboxError
+
+    class StatFailExecutor(FakeExecutor):
+        def prepare(self, workspace: Path, run_id: str) -> None:
+            raise SandboxError("workspace ownership unavailable: stat failed")
+
+        def sandbox_provenance(self):
+            return {"backend": "docker", "container_user": AGENT_USER}
+
+    class CountingModel(ScriptedModel):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.generate_calls = 0
+
+        def generate(self, messages, tools):
+            self.generate_calls += 1
+            return super().generate(messages, tools)
+
+    model = CountingModel([ModelResponse(content="stop")])
+    executor = StatFailExecutor([])
+    loop = build_loop(tmp_path, responses=[], executor=executor)
+    loop.model = model
+    result = loop.run()
+    assert result["status:reason"] == "error:sandbox_error"
+    assert model.generate_calls == 0
+    assert executor.calls == []
+
+
 @docker
 def test_docker_e2e_solved_run_with_provenance_and_cleanup(tmp_path, sandbox_image):
     """End-to-end: ScriptedModel + DockerExecutor + ExactStringVerifier.
@@ -427,7 +503,9 @@ def test_docker_e2e_solved_run_with_provenance_and_cleanup(tmp_path, sandbox_ima
     assert sandbox["memory"] == "2g"
     assert sandbox["cpus"] == "2"
     assert sandbox["pids_limit"] == 256
-    assert sandbox["container_user"] == AGENT_USER
+    assert sandbox["container_user"] == executor._effective_user
+    assert sandbox["container_user"] != "0"
+    assert sandbox["container_user"] != "0:0"
     assert sandbox["security_relaxations"] == []
     assert sandbox["docker_engine"] is not None
     assert sandbox["rootless"] is not None

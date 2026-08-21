@@ -178,6 +178,13 @@ def test_network_and_target_names_are_run_scoped():
 
 
 def test_local_prepare_network_create_failure_raises_sandbox_error(monkeypatch):
+    from unittest.mock import MagicMock
+
+    fake_stat = MagicMock()
+    fake_stat.st_uid = 1000
+    fake_stat.st_gid = 1000
+    monkeypatch.setattr(Path, "stat", lambda self: fake_stat)
+
     def fake_run(args, **kwargs):
         if args[1:3] == ["network", "create"]:
             return _FakeRun(returncode=1, stderr="Error: network exists")
@@ -194,6 +201,12 @@ def test_local_prepare_network_create_failure_raises_sandbox_error(monkeypatch):
 
 
 def test_local_prepare_target_create_failure_cleans_up_network(monkeypatch):
+    from unittest.mock import MagicMock
+
+    fake_stat = MagicMock()
+    fake_stat.st_uid = 1000
+    fake_stat.st_gid = 1000
+    monkeypatch.setattr(Path, "stat", lambda self: fake_stat)
     state = {"network_removed": False}
 
     def fake_run(args, **kwargs):
@@ -218,6 +231,12 @@ def test_local_prepare_target_create_failure_cleans_up_network(monkeypatch):
 def test_local_prepare_readiness_failure_raises_sandbox_error_and_cleans_up(
     monkeypatch,
 ):
+    from unittest.mock import MagicMock
+
+    fake_stat = MagicMock()
+    fake_stat.st_uid = 1000
+    fake_stat.st_gid = 1000
+    monkeypatch.setattr(Path, "stat", lambda self: fake_stat)
     state = {
         "network_created": False,
         "network_removed": False,

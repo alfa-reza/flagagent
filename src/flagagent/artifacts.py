@@ -187,6 +187,11 @@ class RunArtifacts:
             raise FileExistsError(self.result_path)
         _atomic_json(self.result_path, result)
 
+    def refresh_sandbox_provenance(self, provenance: Mapping[str, Any]) -> None:
+        raw = json.loads(self.run_path.read_text(encoding="utf-8"))
+        raw["sandbox"] = dict(provenance)
+        _atomic_json(self.run_path, raw)
+
     def close(self) -> None:
         if not self._events.closed:
             self._events.close()

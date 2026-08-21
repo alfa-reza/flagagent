@@ -455,6 +455,10 @@ class AgentLoop:
                 prepare(self.artifacts.workspace, self.artifacts.run_id)
             except SandboxError:
                 return self._error("sandbox_error", "sandbox")
+            provenance = getattr(self.executor, "sandbox_provenance", None)
+            if provenance is not None:
+                with contextlib.suppress(Exception):
+                    self.artifacts.refresh_sandbox_provenance(provenance())
             lifecycle = getattr(self.executor, "sandbox_lifecycle", None)
             if lifecycle is not None:
                 with contextlib.suppress(Exception):

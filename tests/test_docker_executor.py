@@ -197,6 +197,12 @@ def test_prepare_rejects_unsafe_run_id_before_docker_calls(monkeypatch, bad_id):
 
 
 def test_prepare_accepts_safe_run_ids_without_docker_side_effects(monkeypatch):
+    from unittest.mock import MagicMock
+
+    fake_stat = MagicMock()
+    fake_stat.st_uid = 1000
+    fake_stat.st_gid = 1000
+    monkeypatch.setattr(Path, "stat", lambda self: fake_stat)
     executor = DockerExecutor()
     executor.docker_bin = "/nonexistent-flagagent-docker"
     with pytest.raises(SandboxError, match="docker CLI not found"):
@@ -254,9 +260,15 @@ def test_execute_raises_sandbox_error_when_container_missing(monkeypatch):
 
 
 def test_prepare_raises_sandbox_error_when_docker_missing(monkeypatch):
+    from unittest.mock import MagicMock
+
     def _not_found(*a, **kw):
         raise FileNotFoundError("docker")
 
+    fake_stat = MagicMock()
+    fake_stat.st_uid = 1000
+    fake_stat.st_gid = 1000
+    monkeypatch.setattr(Path, "stat", lambda self: fake_stat)
     monkeypatch.setattr(subprocess, "run", _not_found)
     executor = DockerExecutor()
     with pytest.raises(SandboxError):
@@ -264,11 +276,17 @@ def test_prepare_raises_sandbox_error_when_docker_missing(monkeypatch):
 
 
 def test_prepare_raises_sandbox_error_on_docker_run_failure(monkeypatch):
+    from unittest.mock import MagicMock
+
     class FakeResult:
         returncode = 1
         stdout = ""
         stderr = "Error: no such image"
 
+    fake_stat = MagicMock()
+    fake_stat.st_uid = 1000
+    fake_stat.st_gid = 1000
+    monkeypatch.setattr(Path, "stat", lambda self: fake_stat)
     monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeResult())
     executor = DockerExecutor()
     with pytest.raises(SandboxError, match="docker run failed"):
@@ -970,7 +988,6 @@ def test_container_cannot_reach_docker_socket(docker_exec):
 
 
 def test_run_args_use_numeric_user_when_workspace_owner_differs(monkeypatch):
-    """_run_args fallback path is not the fix target; prepare maps to 1001 via host IDs."""
     from unittest.mock import MagicMock
 
     from flagagent.docker_executor import DockerExecutor
@@ -987,9 +1004,6 @@ def test_run_args_use_numeric_user_when_workspace_owner_differs(monkeypatch):
         executor._effective_user = user
         args = executor._run_args(ws, RUN_ID)
         assert _value(args, "--user") == "2001:2001"
-        # fallback for missing workspace stays agent
-        assert DockerExecutor()._run_args(Path("/nonexistent-flagagent-ws"), RUN_ID).count("agent") >= 1
-        assert _value(DockerExecutor()._run_args(Path("/nonexistent-flagagent-ws"), RUN_ID), "--user") == AGENT_USER
 
 
 def test_prepare_maps_host_ids_to_numeric_user(monkeypatch):
@@ -1091,10 +1105,79 @@ def test_prepare_root_rejection_maps_via_agentloop(monkeypatch, tmp_path):
     fake_stat.st_gid = 0
     monkeypatch.setattr(Path, "stat", lambda self: fake_stat)
     executor = DockerExecutor()
-    # Simulate loop path: prepare is called after RunArtifacts.create
-    # so rejection should raise SandboxError (loop maps to error:sandbox_error)
     with pytest.raises(SandboxError, match="unsupported.*UID"):
         executor.prepare(Path(tmp_path) / "ws", RUN_ID)
+
+
+def test_resolve_effective_user_stat_failure_raises_sandbox_error(monkeypatch):
+    from flagagent.docker_executor import DockerExecutor
+
+    def failing_stat(self):
+        raise OSError("stat failed")
+
+    monkeypatch.setattr(Path, "stat", failing_stat)
+    executor = DockerExecutor()
+    with pytest.raises(SandboxError, match="ownership unavailable"):
+        executor._resolve_effective_user(Path("/tmp/ws"))
+
+
+def test_prepare_stat_failure_raises_sandbox_error_before_container(monkeypatch):
+    from flagagent.docker_executor import DockerExecutor
+
+    def failing_stat(self):
+        raise OSError("stat failed")
+
+    def fail_run(*args, **kwargs):
+        raise AssertionError("docker run must not be called when stat fails")
+
+    monkeypatch.setattr(Path, "stat", failing_stat)
+    monkeypatch.setattr(subprocess, "run", fail_run)
+    executor = DockerExecutor()
+    with pytest.raises(SandboxError, match="ownership unavailable"):
+        executor.prepare(Path("/tmp/ws"), RUN_ID)
+    assert executor._container_id is None
+
+
+def test_agentloop_stat_failure_does_not_execute_model(tmp_path, monkeypatch):
+    from flagagent.docker_executor import DockerExecutor
+    from flagagent.loop import AgentLoop, ChallengeInput, Limits
+    from flagagent.model import ModelResponse, ScriptedModel
+    from flagagent.tools import ExactStringVerifier
+
+    orig_stat = Path.stat
+
+    def patched_stat(self, *a, **kw):
+        if str(self).endswith("workspace"):
+            raise OSError("stat failed")
+        return orig_stat(self, *a, **kw)
+
+    monkeypatch.setattr(Path, "stat", patched_stat)
+    executor = DockerExecutor()
+
+    class CountingModel(ScriptedModel):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.generate_calls = 0
+
+        def generate(self, messages, tools):
+            self.generate_calls += 1
+            return super().generate(messages, tools)
+
+    model = CountingModel([ModelResponse(content="stop")])
+    loop = AgentLoop(
+        model=model,
+        executor=executor,
+        verifier=ExactStringVerifier("Flag{never}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(max_model_turns=5, wall_timeout_seconds=120, command_timeout_seconds=30),
+        runs_root=tmp_path,
+        monotonic=lambda: 0.0,
+        utc_now=lambda: __import__("datetime", fromlist=["datetime"]).datetime.now(__import__("datetime").UTC),
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    result = loop.run()
+    assert result["status:reason"] == "error:sandbox_error"
+    assert model.generate_calls == 0
 
 
 @docker

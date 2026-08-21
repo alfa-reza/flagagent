@@ -154,8 +154,8 @@ class DockerExecutor:
     def _resolve_effective_user(self, workspace: Path) -> str:
         try:
             st = workspace.stat()
-        except OSError:
-            return AGENT_USER
+        except OSError as error:
+            raise SandboxError(f"workspace ownership unavailable: {error}") from error
         uid, gid = int(st.st_uid), int(st.st_gid)
         if uid == 0 or gid == 0:
             raise SandboxError(
