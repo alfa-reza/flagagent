@@ -61,9 +61,13 @@ def _serialize_tool_result(result: Any) -> str:
         return str(result)
 
 
-def _to_anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _to_anthropic_messages(
+    messages: list[dict[str, Any]],
+    thinking_history: list[list[dict[str, Any]]] | None = None,
+) -> list[dict[str, Any]]:
     result: list[dict[str, Any]] = []
     index = 0
+    assistant_index = 0
     while index < len(messages):
         message = messages[index]
         role = message["role"]
@@ -72,6 +76,11 @@ def _to_anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any
             index += 1
         elif role == "assistant":
             blocks: list[dict[str, Any]] = []
+            if thinking_history is not None and assistant_index < len(
+                thinking_history
+            ):
+                for tb in thinking_history[assistant_index]:
+                    blocks.append(dict(tb))
             content = message.get("content") or ""
             if content:
                 blocks.append({"type": "text", "text": content})
@@ -86,6 +95,7 @@ def _to_anthropic_messages(messages: list[dict[str, Any]]) -> list[dict[str, Any
                 )
             if blocks:
                 result.append({"role": "assistant", "content": blocks})
+            assistant_index += 1
             index += 1
         elif role == "tool":
             tool_results: list[dict[str, Any]] = []
@@ -118,7 +128,9 @@ def _normalize_anthropic_usage(usage: Any) -> dict[str, int] | None:
     return result
 
 
-def _parse_anthropic_response(response: Any) -> ModelResponse:
+def _parse_anthropic_response(
+    response: Any,
+) -> tuple[ModelResponse, list[dict[str, Any]]]:
     stop_reason = getattr(response, "stop_reason", None)
     if stop_reason not in ("end_turn", "tool_use"):
         raise ProviderError("messages response has non-normal stop reason")
@@ -127,6 +139,7 @@ def _parse_anthropic_response(response: Any) -> ModelResponse:
         raise ProviderError("messages response has no content")
     text_parts: list[str] = []
     tool_calls: list[ToolCall] = []
+    thinking_blocks: list[dict[str, Any]] = []
     seen_tool_use = False
     for block in content_list:
         block_type = getattr(block, "type", None)
@@ -137,6 +150,25 @@ def _parse_anthropic_response(response: Any) -> ModelResponse:
             if seen_tool_use:
                 raise ProviderError("text block after tool use is not supported")
             text_parts.append(text)
+        elif block_type == "thinking":
+            thinking = getattr(block, "thinking", None)
+            signature = getattr(block, "signature", None)
+            if not isinstance(thinking, str) or not isinstance(signature, str):
+                raise ProviderError("thinking block missing required fields")
+            if seen_tool_use:
+                raise ProviderError("thinking block after tool use is not supported")
+            thinking_blocks.append(
+                {"type": "thinking", "thinking": thinking, "signature": signature}
+            )
+        elif block_type == "redacted_thinking":
+            data = getattr(block, "data", None)
+            if not isinstance(data, str):
+                raise ProviderError("redacted thinking block missing data")
+            if seen_tool_use:
+                raise ProviderError(
+                    "redacted thinking block after tool use is not supported"
+                )
+            thinking_blocks.append({"type": "redacted_thinking", "data": data})
         elif block_type == "tool_use":
             call_id = getattr(block, "id", None)
             if not isinstance(call_id, str) or not call_id:
@@ -158,7 +190,10 @@ def _parse_anthropic_response(response: Any) -> ModelResponse:
             raise ProviderError("unsupported content block type")
     content = "".join(text_parts)
     usage = _normalize_anthropic_usage(getattr(response, "usage", None))
-    return ModelResponse(content=content, tool_calls=tuple(tool_calls), usage=usage)
+    return (
+        ModelResponse(content=content, tool_calls=tuple(tool_calls), usage=usage),
+        thinking_blocks,
+    )
 
 
 @dataclass
@@ -168,6 +203,9 @@ class AnthropicMessagesModel:
     base_url: str | None = None
     client: Any = field(default=None)
     _remaining_budget: float | None = field(default=None, init=False, repr=False)
+    _thinking_history: list[list[dict[str, Any]]] = field(
+        default_factory=list, init=False, repr=False
+    )
 
     def __post_init__(self) -> None:
         if self.client is None:
@@ -201,7 +239,8 @@ class AnthropicMessagesModel:
             None,
         )
         request_messages = _to_anthropic_messages(
-            [message for message in messages if message.get("role") != "system"]
+            [message for message in messages if message.get("role") != "system"],
+            self._thinking_history,
         )
         request_tools = [_to_anthropic_tool(tool) for tool in tools]
         kwargs: dict[str, Any] = {
@@ -223,7 +262,9 @@ class AnthropicMessagesModel:
         except Exception as error:
             raise ProviderError("messages request failed") from error
         try:
-            return _parse_anthropic_response(response)
+            model_response, thinking_blocks = _parse_anthropic_response(response)
+            self._thinking_history.append(thinking_blocks)
+            return model_response
         except ProviderError:
             raise
         except (AttributeError, TypeError, ValueError, IndexError, KeyError) as error:
