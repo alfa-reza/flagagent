@@ -224,6 +224,56 @@ def test_run_json_replacement_failure_leaves_no_metadata_or_events(
 
     assert not (run_dir / "run.json").exists()
     assert not (run_dir / "events.jsonl").exists()
+    assert not run_dir.exists()
+
+
+def test_run_json_failure_rolls_back_directory_and_allows_retry(tmp_path, monkeypatch):
+    original_replace = __import__("os").replace
+
+    def fail_run_json_replace(source, destination):
+        if str(destination).endswith("run.json"):
+            raise OSError("run.json replace failed")
+        return original_replace(source, destination)
+
+    monkeypatch.setattr("flagagent.artifacts.os.replace", fail_run_json_replace)
+    run_dir = tmp_path / metadata()["run_id"]
+
+    with pytest.raises(OSError, match="run.json replace failed"):
+        RunArtifacts.create(
+            tmp_path, metadata(), run_id=metadata()["run_id"], now=lambda: FIXED_TIME
+        )
+
+    assert not run_dir.exists()
+
+    monkeypatch.setattr("flagagent.artifacts.os.replace", original_replace)
+
+    artifacts = RunArtifacts.create(
+        tmp_path, metadata(), run_id=metadata()["run_id"], now=lambda: FIXED_TIME
+    )
+    assert artifacts.directory == run_dir
+    assert artifacts.workspace.is_dir()
+    assert json.loads(artifacts.run_path.read_text()) == metadata()
+    assert artifacts.events_path.exists()
+
+
+def test_failed_create_does_not_remove_preexisting_directory(tmp_path):
+    existing = RunArtifacts.create(
+        tmp_path, metadata(), run_id=metadata()["run_id"], now=lambda: FIXED_TIME
+    )
+    sentinel = existing.directory / "sentinel.txt"
+    sentinel.write_text("preserve")
+    run_dir = tmp_path / metadata()["run_id"]
+
+    with pytest.raises(FileExistsError):
+        RunArtifacts.create(
+            tmp_path, metadata(), run_id=metadata()["run_id"], now=lambda: FIXED_TIME
+        )
+
+    assert run_dir.exists()
+    assert (run_dir / "run.json").exists()
+    assert json.loads((run_dir / "run.json").read_text()) == metadata()
+    assert sentinel.read_text() == "preserve"
+    assert (run_dir / "workspace").is_dir()
 
 
 def test_failed_result_replace_leaves_no_committed_result(tmp_path, monkeypatch):
