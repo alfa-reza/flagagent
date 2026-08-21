@@ -269,3 +269,33 @@ def test_new_model_has_no_prior_state():
     generate(model)
 
     assert responses.calls[0]["input"] == [{"role": "user", "content": "solve"}]
+
+
+def test_incomplete_reasoning_only_raises_provider_error():
+    incomplete = types.SimpleNamespace(
+        status="incomplete", output=[reasoning_item()], usage=None
+    )
+    model, _ = make_model([incomplete])
+
+    with pytest.raises(ProviderError, match="incomplete"):
+        generate(model)
+
+
+def test_incomplete_empty_output_raises_provider_error():
+    incomplete = types.SimpleNamespace(status="incomplete", output=[], usage=None)
+    model, _ = make_model([incomplete])
+
+    with pytest.raises(ProviderError, match="incomplete"):
+        generate(model)
+
+
+def test_completed_status_returns_normal_response():
+    completed = types.SimpleNamespace(
+        status="completed", output=[message_item("ok")], usage=None
+    )
+    model, _ = make_model([completed])
+
+    result = generate(model)
+
+    assert result.content == "ok"
+    assert result.tool_calls == ()
