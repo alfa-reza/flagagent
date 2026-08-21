@@ -231,6 +231,6 @@ def test_model_response_returned_after_wall_deadline_is_preserved(tmp_path):
     assert len(model_responses) == 1
     assert model_responses[0]["payload"]["tool_calls"][0]["call_id"] == "c1"
     assert any(m["role"] == "assistant" for m in loop.messages)
-    terminal = [e for e in events if e["type"] == "terminal_decision"][0]
+    terminal = next(e for e in events if e["type"] == "terminal_decision")
     assert terminal["payload"]["unprocessed_call_ids"] == ["c1"]
     assert not any(e["type"] == "tool_call" for e in events)

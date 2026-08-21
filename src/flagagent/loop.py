@@ -480,7 +480,11 @@ class AgentLoop:
             )
             if duplicate is not None:
                 if self._expired():
-                    return "unsolved", "wall_limit", [call.call_id for call in response.tool_calls]
+                    return (
+                        "unsolved",
+                        "wall_limit",
+                        [call.call_id for call in response.tool_calls],
+                    )
                 return self._error("provider_error", "model")
             self._seen_call_ids.update(call.call_id for call in response.tool_calls)
             self.messages.append(
@@ -491,7 +495,11 @@ class AgentLoop:
                 }
             )
             if self._expired():
-                return "unsolved", "wall_limit", [call.call_id for call in response.tool_calls]
+                return (
+                    "unsolved",
+                    "wall_limit",
+                    [call.call_id for call in response.tool_calls],
+                )
             if not response.tool_calls:
                 return "unsolved", "model_stop", []
             terminal = self._dispatch(response)
