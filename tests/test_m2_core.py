@@ -228,7 +228,8 @@ def _provider_response(content="ok"):
     return types.SimpleNamespace(
         choices=[
             types.SimpleNamespace(
-                message=types.SimpleNamespace(content=content, tool_calls=None)
+                message=types.SimpleNamespace(content=content, tool_calls=None),
+                finish_reason="stop",
             )
         ],
         usage=None,

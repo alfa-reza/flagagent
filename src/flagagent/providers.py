@@ -140,28 +140,54 @@ def _parse_chat_response(response: Any) -> ModelResponse:
     choices = getattr(response, "choices", None)
     if not isinstance(choices, list) or not choices:
         raise ProviderError("chat completions response has no choices")
-    message = getattr(choices[0], "message", None)
+    choice = choices[0]
+    if isinstance(choice, Mapping):
+        finish_reason = choice.get("finish_reason")
+        message = choice.get("message")
+    else:
+        finish_reason = getattr(choice, "finish_reason", None)
+        message = getattr(choice, "message", None)
+    if finish_reason not in {"stop", "tool_calls"}:
+        raise ProviderError("chat completions finish reason is not normal")
     if message is None:
         raise ProviderError("chat completions response missing message")
-    raw_content = getattr(message, "content", None)
+    if isinstance(message, Mapping):
+        raw_content = message.get("content")
+        raw_tool_calls = message.get("tool_calls")
+    else:
+        raw_content = getattr(message, "content", None)
+        raw_tool_calls = getattr(message, "tool_calls", None)
     content = raw_content if isinstance(raw_content, str) else ""
-    raw_tool_calls = getattr(message, "tool_calls", None)
     if raw_tool_calls is None:
         raw_tool_calls = []
     elif not isinstance(raw_tool_calls, list):
         raise ProviderError("tool calls must be a list")
     tool_calls: list[ToolCall] = []
     for raw in raw_tool_calls:
-        call_id = getattr(raw, "id", None)
+        if isinstance(raw, Mapping):
+            call_id = raw.get("id")
+            function = raw.get("function")
+            if isinstance(function, Mapping):
+                name = function.get("name")
+                arguments_str = function.get("arguments")
+            else:
+                name = getattr(function, "name", None) if function is not None else None
+                arguments_str = (
+                    getattr(function, "arguments", None) if function is not None else None
+                )
+        else:
+            call_id = getattr(raw, "id", None)
+            function = getattr(raw, "function", None)
+            if function is None:
+                raise ProviderError("tool call missing function")
+            name = getattr(function, "name", None)
+            arguments_str = getattr(function, "arguments", None)
         if not isinstance(call_id, str) or not call_id:
             raise ProviderError("tool call missing id")
-        function = getattr(raw, "function", None)
         if function is None:
             raise ProviderError("tool call missing function")
-        name = getattr(function, "name", None)
         if not isinstance(name, str) or not name:
             raise ProviderError("tool call missing function name")
-        arguments_str = getattr(function, "arguments", None)
         if not isinstance(arguments_str, str) or not arguments_str.strip():
             raise ProviderError("tool call arguments missing")
         try:
