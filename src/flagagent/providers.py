@@ -140,7 +140,11 @@ def _parse_chat_response(response: Any) -> ModelResponse:
     choices = getattr(response, "choices", None)
     if not isinstance(choices, list) or not choices:
         raise ProviderError("chat completions response has no choices")
-    message = getattr(choices[0], "message", None)
+    choice = choices[0]
+    finish_reason = getattr(choice, "finish_reason", None)
+    if finish_reason not in {"stop", "tool_calls"}:
+        raise ProviderError("chat completions finish reason is not normal")
+    message = getattr(choice, "message", None)
     if message is None:
         raise ProviderError("chat completions response missing message")
     raw_content = getattr(message, "content", None)
