@@ -55,6 +55,16 @@ def _tool_use_block(call_id, name, input_dict):
     )
 
 
+def _thinking_block(thinking, signature):
+    return types.SimpleNamespace(
+        type="thinking", thinking=thinking, signature=signature
+    )
+
+
+def _redacted_block(data):
+    return types.SimpleNamespace(type="redacted_thinking", data=data)
+
+
 def _response(content=None, usage=None, stop_reason="end_turn"):
     return types.SimpleNamespace(
         content=content or [], usage=usage, stop_reason=stop_reason
@@ -524,3 +534,167 @@ def test_missing_stop_reason_raises_provider_error():
 
     with pytest.raises(ProviderError, match="non-normal stop reason"):
         model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+
+def test_thinking_plus_text_does_not_raise_and_content_is_only_text():
+    response = _response(
+        content=[_thinking_block("internal reasoning", "sig-abc"), _text_block("hello")]
+    )
+    model, _ = _model([response])
+
+    result = model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+    assert result.content == "hello"
+    assert result.tool_calls == ()
+    assert "internal reasoning" not in result.content
+    assert "sig-abc" not in result.content
+    assert "thinking" not in result.to_dict().values()
+    dumped = json.dumps(result.to_dict())
+    assert "sig-abc" not in dumped
+    assert "internal reasoning" not in dumped
+
+
+def test_thinking_plus_tool_use_replayed_on_next_turn():
+    thinking = "analyze files"
+    signature = "sig-xyz-123"
+    first = _response(
+        content=[
+            _thinking_block(thinking, signature),
+            _tool_use_block("c1", "shell", {"command": "ls"}),
+        ],
+        stop_reason="tool_use",
+    )
+    second = _response(content=[_text_block("done")])
+    model, msgs = _model([first, second])
+
+    result1 = model.generate([{"role": "user", "content": "go"}], TOOL_DEFINITIONS)
+    assert len(result1.tool_calls) == 1
+
+    history = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": result1.content,
+            "tool_calls": [
+                {"call_id": c.call_id, "name": c.name, "arguments": c.arguments}
+                for c in result1.tool_calls
+            ],
+        },
+        {
+            "role": "tool",
+            "call_id": "c1",
+            "name": "shell",
+            "result": {
+                "stdout": "out",
+                "stderr": "",
+                "exit_code": 0,
+                "timed_out": False,
+                "truncated": False,
+            },
+        },
+    ]
+    result2 = model.generate(history, TOOL_DEFINITIONS)
+
+    assert result2.content == "done"
+    sent = msgs.calls[1]["messages"]
+    assert sent[0] == {"role": "user", "content": "go"}
+    assistant = sent[1]
+    assert assistant["role"] == "assistant"
+    blocks = assistant["content"]
+    assert blocks[0] == {"type": "thinking", "thinking": thinking, "signature": signature}
+    assert blocks[1] == {
+        "type": "tool_use",
+        "id": "c1",
+        "name": "shell",
+        "input": {"command": "ls"},
+    }
+    assert blocks[0]["type"] == "thinking"
+    assert blocks[1]["type"] == "tool_use"
+    tool_user = sent[2]
+    assert tool_user["role"] == "user"
+    assert tool_user["content"][0]["type"] == "tool_result"
+    assert tool_user["content"][0]["tool_use_id"] == "c1"
+    assert json.loads(tool_user["content"][0]["content"]) == {
+        "stdout": "out",
+        "stderr": "",
+        "exit_code": 0,
+        "timed_out": False,
+        "truncated": False,
+    }
+
+
+def test_redacted_thinking_accepted_and_replayed_unchanged():
+    data = "opaque-encrypted-data=="
+    first = _response(
+        content=[
+            _redacted_block(data),
+            _tool_use_block("c2", "shell", {"command": "id"}),
+        ],
+        stop_reason="tool_use",
+    )
+    second = _response(content=[_text_block("done")])
+    model, msgs = _model([first, second])
+
+    result1 = model.generate([{"role": "user", "content": "go"}], TOOL_DEFINITIONS)
+    assert result1.content == ""
+    assert "opaque" not in json.dumps(result1.to_dict())
+
+    history = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": result1.content,
+            "tool_calls": [
+                {"call_id": c.call_id, "name": c.name, "arguments": c.arguments}
+                for c in result1.tool_calls
+            ],
+        },
+        {
+            "role": "tool",
+            "call_id": "c2",
+            "name": "shell",
+            "result": {"stdout": "uid=0", "stderr": "", "exit_code": 0, "timed_out": False, "truncated": False},
+        },
+    ]
+    model.generate(history, TOOL_DEFINITIONS)
+
+    assistant = msgs.calls[1]["messages"][1]
+    assert assistant["content"][0] == {"type": "redacted_thinking", "data": data}
+    assert assistant["content"][1]["type"] == "tool_use"
+
+
+def test_thinking_text_tool_use_replay_preserves_order_and_text():
+    thinking = "step by step"
+    signature = "sig-order"
+    first = _response(
+        content=[
+            _thinking_block(thinking, signature),
+            _text_block("progress"),
+            _tool_use_block("c3", "shell", {"command": "ls"}),
+        ],
+        stop_reason="tool_use",
+    )
+    second = _response(content=[_text_block("done")])
+    model, msgs = _model([first, second])
+
+    result1 = model.generate([{"role": "user", "content": "go"}], TOOL_DEFINITIONS)
+    assert result1.content == "progress"
+
+    history = [
+        {"role": "user", "content": "go"},
+        {
+            "role": "assistant",
+            "content": result1.content,
+            "tool_calls": [
+                {"call_id": c.call_id, "name": c.name, "arguments": c.arguments}
+                for c in result1.tool_calls
+            ],
+        },
+        {"role": "tool", "call_id": "c3", "name": "shell", "result": "ok"},
+    ]
+    model.generate(history, TOOL_DEFINITIONS)
+
+    blocks = msgs.calls[1]["messages"][1]["content"]
+    assert blocks[0] == {"type": "thinking", "thinking": thinking, "signature": signature}
+    assert blocks[1] == {"type": "text", "text": "progress"}
+    assert blocks[2]["type"] == "tool_use"
