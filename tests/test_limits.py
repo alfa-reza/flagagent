@@ -2,6 +2,7 @@ from datetime import UTC, datetime
 
 import pytest
 
+from flagagent.artifacts import read_events
 from flagagent.loop import AgentLoop, ChallengeInput, Limits
 from flagagent.model import ModelResponse, ScriptedModel, ToolCall
 from flagagent.tools import ExactStringVerifier, FakeExecutor
@@ -188,3 +189,48 @@ def test_correct_verifier_after_deadline_is_wall_limit(tmp_path):
     result = loop.run()
 
     assert result["status:reason"] == "unsolved:wall_limit"
+
+
+def test_model_response_returned_after_wall_deadline_is_preserved(tmp_path):
+    clock = Clock()
+
+    class LateModel:
+        def generate(self, messages, tools):
+            clock.value = 2
+            return ModelResponse(
+                content="late",
+                tool_calls=(ToolCall("c1", "shell", {"command": "echo hi"}),),
+                usage={"input_tokens": 11, "output_tokens": 22},
+            )
+
+    executor = FakeExecutor([])
+    loop = AgentLoop(
+        model=LateModel(),
+        executor=executor,
+        verifier=ExactStringVerifier("Flag{x}"),
+        challenge=ChallengeInput("fixture", "test"),
+        limits=Limits(
+            max_model_turns=5, wall_timeout_seconds=1, command_timeout_seconds=1
+        ),
+        runs_root=tmp_path,
+        monotonic=clock,
+        utc_now=lambda: NOW,
+        run_id="FA-20260814T000000Z-a13f4c2d",
+    )
+
+    result = loop.run()
+
+    assert result["status:reason"] == "unsolved:wall_limit"
+    assert result["model_calls"] == 1
+    assert result["input_tokens"] == 11
+    assert result["output_tokens"] == 22
+    assert result["tool_calls"] == 0
+    assert executor.calls == []
+    events = read_events(loop.artifacts.events_path)
+    model_responses = [e for e in events if e["type"] == "model_response"]
+    assert len(model_responses) == 1
+    assert model_responses[0]["payload"]["tool_calls"][0]["call_id"] == "c1"
+    assert any(m["role"] == "assistant" for m in loop.messages)
+    terminal = [e for e in events if e["type"] == "terminal_decision"][0]
+    assert terminal["payload"]["unprocessed_call_ids"] == ["c1"]
+    assert not any(e["type"] == "tool_call" for e in events)
