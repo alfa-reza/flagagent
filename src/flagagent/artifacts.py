@@ -2,6 +2,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -149,7 +150,14 @@ class RunArtifacts:
             return artifacts
         except BaseException:
             if artifacts is not None:
-                artifacts.close()
+                try:
+                    artifacts.close()
+                except BaseException:  # noqa: S110
+                    pass
+            try:
+                shutil.rmtree(directory)
+            except BaseException:  # noqa: S110
+                pass
             raise
 
     def append_event(
