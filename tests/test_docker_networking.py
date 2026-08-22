@@ -179,6 +179,11 @@ def test_network_and_target_names_are_run_scoped():
 
 def test_local_prepare_network_create_failure_raises_sandbox_error(monkeypatch):
     def fake_run(args, **kwargs):
+        if args[1] == "context":
+            if args[2] == "show":
+                return _FakeRun(stdout="default\n")
+            if args[2] == "inspect":
+                return _FakeRun(stdout="unix:///var/run/docker.sock\n")
         if args[1:3] == ["network", "create"]:
             return _FakeRun(returncode=1, stderr="Error: network exists")
         return _FakeRun()
@@ -197,6 +202,11 @@ def test_local_prepare_target_create_failure_cleans_up_network(monkeypatch):
     state = {"network_removed": False}
 
     def fake_run(args, **kwargs):
+        if args[1] == "context":
+            if args[2] == "show":
+                return _FakeRun(stdout="default\n")
+            if args[2] == "inspect":
+                return _FakeRun(stdout="unix:///var/run/docker.sock\n")
         if args[1:3] == ["network", "create"]:
             return _FakeRun(stdout="netid\n")
         if args[1] == "run":  # target run fails
@@ -225,6 +235,11 @@ def test_local_prepare_readiness_failure_raises_sandbox_error_and_cleans_up(
     }
 
     def fake_run(args, **kwargs):
+        if args[1] == "context":
+            if args[2] == "show":
+                return _FakeRun(stdout="default\n")
+            if args[2] == "inspect":
+                return _FakeRun(stdout="unix:///var/run/docker.sock\n")
         if args[1:3] == ["network", "create"]:
             state["network_created"] = True
             return _FakeRun(stdout="netid\n")
