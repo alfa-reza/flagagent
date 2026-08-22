@@ -698,3 +698,22 @@ def test_thinking_text_tool_use_replay_preserves_order_and_text():
     assert blocks[0] == {"type": "thinking", "thinking": thinking, "signature": signature}
     assert blocks[1] == {"type": "text", "text": "progress"}
     assert blocks[2]["type"] == "tool_use"
+
+
+def test_tool_use_stop_reason_without_tool_use_raises_provider_error():
+    response = _response(content=[_text_block("hello")], stop_reason="tool_use")
+    model, _ = _model([response])
+
+    with pytest.raises(ProviderError):
+        model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+
+def test_end_turn_with_tool_use_raises_provider_error():
+    response = _response(
+        content=[_tool_use_block("c1", "shell", {"command": "ls"})],
+        stop_reason="end_turn",
+    )
+    model, _ = _model([response])
+
+    with pytest.raises(ProviderError):
+        model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)

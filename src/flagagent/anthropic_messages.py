@@ -188,6 +188,10 @@ def _parse_anthropic_response(
             seen_tool_use = True
         else:
             raise ProviderError("unsupported content block type")
+    if stop_reason == "tool_use" and not tool_calls:
+        raise ProviderError("tool_use stop reason without client tool_use block")
+    if stop_reason == "end_turn" and tool_calls:
+        raise ProviderError("end_turn stop reason with client tool_use block")
     content = "".join(text_parts)
     usage = _normalize_anthropic_usage(getattr(response, "usage", None))
     return (
