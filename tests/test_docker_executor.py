@@ -10,6 +10,7 @@ evidence.
 
 import contextlib
 import json
+import os
 import secrets
 import subprocess
 import sys
@@ -20,7 +21,6 @@ from pathlib import Path
 import pytest
 
 from flagagent.docker_executor import (
-    AGENT_USER,
     KEEPALIVE_COMMAND,
     SANDBOX_IMAGE,
     WORKSPACE_TARGET,
@@ -95,6 +95,19 @@ def test_run_args_are_a_subprocess_vector_not_a_shell_string():
     assert args[0] == "docker"
 
 
+def test_run_args_use_invoking_uid_and_gid_for_container_user(monkeypatch):
+    monkeypatch.setattr(os, "getuid", lambda: 1234)
+    monkeypatch.setattr(os, "getgid", lambda: 2345)
+    executor = DockerExecutor()
+    args = executor._run_args(Path("/tmp/ws"), RUN_ID)
+    monkeypatch.setattr(
+        executor, "_docker_engine_info", lambda: {"version": None, "rootless": None}
+    )
+
+    assert _value(args, "--user") == "1234:2345"
+    assert executor.sandbox_provenance()["container_user"] == "1234:2345"
+
+
 def test_run_args_contain_required_security_and_resource_flags():
     executor = DockerExecutor()
     args = executor._run_args(Path("/tmp/ws"), RUN_ID)
@@ -102,7 +115,7 @@ def test_run_args_contain_required_security_and_resource_flags():
     assert "run" in args
     assert "-d" in args
     assert "--init" in args
-    assert _value(args, "--user") == AGENT_USER
+    assert _value(args, "--user") == f"{os.getuid()}:{os.getgid()}"
     assert _value(args, "-w") == WORKSPACE_TARGET
     assert _value(args, "--memory") == "2g"
     assert _value(args, "--cpus") == "2"
@@ -251,6 +264,21 @@ def test_execute_raises_sandbox_error_when_container_missing(monkeypatch):
     executor._container_id = "cid"
     with pytest.raises(SandboxError, match="not running"):
         executor.execute("echo hi", 10)
+
+
+def test_prepare_rejects_root_before_docker_calls(monkeypatch):
+    monkeypatch.setattr(os, "getuid", lambda: 0)
+
+    def fail(*args, **kwargs):
+        raise AssertionError(f"unexpected docker call: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    monkeypatch.setattr(subprocess, "Popen", fail)
+    executor = DockerExecutor()
+    with pytest.raises(SandboxError, match="root is unsupported"):
+        executor.prepare(Path("/tmp/ws"), RUN_ID)
+    assert executor._container_id is None
+    assert executor._container_name is None
 
 
 def test_prepare_raises_sandbox_error_when_docker_missing(monkeypatch):
@@ -675,7 +703,7 @@ def test_container_has_security_posture(docker_exec):
     cap_add = _docker_inspect_json(cid, "{{json .HostConfig.CapAdd}}")
 
     assert privileged == "false"
-    assert user == AGENT_USER
+    assert user == f"{os.getuid()}:{os.getgid()}"
     assert "no-new-privileges" in security_opt
     assert "ALL" in cap_drop
     assert cap_add == [] or cap_add is None

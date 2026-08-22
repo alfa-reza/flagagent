@@ -19,6 +19,7 @@ orphan discovery.  Tests skip when Docker Engine is unavailable.
 
 import contextlib
 import json
+import os
 import secrets
 import subprocess
 from pathlib import Path
@@ -27,7 +28,6 @@ import pytest
 
 from flagagent.docker_executor import (
     _VERSION,
-    AGENT_USER,
     TARGET_ALIAS,
     TARGET_IMAGE,
     TARGET_MARKER,
@@ -101,7 +101,7 @@ def test_local_run_args_use_run_scoped_network_not_none():
 def test_local_run_args_preserve_security_and_resource_flags():
     executor = DockerExecutor(network_mode="local")
     args = executor._run_args(Path("/tmp/ws"), RUN_ID)
-    assert _value(args, "--user") == AGENT_USER
+    assert _value(args, "--user") == f"{os.getuid()}:{os.getgid()}"
     assert _value(args, "--memory") == "2g"
     assert _value(args, "--cpus") == "2"
     assert _value(args, "--pids-limit") == "256"

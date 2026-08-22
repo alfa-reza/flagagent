@@ -4,8 +4,8 @@
 # by the frozen M2 smoke fixtures: Python for file decoding and netcat for the
 # audited local TCP target.
 #
-# The ``agent`` user reuses UID/GID 1000 so it can read/write the host
-# workspace bind-mount owned by the reference host user (UID 1000).
+# The runtime passes the invoking host process's numeric UID/GID to Docker so
+# the ``agent`` image user does not determine bind-mounted workspace ownership.
 
 FROM ubuntu:24.04
 
@@ -13,7 +13,8 @@ LABEL flagagent.managed=true \
       flagagent.version=0.1.0
 
 # ubuntu:24.04 ships a ``ubuntu`` user at UID/GID 1000; rename it to ``agent``
-# so the container user matches the host workspace owner without colliding.
+# as the image's named non-root default.  DockerExecutor overrides this user
+# at runtime with the invoking process's numeric UID/GID.
 RUN if id ubuntu >/dev/null 2>&1; then \
         usermod -l agent -d /home/agent -m ubuntu \
         && groupmod -n agent ubuntu; \
