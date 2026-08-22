@@ -420,6 +420,72 @@ def test_prepare_local_timeouts_bounded_by_shared_remaining_budget(monkeypatch):
     assert executor._preparation_deadline is None
 
 
+def test_prepare_local_skips_cleanup_when_budget_exhausted(monkeypatch):
+    """When the shared preparation deadline is exhausted, the SandboxError
+    handler in _prepare_local must skip synchronous _remove_owned (whose
+    Docker removals use fresh fixed 30s timeouts).  Ownership of partial
+    resources stays recorded so AgentLoop's final cleanup can still remove
+    them with normal timeouts."""
+    clock = [0.0]
+    calls: list[tuple[list[str], float | None]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append((list(args), kwargs.get("timeout")))
+        if args[1] == "network" and args[2] == "create":
+            return _FakeCompleted(stdout="nid123\n")
+        if args[1] == "run":
+            return _FakeCompleted(stdout="tid123\n")
+        if args[1] == "inspect" and "{{.State.Running}}" in args:
+            return _FakeCompleted(stdout="true\n")
+        if args[1] == "exec":
+            # Readiness probe fails; advance the clock past the deadline so
+            # the next deadline check raises SandboxError.
+            clock[0] = 100.0
+            return _FakeCompleted(returncode=1)
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    executor = DockerExecutor(network_mode="local")
+    executor.monotonic = lambda: clock[0]
+    executor.set_remaining(5.0)
+
+    with pytest.raises(SandboxError, match="preparation budget exhausted"):
+        executor.prepare(Path("/tmp/ws"), RUN_ID)
+
+    # No removal calls during prepare: _remove_owned was skipped because
+    # the deadline was exhausted when the SandboxError was caught.
+    prepare_call_count = len(calls)
+
+    def _removals(call_list):
+        return [
+            c
+            for c in call_list
+            if c[0][1] == "rm"
+            or (c[0][1] == "network" and len(c[0]) > 2 and c[0][2] == "rm")
+        ]
+
+    assert _removals(calls[:prepare_call_count]) == []
+
+    # Ownership of partial resources is retained for final cleanup.
+    assert executor._network_id == "nid123"
+    assert executor._target_id == "tid123"
+    assert executor._network_name is not None
+    assert executor._target_name is not None
+    assert executor._preparation_deadline is None
+
+    # Final cleanup removes the retained resources with normal 30s timeouts.
+    executor.cleanup(RUN_ID)
+
+    cleanup_removals = _removals(calls[prepare_call_count:])
+    assert len(cleanup_removals) == 2  # target container + network
+    for _, timeout in cleanup_removals:
+        assert timeout == 30
+    assert executor._network_id is None
+    assert executor._target_id is None
+
+
 # ---------------------------------------------------------------------------
 # Unit tests — timeout recovery boundary (AC-M1-05, no Docker required)
 # ---------------------------------------------------------------------------

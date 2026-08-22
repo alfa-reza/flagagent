@@ -363,7 +363,17 @@ class DockerExecutor:
             self._create_agent(workspace, run_id)
         except SandboxError:
             # Best-effort cleanup of anything partially created, then
-            # propagate the original sandbox failure.
+            # propagate the original sandbox failure.  When the shared
+            # preparation deadline is exhausted, skip the synchronous
+            # removal: _remove_owned uses fresh fixed 30s timeouts that
+            # would block past the wall deadline.  Ownership stays
+            # recorded so AgentLoop's final cleanup path can still
+            # remove the partial resources.
+            if (
+                self._preparation_deadline is not None
+                and self.monotonic() >= self._preparation_deadline
+            ):
+                raise
             self._remove_owned()
             raise
 
