@@ -46,7 +46,13 @@ Design constraints (PRD-M1):
   otherwise ``SandboxError`` is raised.
 - Cleanup removes only known Run-owned Agent/Target/network resources (by
   recorded owned IDs) in order; orphan discovery is report-only and never
-  deletes or prunes.
+  deletes or prunes.  When a creation attempt failed ambiguously before its
+  ID could be captured, the ownership is kept *pending* and cleanup first
+  reconciles it against live Docker state (Issue 35): an ID is adopted —
+  and then removed by ID — only from the single resource carrying the
+  exact expected name plus full ownership-label proof (managed, run-id,
+  role); zero candidates prove nothing leaked, and any ambiguity fails
+  closed without deleting anything.
 """
 
 import json
@@ -75,6 +81,33 @@ _VERSION = "0.1.0"
 def _runtime_user() -> str:
     """Return the invoking process identity for Docker's numeric user flag."""
     return f"{os.getuid()}:{os.getgid()}"
+
+
+def _classify_candidates(
+    candidates: list[dict[str, Any]], *, run_id: str, role: str
+) -> tuple[str, str | None]:
+    """Classify name-matched reconciliation candidates (Issue 35).
+
+    ``candidates`` are resources whose name already equals the expected
+    deterministic name.  Returns ``("absent", None)`` when nothing leaked,
+    ``("adopt", resource_id)`` when exactly one candidate carries the full
+    ownership-label proof (``flagagent.managed=true``, matching
+    ``flagagent.run_id`` and matching ``flagagent.role``; version is
+    deliberately not checked), and ``("fail", reason)`` for anything else so
+    callers can fail closed without deleting.
+    """
+    if not candidates:
+        return "absent", None
+    if len(candidates) > 1:
+        return "fail", f"{len(candidates)} resources carry the expected name"
+    labels = candidates[0].get("labels") or {}
+    if (
+        labels.get("flagagent.managed") != "true"
+        or labels.get("flagagent.run_id") != run_id
+        or labels.get("flagagent.role") != role
+    ):
+        return "fail", "candidate lacks the required ownership labels"
+    return "adopt", candidates[0]["id"]
 
 
 # -- local networking target fixture --------------------------------------
@@ -146,7 +179,16 @@ class DockerExecutor:
     _network_id: str | None = field(default=None, init=False, repr=False)
     _network_name: str | None = field(default=None, init=False, repr=False)
     _resolved_image_id: str | None = field(default=None, init=False, repr=False)
-    _pending_cleanup_errors: list[str] = field(default_factory=list, init=False, repr=False)
+    # Pending ownership: the deterministic name is set and an ambiguous
+    # creation attempt may have produced a Run-owned resource, but its ID
+    # was never captured.  Cleanup reconciles these against live Docker
+    # state before removal (Issue 35).
+    _pending_agent: bool = field(default=False, init=False, repr=False)
+    _pending_target: bool = field(default=False, init=False, repr=False)
+    _pending_network: bool = field(default=False, init=False, repr=False)
+    _pending_cleanup_errors: list[str] = field(
+        default_factory=list, init=False, repr=False
+    )
     _preparation_remaining: float | None = field(default=None, init=False, repr=False)
     _preparation_deadline: float | None = field(default=None, init=False, repr=False)
 
@@ -272,16 +314,20 @@ class DockerExecutor:
     def cleanup(self, run_id: str) -> None:
         """Remove all known Run-owned resources (Agent, Target, network).
 
-        Best-effort per resource: each is attempted even if an earlier removal
-        fails, so a single failure does not leak the remaining resources.
-        Raises ``SandboxError`` if any removal failed.  A cleanup failure after
-        a result is committed does not rewrite that result; AgentLoop records
-        it separately.
+        Before removal, resources whose creation failed ambiguously before
+        their ID was captured are reconciled against live Docker state
+        (see :meth:`_reconcile_pending`).  Best-effort per resource: each is
+        attempted even if an earlier removal fails, so a single failure does
+        not leak the remaining resources.  Raises ``SandboxError`` if any
+        reconciliation or removal failed.  A cleanup failure after a result
+        is committed does not rewrite that result; AgentLoop records it
+        separately.
         """
         pending = list(self._pending_cleanup_errors)
         self._pending_cleanup_errors.clear()
+        reconcile_errors = self._reconcile_pending(run_id)
         errors = self._remove_owned()
-        combined = pending + errors
+        combined = pending + reconcile_errors + errors
         if combined:
             raise SandboxError("cleanup failed: " + "; ".join(combined))
 
@@ -442,7 +488,26 @@ class DockerExecutor:
     # -- prepare paths -------------------------------------------------------
 
     def _prepare_none(self, workspace: Path, run_id: str) -> None:
-        self._create_agent(workspace, run_id)
+        try:
+            self._create_agent(workspace, run_id)
+        except SandboxError:
+            # Best-effort cleanup of anything partially created, then
+            # propagate the original sandbox failure.  Mirrors
+            # _prepare_local: when the shared preparation deadline is
+            # exhausted, skip the synchronous removal (_remove_owned uses
+            # fresh fixed 30s timeouts that would block past the wall
+            # deadline); ambiguous ownership stays pending so AgentLoop's
+            # final cleanup can still reconcile and remove it.
+            if (
+                self._preparation_deadline is not None
+                and self.monotonic() >= self._preparation_deadline
+            ):
+                raise
+
+            errors = self._remove_owned()
+            if errors:
+                self._pending_cleanup_errors.extend(errors)
+            raise
 
     def _prepare_local(self, workspace: Path, run_id: str) -> None:
         self._network_name = self._network_name_for(run_id)
@@ -465,7 +530,7 @@ class DockerExecutor:
                 and self.monotonic() >= self._preparation_deadline
             ):
                 raise
-    
+
             errors = self._remove_owned()
             if errors:
                 self._pending_cleanup_errors.extend(errors)
@@ -482,20 +547,32 @@ class DockerExecutor:
                 check=False,
             )
         except FileNotFoundError as error:
+            # The CLI never ran: no resource can exist (not ambiguous).
             raise SandboxError("docker CLI not found") from error
         except subprocess.TimeoutExpired as error:
+            self._pending_agent = True
             raise SandboxError("docker run timed out") from error
         except OSError as error:
+            self._pending_agent = True
             raise SandboxError("docker run failed to start") from error
         if result.returncode != 0:
+            # ``docker run`` is not atomic: a failure after container
+            # creation (e.g. a late daemon error) leaves the named,
+            # labeled container behind.  Ownership stays pending.
+            self._pending_agent = True
             raise SandboxError(f"docker run failed: {result.stderr.strip()}")
         container_id = result.stdout.strip()
         if not container_id:
+            self._pending_agent = True
             raise SandboxError("docker run returned no container id")
         self._container_id = container_id
+        self._pending_agent = False
         if not self._is_container_running(self._container_id):
             self._force_remove(self._container_id)
             self._container_id = None
+            # _force_remove is best-effort; if it silently failed the
+            # container still exists without a tracked ID.
+            self._pending_agent = True
             raise SandboxError("agent container is not running")
         # AC-M1-18: the resolved image identity is required evidence.  If
         # inspect cannot resolve it, remove the owned container and fail
@@ -504,6 +581,7 @@ class DockerExecutor:
         if image_id is None:
             self._force_remove(self._container_id)
             self._container_id = None
+            self._pending_agent = True
             raise SandboxError("resolved image identity unavailable")
         self._resolved_image_id = image_id
 
@@ -518,17 +596,23 @@ class DockerExecutor:
                 check=False,
             )
         except FileNotFoundError as error:
+            # The CLI never ran: no resource can exist (not ambiguous).
             raise SandboxError("docker CLI not found") from error
         except subprocess.TimeoutExpired as error:
+            self._pending_network = True
             raise SandboxError("docker network create timed out") from error
         except OSError as error:
+            self._pending_network = True
             raise SandboxError("docker network create failed to start") from error
         if result.returncode != 0:
+            self._pending_network = True
             raise SandboxError(f"docker network create failed: {result.stderr.strip()}")
         network_id = result.stdout.strip()
         if not network_id:
+            self._pending_network = True
             raise SandboxError("docker network create returned no network id")
         self._network_id = network_id
+        self._pending_network = False
 
     def _create_target(self, run_id: str) -> None:
         args = self._target_run_args(run_id)
@@ -541,20 +625,32 @@ class DockerExecutor:
                 check=False,
             )
         except FileNotFoundError as error:
+            # The CLI never ran: no resource can exist (not ambiguous).
             raise SandboxError("docker CLI not found") from error
         except subprocess.TimeoutExpired as error:
+            self._pending_target = True
             raise SandboxError("docker target run timed out") from error
         except OSError as error:
+            self._pending_target = True
             raise SandboxError("docker target run failed to start") from error
         if result.returncode != 0:
+            # ``docker run`` is not atomic: a failure after container
+            # creation leaves the named, labeled container behind.
+            # Ownership stays pending.
+            self._pending_target = True
             raise SandboxError(f"docker target run failed: {result.stderr.strip()}")
         target_id = result.stdout.strip()
         if not target_id:
+            self._pending_target = True
             raise SandboxError("docker target run returned no container id")
         self._target_id = target_id
+        self._pending_target = False
         if not self._is_container_running(self._target_id):
             self._force_remove(self._target_id)
             self._target_id = None
+            # _force_remove is best-effort; if it silently failed the
+            # container still exists without a tracked ID.
+            self._pending_target = True
             raise SandboxError("target container is not running")
 
     def _wait_target_ready(self) -> None:
@@ -848,8 +944,12 @@ class DockerExecutor:
         while containers are attached).  Ownership state is only forgotten when
         removal is known to have succeeded or the resource is deterministically
         gone; a failed or ambiguous removal retains the IDs so a later cleanup
-        can retry or account for the resource.  Returns a list of error strings
-        (empty when fully successful); never raises.
+        can retry or account for the resource.  When an ID was never captured
+        but an ambiguous creation may have produced a resource (pending
+        ownership), the name is retained for reconciliation at cleanup and no
+        Docker call is made here; otherwise a definite no-creation clears the
+        name immediately.  Returns a list of error strings (empty when fully
+        successful); never raises.
         """
         errors: list[str] = []
         if self._container_id is not None:
@@ -860,9 +960,14 @@ class DockerExecutor:
             else:
                 self._container_id = None
                 self._container_name = None
+                self._pending_agent = False
                 self._resolved_image_id = None
+        elif self._pending_agent and self._container_name is not None:
+            # Ambiguous creation: retain for cleanup-time reconciliation.
+            pass
         else:
             self._container_name = None
+            self._pending_agent = False
             self._resolved_image_id = None
         if self._target_id is not None:
             tid = self._target_id
@@ -872,8 +977,13 @@ class DockerExecutor:
             else:
                 self._target_id = None
                 self._target_name = None
+                self._pending_target = False
+        elif self._pending_target and self._target_name is not None:
+            # Ambiguous creation: retain for cleanup-time reconciliation.
+            pass
         else:
             self._target_name = None
+            self._pending_target = False
         if self._network_id is not None:
             network_id = self._network_id
             network_name = self._network_name or network_id
@@ -883,9 +993,147 @@ class DockerExecutor:
             else:
                 self._network_id = None
                 self._network_name = None
+                self._pending_network = False
+        elif self._pending_network and self._network_name is not None:
+            # Ambiguous creation: retain for cleanup-time reconciliation.
+            pass
         else:
             self._network_name = None
+            self._pending_network = False
         return errors
+
+    # -- pending-ownership reconciliation ------------------------------------
+
+    def _reconcile_pending(self, run_id: str) -> list[str]:
+        """Resolve pending ambiguous-creation ownership (Issue 35).
+
+        Called only from ``cleanup``, never during preparation: preparation
+        failures retain pending evidence without Docker calls so the wall
+        deadline stays protected.  For each resource whose creation outcome
+        was unknown and whose ID was never captured, live Docker state is
+        queried for resources carrying the deterministic expected name.
+
+        A discovered ID is adopted — recorded so the subsequent
+        ``_remove_owned`` deletes it by ID — only with full proof via
+        :func:`_classify_candidates`.  Zero candidates clear the pending
+        evidence; discovery failures or any ambiguity fail closed: nothing
+        is deleted, the pending evidence is retained, and an error string is
+        returned for surfacing through the cleanup failure event.
+        """
+        errors: list[str] = []
+        if self._pending_agent and self._container_name is not None:
+            error = self._reconcile_pending_container(
+                kind="agent",
+                role="agent",
+                run_id=run_id,
+                expected_name=self._container_name_for(run_id),
+            )
+            if error:
+                errors.append(error)
+        if self._pending_target and self._target_name is not None:
+            error = self._reconcile_pending_container(
+                kind="target",
+                role="target",
+                run_id=run_id,
+                expected_name=self._target_name_for(run_id),
+            )
+            if error:
+                errors.append(error)
+        if self._pending_network and self._network_name is not None:
+            error = self._reconcile_pending_network(
+                run_id=run_id,
+                expected_name=self._network_name_for(run_id),
+            )
+            if error:
+                errors.append(error)
+        return errors
+
+    def _reconcile_pending_container(
+        self, *, kind: str, role: str, run_id: str, expected_name: str
+    ) -> str | None:
+        """Reconcile one pending Agent/Target container; returns error or None."""
+        # Listed by deterministic name rather than by the managed label: a
+        # candidate that lacks labels must still be seen so adoption can
+        # fail closed on missing proof instead of ignoring a name collision.
+        args = [
+            self.docker_bin,
+            "ps",
+            "-a",
+            "--filter",
+            f"name={expected_name}",
+            "-q",
+        ]
+        try:
+            ids = self._list_ids(args)
+            candidates = (
+                [
+                    resource
+                    for resource in self._inspect_labeled(ids, network=False)
+                    if resource["name"] == expected_name
+                ]
+                if ids
+                else []
+            )
+        except SandboxError as error:
+            return f"{kind}({expected_name}): reconciliation failed: {error}"
+        outcome, payload = _classify_candidates(candidates, run_id=run_id, role=role)
+        if outcome == "absent":
+            if kind == "agent":
+                self._pending_agent = False
+                self._container_name = None
+            else:
+                self._pending_target = False
+                self._target_name = None
+            return None
+        if outcome == "fail":
+            return f"{kind}({expected_name}): ambiguous ownership: {payload}"
+        # Full proof: recover the ID; deletion happens in _remove_owned by ID.
+        if kind == "agent":
+            self._container_id = payload
+            self._pending_agent = False
+        else:
+            self._target_id = payload
+            self._pending_target = False
+        return None
+
+    def _reconcile_pending_network(
+        self, *, run_id: str, expected_name: str
+    ) -> str | None:
+        """Reconcile one pending network; returns an error string or None."""
+        args = [
+            self.docker_bin,
+            "network",
+            "ls",
+            "--filter",
+            f"name={expected_name}",
+            "-q",
+        ]
+        try:
+            ids = self._list_ids(args)
+            candidates = (
+                [
+                    resource
+                    for resource in self._inspect_labeled(ids, network=True)
+                    if resource["name"] == expected_name
+                ]
+                if ids
+                else []
+            )
+        except SandboxError as error:
+            return f"network({expected_name}): reconciliation failed: {error}"
+        outcome, payload = _classify_candidates(
+            candidates, run_id=run_id, role="network"
+        )
+        if outcome == "absent":
+            self._pending_network = False
+            self._network_name = None
+            return None
+        if outcome == "fail":
+            return f"network({expected_name}): ambiguous ownership: {payload}"
+        # Full proof: recover the ID; deletion happens in _remove_owned by ID.
+        self._network_id = payload
+        self._pending_network = False
+        return None
 
     def _remove_container(self, container_id: str) -> str | None:
         args = [self.docker_bin, "rm", "-f", container_id]

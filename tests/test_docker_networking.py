@@ -193,7 +193,8 @@ def test_local_prepare_network_create_failure_raises_sandbox_error(monkeypatch):
     with pytest.raises(SandboxError, match="network create failed"):
         executor.prepare(Path("/tmp/ws"), RUN_ID)
     assert executor._network_id is None
-    assert executor._network_name is None
+    assert executor._network_name == DockerExecutor._network_name_for(RUN_ID)
+    assert executor._pending_network is True
     assert executor._target_id is None
     assert executor._container_id is None
 
