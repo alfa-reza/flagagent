@@ -3,7 +3,7 @@ from datetime import UTC, datetime
 from flagagent.artifacts import read_events
 from flagagent.loop import AgentLoop, ChallengeInput, Limits
 from flagagent.model import ModelResponse, ScriptedModel, ToolCall
-from flagagent.tools import ExactStringVerifier, FakeExecutor, ShellResult
+from flagagent.tools import ExactStringVerifier, FakeExecutor, SandboxError, ShellResult
 
 NOW = datetime(2026, 8, 14, 16, 15, 30, tzinfo=UTC)
 
@@ -380,3 +380,175 @@ def test_loop_passes_remaining_budget_to_adapter_seam(tmp_path):
 
     assert result["status:reason"] == "unsolved:model_stop"
     assert recorded == [100.0]
+
+
+class _FirstCallExpiredClock:
+    """Returns 0 on the first call (for _started), then a large value."""
+
+    def __init__(self):
+        self._first = True
+
+    def __call__(self):
+        if self._first:
+            self._first = False
+            return 0.0
+        return 100.0
+
+
+def test_wall_budget_expired_before_preparation_skips_staging_and_prepare(tmp_path):
+    """If the Run wall budget is already exhausted before staging, neither
+    staging, prepare, nor model execution starts; the Run is wall_limit."""
+
+    executor = FakeExecutor([])
+    loop = AgentLoop(
+        model=ScriptedModel([ModelResponse(content="never")]),
+        executor=executor,
+        verifier=ExactStringVerifier("Flag{ok}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(
+            max_model_turns=2, wall_timeout_seconds=1, command_timeout_seconds=1
+        ),
+        runs_root=tmp_path,
+        monotonic=_FirstCallExpiredClock(),
+        utc_now=lambda: NOW,
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    result = loop.run()
+
+    assert result["status:reason"] == "unsolved:wall_limit"
+    assert result["model_calls"] == 0
+    assert executor.prepared == []
+
+
+def test_set_remaining_passed_to_executor_before_prepare(tmp_path):
+    """The loop calls set_remaining on executors that expose it before
+    prepare, so preparation-time timeouts can be bounded by the shared
+    Run wall budget."""
+
+    executor = FakeExecutor([ShellResult("ok", "", 0, False)])
+    responses = [
+        ModelResponse(tool_calls=(ToolCall("s", "shell", {"command": "x"}),)),
+        ModelResponse(content="done"),
+    ]
+    loop = AgentLoop(
+        model=ScriptedModel(responses),
+        executor=executor,
+        verifier=ExactStringVerifier("Flag{ok}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(
+            max_model_turns=10, wall_timeout_seconds=100, command_timeout_seconds=10
+        ),
+        runs_root=tmp_path,
+        monotonic=Clock(),
+        utc_now=lambda: NOW,
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    result = loop.run()
+
+    assert result["status:reason"] == "unsolved:model_stop"
+    assert executor.remaining_budgets == [100.0]
+
+
+def test_prepare_sandbox_error_after_deadline_is_wall_limit(tmp_path):
+    """A SandboxError from prepare after the wall deadline is wall_limit,
+    not sandbox_error, and model execution does not begin."""
+
+    clock = Clock()
+
+    class LatePrepareExecutor(FakeExecutor):
+        def prepare(self, workspace, run_id):
+            super().prepare(workspace, run_id)
+            clock.value = 100
+            raise SandboxError("preparation exceeded budget")
+
+    executor = LatePrepareExecutor([])
+    loop = AgentLoop(
+        model=ScriptedModel([ModelResponse(content="never")]),
+        executor=executor,
+        verifier=ExactStringVerifier("Flag{ok}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(
+            max_model_turns=2, wall_timeout_seconds=1, command_timeout_seconds=1
+        ),
+        runs_root=tmp_path,
+        monotonic=clock,
+        utc_now=lambda: NOW,
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    result = loop.run()
+
+    assert result["status:reason"] == "unsolved:wall_limit"
+    assert result["model_calls"] == 0
+    assert executor.prepared != []
+
+
+def test_wall_expired_after_successful_prepare_skips_model(tmp_path):
+    """If the wall deadline expires during a successful prepare, model
+    execution does not begin and the Run returns wall_limit."""
+
+    clock = Clock()
+
+    class LatePrepareExecutor(FakeExecutor):
+        def prepare(self, workspace, run_id):
+            super().prepare(workspace, run_id)
+            clock.value = 100
+
+    executor = LatePrepareExecutor([ShellResult("ok", "", 0, False)])
+    loop = AgentLoop(
+        model=ScriptedModel([ModelResponse(content="never")]),
+        executor=executor,
+        verifier=ExactStringVerifier("Flag{ok}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(
+            max_model_turns=2, wall_timeout_seconds=1, command_timeout_seconds=1
+        ),
+        runs_root=tmp_path,
+        monotonic=clock,
+        utc_now=lambda: NOW,
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    result = loop.run()
+
+    assert result["status:reason"] == "unsolved:wall_limit"
+    assert result["model_calls"] == 0
+    assert executor.prepared != []
+
+
+def test_staging_respects_active_deadline(tmp_path):
+    """Staging checks the wall deadline between file copies; if the deadline
+    expires during staging, the Run returns wall_limit without calling prepare
+    or the model."""
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "a.txt").write_text("a")
+    (source / "b.txt").write_text("b")
+
+    class SteppingClock:
+        def __init__(self):
+            self.value = 0.0
+
+        def __call__(self):
+            result = self.value
+            self.value += 0.5
+            return result
+
+    executor = FakeExecutor([])
+    loop = AgentLoop(
+        model=ScriptedModel([ModelResponse(content="never")]),
+        executor=executor,
+        verifier=ExactStringVerifier("Flag{ok}"),
+        challenge=ChallengeInput("files", "solve it", source_dir=source),
+        limits=Limits(
+            max_model_turns=2, wall_timeout_seconds=1, command_timeout_seconds=1
+        ),
+        runs_root=tmp_path,
+        monotonic=SteppingClock(),
+        utc_now=lambda: NOW,
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    result = loop.run()
+
+    assert result["status:reason"] == "unsolved:wall_limit"
+    assert result["model_calls"] == 0
+    assert executor.prepared == []
