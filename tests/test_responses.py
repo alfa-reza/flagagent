@@ -299,3 +299,16 @@ def test_completed_status_returns_normal_response():
 
     assert result.content == "ok"
     assert result.tool_calls == ()
+
+
+@pytest.mark.parametrize(
+    "status", ["failed", "cancelled", "queued", "in_progress", "incomplete"]
+)
+def test_non_completed_top_level_status_raises_provider_error_with_valid_output(status):
+    response_with_status = types.SimpleNamespace(
+        status=status, output=[message_item("ok")], usage=None
+    )
+    model, _ = make_model([response_with_status])
+
+    with pytest.raises(ProviderError):
+        generate(model)
