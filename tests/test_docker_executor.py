@@ -188,6 +188,161 @@ def test_cleanup_is_noop_when_not_prepared():
     executor.cleanup(RUN_ID)  # must not raise
 
 
+def test_prepare_local_retains_target_on_failed_removal_and_pending_is_observable(
+    monkeypatch, tmp_path
+):
+    executor = DockerExecutor(network_mode="local")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def fake_create_network(run_id):
+        executor._network_id = "net123"
+
+    def fake_create_target(run_id):
+        executor._target_id = "target123"
+
+    def fake_wait():
+        raise SandboxError("target readiness check failed")
+
+    monkeypatch.setattr(executor, "_create_network", fake_create_network)
+    monkeypatch.setattr(executor, "_create_target", fake_create_target)
+    monkeypatch.setattr(executor, "_wait_target_ready", fake_wait)
+    monkeypatch.setattr(executor, "_create_agent", lambda ws, rid: None)
+
+    def fake_remove_container(cid):
+        if cid == "target123":
+            return "docker rm failed: boom"
+        return None
+
+    monkeypatch.setattr(executor, "_remove_container", fake_remove_container)
+    monkeypatch.setattr(executor, "_remove_network", lambda nid: None)
+
+    with pytest.raises(SandboxError, match="target readiness check failed"):
+        executor.prepare(workspace, RUN_ID)
+
+    assert executor._target_id == "target123"
+    assert executor._network_id is None
+    assert any("target(target123)" in err for err in executor._pending_cleanup_errors)
+
+    monkeypatch.setattr(executor, "_remove_container", lambda cid: None)
+    with pytest.raises(SandboxError, match="cleanup failed.*target\\(target123\\)"):
+        executor.cleanup(RUN_ID)
+
+    assert executor._target_id is None
+    assert executor._pending_cleanup_errors == []
+
+
+def test_prepare_local_retains_network_on_failed_removal_and_preserves_original_error(
+    monkeypatch, tmp_path
+):
+    executor = DockerExecutor(network_mode="local")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def fake_create_network(run_id):
+        executor._network_id = "net123"
+
+    def fake_create_target(run_id):
+        executor._target_id = "target123"
+
+    def fake_wait():
+        raise SandboxError("readiness failed")
+
+    monkeypatch.setattr(executor, "_create_network", fake_create_network)
+    monkeypatch.setattr(executor, "_create_target", fake_create_target)
+    monkeypatch.setattr(executor, "_wait_target_ready", fake_wait)
+    monkeypatch.setattr(executor, "_create_agent", lambda ws, rid: None)
+    monkeypatch.setattr(executor, "_remove_container", lambda cid: None)
+
+    def fake_remove_network(nid):
+        return "docker network rm failed: boom"
+
+    monkeypatch.setattr(executor, "_remove_network", fake_remove_network)
+
+    with pytest.raises(SandboxError, match="readiness failed"):
+        executor.prepare(workspace, RUN_ID)
+
+    assert executor._network_id == "net123"
+    assert executor._target_id is None
+    assert any("network(" in err for err in executor._pending_cleanup_errors)
+
+    with pytest.raises(SandboxError, match="cleanup failed.*network\\("):
+        executor.cleanup(RUN_ID)
+
+    assert executor._network_id == "net123"
+
+    monkeypatch.setattr(executor, "_remove_network", lambda nid: None)
+    executor.cleanup(RUN_ID)
+    assert executor._network_id is None
+    assert executor._pending_cleanup_errors == []
+
+
+def test_remove_owned_retains_on_failure_and_clears_on_success(monkeypatch):
+    executor = DockerExecutor()
+    executor._container_id = "agent123"
+    executor._container_name = "flagagent-agent-x"
+    executor._target_id = "target123"
+    executor._target_name = "flagagent-target-x"
+    executor._network_id = "net123"
+    executor._network_name = "flagagent-net-x"
+
+    monkeypatch.setattr(executor, "_remove_container", lambda cid: "boom" if cid == "target123" else None)
+    monkeypatch.setattr(executor, "_remove_network", lambda nid: None)
+
+    errors = executor._remove_owned()
+    assert any("target(target123)" in e for e in errors)
+    assert executor._container_id is None
+    assert executor._target_id == "target123"
+    assert executor._network_id is None
+
+    monkeypatch.setattr(executor, "_remove_container", lambda cid: None)
+    errors = executor._remove_owned()
+    assert errors == []
+    assert executor._target_id is None
+
+
+def test_prepare_failure_preserved_and_cleanup_observable_via_loop(
+    monkeypatch, tmp_path
+):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    executor = DockerExecutor(network_mode="local")
+
+    def fake_create_network(run_id):
+        executor._network_id = "net123"
+
+    def fake_create_target(run_id):
+        executor._target_id = "target123"
+
+    def fake_wait():
+        raise SandboxError("readiness failed")
+
+    monkeypatch.setattr(executor, "_create_network", fake_create_network)
+    monkeypatch.setattr(executor, "_create_target", fake_create_target)
+    monkeypatch.setattr(executor, "_wait_target_ready", fake_wait)
+    monkeypatch.setattr(executor, "_create_agent", lambda ws, rid: None)
+    monkeypatch.setattr(executor, "_remove_container", lambda cid: "boom" if cid == "target123" else None)
+    monkeypatch.setattr(executor, "_remove_network", lambda nid: None)
+
+    from flagagent.artifacts import read_events
+
+    loop = AgentLoop(
+        model=ScriptedModel([ModelResponse(content="never")]),
+        executor=executor,
+        verifier=ExactStringVerifier("Flag{never}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(max_model_turns=5, wall_timeout_seconds=120, command_timeout_seconds=30),
+        runs_root=tmp_path,
+        monotonic=lambda: 0.0,
+        utc_now=lambda: datetime.now(UTC),
+        run_id=RUN_ID,
+    )
+    result = loop.run()
+    assert result["status:reason"] == "error:sandbox_error"
+    events = read_events(loop.artifacts.events_path)
+    assert any(e["type"] == "sandbox_cleanup_failed" for e in events)
+
+
 # ---------------------------------------------------------------------------
 # Unit tests — run id trust boundary (no Docker required)
 # ---------------------------------------------------------------------------
