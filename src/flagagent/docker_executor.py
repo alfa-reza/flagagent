@@ -82,12 +82,10 @@ TARGET_PIDS_LIMIT = 64
 _NETWORK_DRIVER = "bridge"
 _OWNED_LABEL = "flagagent.managed=true"
 
-# ``docker exec`` reuses the command's exit codes, so exit code 125 alone is
-# ambiguous (a command may legitimately exit 125).  A control failure is only
-# classified as ``SandboxError`` when 125 is paired with a Docker CLI error
-# message on stderr.
-# ponytail: a command that prints a docker-looking error AND exits 125 is
-# misclassified as sandbox failure; the next execute's running-check recovers.
+# ``docker exec`` reuses the command's exit codes and stderr, so exit code 125
+# plus a Docker-looking message is only a heuristic trigger.  Before mapping
+# it to ``SandboxError``, ``execute`` verifies the owned container and a
+# host-side ``docker exec ... /bin/true`` probe.
 _DOCKER_CONTROL_ERROR_MARKERS = (
     "Error response from daemon",
     "Cannot connect to the Docker daemon",
@@ -200,7 +198,12 @@ class DockerExecutor:
         except subprocess.TimeoutExpired:
             self._recover_after_timeout(process)
             return ShellResult(stdout_text, stderr_text, None, True, truncated)
-        if self._is_control_failure(process.returncode, stderr_text):
+        if self._is_control_failure(process.returncode, stderr_text) and (
+            not self._is_container_running(self._container_id)
+            or not self._docker_ok(
+                [self.docker_bin, "exec", self._container_id, "/bin/true"], timeout=10
+            )
+        ):
             raise SandboxError(f"docker exec control failure: {stderr_text.strip()}")
         return ShellResult(
             stdout_text, stderr_text, process.returncode, False, truncated

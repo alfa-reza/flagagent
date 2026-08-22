@@ -373,7 +373,13 @@ def test_execute_maps_docker_exec_control_failure_to_sandbox_error(monkeypatch):
         popen_instances.append(process)
         return process
 
-    monkeypatch.setattr(subprocess, "run", _inspect_running())
+    def fake_run(args, **kwargs):
+        if args[1] == "inspect":
+            return _FakeCompleted(stdout="true\n")
+        assert args == ["docker", "exec", "cid", "/bin/true"]
+        return _FakeCompleted(returncode=1, stderr="probe failed")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
     monkeypatch.setattr(subprocess, "Popen", fake_popen)
     executor = DockerExecutor()
     executor._container_id = "cid"
@@ -390,6 +396,37 @@ def test_execute_maps_docker_exec_control_failure_to_sandbox_error(monkeypatch):
 
     with pytest.raises(SandboxError, match="control failure"):
         executor.execute("true", 10)
+
+
+def test_execute_exit_125_with_synthetic_docker_stderr_stays_normal_evidence(
+    monkeypatch,
+):
+    """Docker-looking command output is normal evidence when probes are healthy."""
+
+    def fake_popen(args, **kwargs):
+        process = _FakePopen(args, **kwargs)
+        process.returncode = 125
+        return process
+
+    monkeypatch.setattr(subprocess, "run", _inspect_running())
+    monkeypatch.setattr(subprocess, "Popen", fake_popen)
+    executor = DockerExecutor()
+    executor._container_id = "cid"
+    monkeypatch.setattr(executor, "_docker_ok", lambda args, timeout: True)
+    monkeypatch.setattr(
+        executor,
+        "_collect",
+        lambda process, deadline: (
+            b"",
+            b"Error response from daemon: synthetic\n",
+            False,
+            False,
+        ),
+    )
+
+    result = executor.execute("printf synthetic; exit 125", 10)
+    assert result.exit_code == 125
+    assert result.timed_out is False
 
 
 def test_execute_exit_125_with_ordinary_stderr_stays_normal_evidence(monkeypatch):
