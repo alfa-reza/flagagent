@@ -286,7 +286,11 @@ def test_remove_owned_retains_on_failure_and_clears_on_success(monkeypatch):
     executor._network_id = "net123"
     executor._network_name = "flagagent-net-x"
 
-    monkeypatch.setattr(executor, "_remove_container", lambda cid: "boom" if cid == "target123" else None)
+    monkeypatch.setattr(
+        executor,
+        "_remove_container",
+        lambda cid: "boom" if cid == "target123" else None,
+    )
     monkeypatch.setattr(executor, "_remove_network", lambda nid: None)
 
     errors = executor._remove_owned()
@@ -321,7 +325,11 @@ def test_prepare_failure_preserved_and_cleanup_observable_via_loop(
     monkeypatch.setattr(executor, "_create_target", fake_create_target)
     monkeypatch.setattr(executor, "_wait_target_ready", fake_wait)
     monkeypatch.setattr(executor, "_create_agent", lambda ws, rid: None)
-    monkeypatch.setattr(executor, "_remove_container", lambda cid: "boom" if cid == "target123" else None)
+    monkeypatch.setattr(
+        executor,
+        "_remove_container",
+        lambda cid: "boom" if cid == "target123" else None,
+    )
     monkeypatch.setattr(executor, "_remove_network", lambda nid: None)
 
     from flagagent.artifacts import read_events
@@ -331,7 +339,9 @@ def test_prepare_failure_preserved_and_cleanup_observable_via_loop(
         executor=executor,
         verifier=ExactStringVerifier("Flag{never}"),
         challenge=ChallengeInput("fixture", "solve it"),
-        limits=Limits(max_model_turns=5, wall_timeout_seconds=120, command_timeout_seconds=30),
+        limits=Limits(
+            max_model_turns=5, wall_timeout_seconds=120, command_timeout_seconds=30
+        ),
         runs_root=tmp_path,
         monotonic=lambda: 0.0,
         utc_now=lambda: datetime.now(UTC),
@@ -370,7 +380,11 @@ def test_prepare_accepts_safe_run_ids_without_docker_side_effects(monkeypatch):
     executor.docker_bin = "/nonexistent-flagagent-docker"
     with pytest.raises(SandboxError, match="docker CLI not found"):
         executor.prepare(Path("/tmp/ws"), "FA-20260814T161530Z-a13f4c2d")
-    assert executor._container_name == "flagagent-agent-FA-20260814T161530Z-a13f4c2d"
+    # Definite pre-spawn failure: no pending ownership survives and the
+    # deterministic name is cleared immediately (no daemon-side resource can
+    # exist, so no reconciliation is needed).
+    assert executor._container_name is None
+    assert executor._pending_agent is False
 
 
 # ---------------------------------------------------------------------------
@@ -1358,3 +1372,598 @@ def test_container_cannot_reach_docker_socket(docker_exec):
         "ls /var/run/docker.sock 2>/dev/null && echo FOUND || echo ABSENT", 10
     )
     assert "ABSENT" in result.stdout
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — Issue #35 pre-ID ownership reconciliation (no Docker required)
+# ---------------------------------------------------------------------------
+
+
+def _reconcile_candidate(name, run_id, role, cid="cand123"):
+    labels = {
+        "flagagent.managed": "true",
+        "flagagent.run_id": run_id,
+        "flagagent.role": role,
+        "flagagent.version": "0.1.0",
+    }
+    return {"id": cid, "name": name, "labels": labels}
+
+
+def _make_reconcile_fake(
+    monkeypatch,
+    executor,
+    *,
+    expected_name,
+    candidates,
+    record_calls=None,
+):
+    """Patch list/rm helpers to simulate Docker state for reconciliation tests.
+
+    candidates: list returned by _inspect_labeled for the name-filtered query.
+    record_calls: optional list to capture docker rm calls.
+    """
+    calls: list[list[str]] = record_calls if record_calls is not None else []
+
+    def fake_list_ids(args):
+        assert f"name={expected_name}" in " ".join(args)
+        # Return synthetic IDs matching candidates, or empty when none.
+        return [c["id"] for c in candidates]
+
+    def fake_inspect(ids, network=False):
+        # candidates already filtered to expected name; return them for ids present.
+        return [c for c in candidates if c["id"] in ids]
+
+    def fake_remove(cid):
+        calls.append(["docker", "rm", "-f", cid])
+
+    def fake_remove_network(nid):
+        calls.append(["docker", "network", "rm", nid])
+
+    monkeypatch.setattr(executor, "_list_ids", fake_list_ids)
+    monkeypatch.setattr(executor, "_inspect_labeled", fake_inspect)
+    monkeypatch.setattr(executor, "_remove_container", fake_remove)
+    monkeypatch.setattr(executor, "_remove_network", fake_remove_network)
+    return calls
+
+
+def test_pending_agent_nonzero_recovers_and_removes(monkeypatch, tmp_path):
+    """A: non-zero docker run leaves pending; cleanup recovers ID and removes by ID."""
+    executor = DockerExecutor()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def fake_run(args, **kwargs):
+        return _FakeCompleted(returncode=1, stderr="daemon error after create")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    # _remove_owned during _prepare_none's handler should NOT docker-call for pending
+    with pytest.raises(SandboxError, match="docker run failed"):
+        executor.prepare(workspace, RUN_ID)
+    assert executor._pending_agent is True
+    expected = DockerExecutor._container_name_for(RUN_ID)
+    assert executor._container_name == expected
+    assert executor._container_id is None
+
+    cand = _reconcile_candidate(expected, RUN_ID, "agent")
+    calls: list[list[str]] = []
+    _make_reconcile_fake(
+        monkeypatch,
+        executor,
+        expected_name=expected,
+        candidates=[cand],
+        record_calls=calls,
+    )
+
+    executor.cleanup(RUN_ID)
+
+    assert ["docker", "rm", "-f", "cand123"] in calls
+    assert executor._container_id is None
+    assert executor._container_name is None
+    assert executor._pending_agent is False
+
+
+def test_pending_agent_timeout_recovers_and_removes(monkeypatch, tmp_path):
+    """B: timeout before ID capture → pending → cleanup recovers and removes."""
+    executor = DockerExecutor()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def fake_run(args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args, timeout=60)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(SandboxError, match="docker run timed out"):
+        executor.prepare(workspace, RUN_ID)
+    assert executor._pending_agent is True
+    expected = DockerExecutor._container_name_for(RUN_ID)
+    assert executor._container_name == expected
+
+    cand = _reconcile_candidate(expected, RUN_ID, "agent", cid="cid-timeout")
+    calls: list[list[str]] = []
+    _make_reconcile_fake(
+        monkeypatch,
+        executor,
+        expected_name=expected,
+        candidates=[cand],
+        record_calls=calls,
+    )
+
+    executor.cleanup(RUN_ID)
+
+    assert ["docker", "rm", "-f", "cid-timeout"] in calls
+    assert executor._pending_agent is False
+    assert executor._container_name is None
+
+
+def test_pending_agent_empty_id_recovers_and_removes(monkeypatch, tmp_path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    executor = DockerExecutor()
+
+    def fake_run(args, **kwargs):
+        return _FakeCompleted(stdout="\n")  # empty ID
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(SandboxError, match="returned no container id"):
+        executor.prepare(workspace, RUN_ID)
+    assert executor._pending_agent is True
+
+    expected = DockerExecutor._container_name_for(RUN_ID)
+    cand = _reconcile_candidate(expected, RUN_ID, "agent", cid="cid-empty")
+    calls: list[list[str]] = []
+    _make_reconcile_fake(
+        monkeypatch,
+        executor,
+        expected_name=expected,
+        candidates=[cand],
+        record_calls=calls,
+    )
+
+    executor.cleanup(RUN_ID)
+    assert ["docker", "rm", "-f", "cid-empty"] in calls
+    assert executor._pending_agent is False
+
+
+def test_pending_agent_oserror_recovers_and_removes(monkeypatch, tmp_path):
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    executor = DockerExecutor()
+
+    def fake_run(args, **kwargs):
+        raise OSError("spawn failed")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(SandboxError, match="failed to start"):
+        executor.prepare(workspace, RUN_ID)
+    assert executor._pending_agent is True
+
+    expected = DockerExecutor._container_name_for(RUN_ID)
+    cand = _reconcile_candidate(expected, RUN_ID, "agent", cid="cid-oserr")
+    calls: list[list[str]] = []
+    _make_reconcile_fake(
+        monkeypatch,
+        executor,
+        expected_name=expected,
+        candidates=[cand],
+        record_calls=calls,
+    )
+
+    executor.cleanup(RUN_ID)
+    assert ["docker", "rm", "-f", "cid-oserr"] in calls
+    assert executor._pending_agent is False
+
+
+def test_pending_agent_nothing_created_no_deletion(monkeypatch, tmp_path):
+    """C: pending set but no matching resource → cleanup clears pending, no rm."""
+    executor = DockerExecutor()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def fake_run(args, **kwargs):
+        return _FakeCompleted(returncode=1, stderr="no creation")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(SandboxError):
+        executor.prepare(workspace, RUN_ID)
+    assert executor._pending_agent is True
+
+    expected = DockerExecutor._container_name_for(RUN_ID)
+    calls: list[list[str]] = []
+    _make_reconcile_fake(
+        monkeypatch, executor, expected_name=expected, candidates=[], record_calls=calls
+    )
+
+    executor.cleanup(RUN_ID)  # must not raise
+
+    assert calls == []
+    assert executor._pending_agent is False
+    assert executor._container_name is None
+
+
+def test_pending_agent_definite_filenotfound_no_pending(monkeypatch, tmp_path):
+    """C variant: FileNotFoundError is definite no-creation → no pending, no reconciliation."""
+    executor = DockerExecutor()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def fake_run(args, **kwargs):
+        raise FileNotFoundError("docker")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(SandboxError, match="docker CLI not found"):
+        executor.prepare(workspace, RUN_ID)
+    assert executor._pending_agent is False
+    assert executor._container_name is None
+
+    # Cleanup should not attempt any Docker calls (no pending)
+    called = []
+
+    def fake_list_ids(args):
+        called.append(args)
+        return []
+
+    monkeypatch.setattr(executor, "_list_ids", fake_list_ids)
+    executor.cleanup(RUN_ID)
+    assert called == []
+
+
+@pytest.mark.parametrize(
+    "tamper",
+    [
+        lambda c: c["labels"].__setitem__("flagagent.run_id", "FA-OTHER"),
+        lambda c: c["labels"].__setitem__("flagagent.role", "target"),
+        lambda c: c["labels"].pop("flagagent.managed"),
+        lambda c: c["labels"].__setitem__("flagagent.managed", "false"),
+    ],
+    ids=["wrong_run_id", "wrong_role", "missing_managed", "managed_false"],
+)
+def test_pending_agent_ownership_mismatch_fail_closed(monkeypatch, tmp_path, tamper):
+    """D: candidate with wrong ownership → fail closed, no adoption, no deletion."""
+    executor = DockerExecutor()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def fake_run(args, **kwargs):
+        return _FakeCompleted(returncode=1, stderr="ambiguous")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(SandboxError):
+        executor.prepare(workspace, RUN_ID)
+
+    expected = DockerExecutor._container_name_for(RUN_ID)
+    cand = _reconcile_candidate(expected, RUN_ID, "agent")
+    tamper(cand)
+    calls: list[list[str]] = []
+    _make_reconcile_fake(
+        monkeypatch,
+        executor,
+        expected_name=expected,
+        candidates=[cand],
+        record_calls=calls,
+    )
+
+    with pytest.raises(SandboxError, match="ambiguous ownership"):
+        executor.cleanup(RUN_ID)
+
+    assert calls == []  # no deletion
+    assert executor._pending_agent is True  # retained
+    assert executor._container_name == expected
+    assert executor._container_id is None
+
+
+def test_pending_agent_multiple_candidates_fail_closed(monkeypatch, tmp_path):
+    executor = DockerExecutor()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def fake_run(args, **kwargs):
+        return _FakeCompleted(returncode=1, stderr="ambiguous")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(SandboxError):
+        executor.prepare(workspace, RUN_ID)
+
+    expected = DockerExecutor._container_name_for(RUN_ID)
+    c1 = _reconcile_candidate(expected, RUN_ID, "agent", cid="cand1")
+    c2 = _reconcile_candidate(expected, RUN_ID, "agent", cid="cand2")
+    calls: list[list[str]] = []
+    _make_reconcile_fake(
+        monkeypatch,
+        executor,
+        expected_name=expected,
+        candidates=[c1, c2],
+        record_calls=calls,
+    )
+
+    with pytest.raises(SandboxError, match="ambiguous ownership"):
+        executor.cleanup(RUN_ID)
+
+    assert calls == []
+    assert executor._pending_agent is True
+
+
+def test_pending_agent_reconciliation_list_failure_retains(monkeypatch, tmp_path):
+    executor = DockerExecutor()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def fake_run(args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd=args, timeout=60)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(SandboxError):
+        executor.prepare(workspace, RUN_ID)
+
+    expected = DockerExecutor._container_name_for(RUN_ID)
+
+    def fake_list_ids(args):
+        raise SandboxError("docker list timed out")
+
+    monkeypatch.setattr(executor, "_list_ids", fake_list_ids)
+
+    with pytest.raises(SandboxError, match="reconciliation failed"):
+        executor.cleanup(RUN_ID)
+
+    assert executor._pending_agent is True
+    assert executor._container_name == expected
+
+
+def test_pending_network_empty_id_recovers_by_id(monkeypatch, tmp_path):
+    """Network parity: empty stdout → pending → cleanup recovers network by ID."""
+    executor = DockerExecutor(network_mode="local")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def fake_run(args, **kwargs):
+        if args[1] == "network" and args[2] == "create":
+            return _FakeCompleted(stdout="\n")  # empty network id
+        raise AssertionError(f"unexpected: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(SandboxError, match="returned no network id"):
+        executor.prepare(workspace, RUN_ID)
+    assert executor._pending_network is True
+    expected = DockerExecutor._network_name_for(RUN_ID)
+    assert executor._network_name == expected
+
+    net_cand = {
+        "id": "net123",
+        "name": expected,
+        "labels": {
+            "flagagent.managed": "true",
+            "flagagent.run_id": RUN_ID,
+            "flagagent.role": "network",
+        },
+    }
+    calls: list[list[str]] = []
+
+    def fake_list_ids(args):
+        assert "network" in args or f"name={expected}" in " ".join(args)
+        return [net_cand["id"]]
+
+    def fake_inspect(ids, network=False):
+        if network:
+            return [net_cand] if net_cand["id"] in ids else []
+        return []
+
+    monkeypatch.setattr(executor, "_list_ids", fake_list_ids)
+    monkeypatch.setattr(executor, "_inspect_labeled", fake_inspect)
+
+    def fake_rm_net(nid):
+        calls.append(["docker", "network", "rm", nid])
+
+    monkeypatch.setattr(executor, "_remove_network", fake_rm_net)
+    monkeypatch.setattr(executor, "_remove_container", lambda cid: None)
+
+    executor.cleanup(RUN_ID)
+
+    assert ["docker", "network", "rm", "net123"] in calls
+    assert executor._pending_network is False
+    assert executor._network_name is None
+
+
+def test_pending_network_nonzero_is_not_ambiguous(monkeypatch, tmp_path):
+    """Network non-zero is atomic failure → not pending → no reconciliation."""
+    executor = DockerExecutor(network_mode="local")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def fake_run(args, **kwargs):
+        if args[1] == "network" and args[2] == "create":
+            return _FakeCompleted(returncode=1, stderr="already exists")
+        raise AssertionError(f"unexpected: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(SandboxError, match="docker network create failed"):
+        executor.prepare(workspace, RUN_ID)
+    assert executor._pending_network is False
+    assert executor._network_name is None  # cleared by _remove_owned immediately
+
+    called = []
+
+    def fake_list_ids(args):
+        called.append(args)
+        return []
+
+    monkeypatch.setattr(executor, "_list_ids", fake_list_ids)
+    executor.cleanup(RUN_ID)
+    assert called == []  # no reconciliation attempted
+
+
+def test_pending_target_timeout_recovers(monkeypatch, tmp_path):
+    executor = DockerExecutor(network_mode="local")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def fake_run(args, **kwargs):
+        if args[1] == "network" and args[2] == "create":
+            return _FakeCompleted(stdout="net123\n")
+        if args[1] == "run":
+            raise subprocess.TimeoutExpired(cmd=args, timeout=60)
+        if args[1] == "inspect":
+            return _FakeCompleted(stdout="true\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    # Mock _remove_owned during _prepare_local's handler to avoid clearing pending
+    # via real Docker calls; the handler will retain pending_target.
+    with pytest.raises(SandboxError, match="docker target run timed out"):
+        executor.prepare(workspace, RUN_ID)
+    assert executor._pending_target is True
+    expected = DockerExecutor._target_name_for(RUN_ID)
+    assert executor._target_name == expected
+
+    cand = _reconcile_candidate(expected, RUN_ID, "target", cid="tid123")
+    # Network was created successfully; it will be removed by known-id path. Mock that.
+    monkeypatch.setattr(executor, "_remove_network", lambda nid: None)
+    monkeypatch.setattr(executor, "_remove_container", lambda cid: None)
+
+    calls: list[list[str]] = []
+
+    def fake_list_ids(args):
+        return [cand["id"]] if f"name={expected}" in " ".join(args) else []
+
+    def fake_inspect(ids, network=False):
+        return [cand] if not network and cand["id"] in ids else []
+
+    monkeypatch.setattr(executor, "_list_ids", fake_list_ids)
+    monkeypatch.setattr(executor, "_inspect_labeled", fake_inspect)
+
+    def tracking_rm(cid):
+        calls.append(cid)
+
+    monkeypatch.setattr(executor, "_remove_container", tracking_rm)
+    # Also need _remove_network for the already-created network (id net123)
+    monkeypatch.setattr(executor, "_remove_network", lambda nid: None)
+
+    executor.cleanup(RUN_ID)
+    assert "tid123" in calls
+    assert executor._pending_target is False
+
+
+def test_prepare_none_retains_pending_when_deadline_exhausted(monkeypatch, tmp_path):
+    """Issue #22: deadline exhausted → _prepare_none skips _remove_owned; pending survives for cleanup."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    executor = DockerExecutor()
+    executor.monotonic = lambda: 100.0
+    executor.set_remaining(5.0)  # deadline = 105.0
+
+    def fake_run(args, **kwargs):
+        # Make monotonic jump past deadline after docker run timeout
+        executor.monotonic = lambda: 200.0
+        raise subprocess.TimeoutExpired(cmd=args, timeout=5)
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(SandboxError, match="docker run timed out"):
+        executor.prepare(workspace, RUN_ID)
+
+    # _prepare_none should have skipped _remove_owned due to deadline exhaustion
+    assert executor._pending_agent is True
+    expected = DockerExecutor._container_name_for(RUN_ID)
+    assert executor._container_name == expected
+
+    # Final cleanup must still reconcile and remove
+    cand = _reconcile_candidate(expected, RUN_ID, "agent", cid="deadline-cid")
+    calls: list[list[str]] = []
+    _make_reconcile_fake(
+        monkeypatch,
+        executor,
+        expected_name=expected,
+        candidates=[cand],
+        record_calls=calls,
+    )
+
+    executor.cleanup(RUN_ID)
+    assert ["docker", "rm", "-f", "deadline-cid"] in calls
+    assert executor._pending_agent is False
+
+
+def test_pending_adoption_uses_id_not_name_for_removal(monkeypatch, tmp_path):
+    """Proven resource is removed by recovered ID, never by name alone."""
+    executor = DockerExecutor()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def fake_run(args, **kwargs):
+        return _FakeCompleted(returncode=1, stderr="late failure")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(SandboxError):
+        executor.prepare(workspace, RUN_ID)
+
+    expected = DockerExecutor._container_name_for(RUN_ID)
+    cand = _reconcile_candidate(expected, RUN_ID, "agent", cid="real-id-999")
+    removed: list[str] = []
+
+    def fake_list_ids(args):
+        return ["real-id-999"]
+
+    def fake_inspect(ids, network=False):
+        return [cand] if "real-id-999" in ids else []
+
+    def fake_rm(cid):
+        removed.append(cid)
+
+    monkeypatch.setattr(executor, "_list_ids", fake_list_ids)
+    monkeypatch.setattr(executor, "_inspect_labeled", fake_inspect)
+    monkeypatch.setattr(executor, "_remove_container", fake_rm)
+    monkeypatch.setattr(executor, "_remove_network", lambda nid: None)
+
+    executor.cleanup(RUN_ID)
+    assert removed == ["real-id-999"]
+    assert removed[0] != expected  # not deleted by name
+
+
+def test_cleanup_surfaces_pending_error_via_loop(monkeypatch, tmp_path):
+    """Cleanup ambiguity surfaces as sandbox_cleanup_failed event without changing AgentLoop."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    executor = DockerExecutor()
+
+    def fake_run(args, **kwargs):
+        return _FakeCompleted(returncode=1, stderr="ambiguous")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(SandboxError):
+        executor.prepare(workspace, RUN_ID)
+
+    expected = DockerExecutor._container_name_for(RUN_ID)
+    # Candidate lacks proper labels → ambiguous
+    cand = {
+        "id": "cid-x",
+        "name": expected,
+        "labels": {
+            "flagagent.managed": "true",
+            "flagagent.run_id": "WRONG",
+            "flagagent.role": "agent",
+        },
+    }
+    _make_reconcile_fake(
+        monkeypatch, executor, expected_name=expected, candidates=[cand]
+    )
+
+    from datetime import UTC, datetime
+
+    from flagagent.artifacts import read_events
+    from flagagent.loop import AgentLoop, ChallengeInput, Limits
+    from flagagent.model import ModelResponse, ScriptedModel
+    from flagagent.tools import ExactStringVerifier
+
+    loop = AgentLoop(
+        model=ScriptedModel([ModelResponse(content="never")]),
+        executor=executor,
+        verifier=ExactStringVerifier("Flag{never}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(
+            max_model_turns=5, wall_timeout_seconds=120, command_timeout_seconds=30
+        ),
+        runs_root=tmp_path,
+        monotonic=lambda: 0.0,
+        utc_now=lambda: datetime.now(UTC),
+        run_id=RUN_ID,
+    )
+    result = loop.run()
+    assert result["status:reason"] == "error:sandbox_error"
+    events = read_events(loop.artifacts.events_path)
+    assert any(e["type"] == "sandbox_cleanup_failed" for e in events)
