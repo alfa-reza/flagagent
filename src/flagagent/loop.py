@@ -206,8 +206,14 @@ def _snapshot_source_files(
     return files, digest.hexdigest(), temporary
 
 
-def _stage_source_files(workspace: Path, files: list[tuple[Path, Path]]) -> None:
+def _stage_source_files(
+    workspace: Path,
+    files: list[tuple[Path, Path]],
+    expired: Callable[[], bool] | None = None,
+) -> None:
     for source, relative in files:
+        if expired is not None and expired():
+            break
         destination = workspace / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
@@ -424,8 +430,14 @@ class AgentLoop:
                 return result
             if source_serialization_error is not None:
                 raise source_serialization_error
-            _stage_source_files(self.artifacts.workspace, self._source_files)
-            active = self._prepare_or_run()
+            if not self._expired():
+                _stage_source_files(
+                    self.artifacts.workspace, self._source_files, self._expired
+                )
+            if self._expired():
+                active = "unsolved", "wall_limit", []
+            else:
+                active = self._prepare_or_run()
             active_status, active_reason, active_unprocessed = active
             try:
                 result = self._terminal(
@@ -451,14 +463,22 @@ class AgentLoop:
     def _prepare_or_run(self) -> tuple[str, str, list[str]]:
         prepare = getattr(self.executor, "prepare", None)
         if prepare is not None:
+            set_remaining = getattr(self.executor, "set_remaining", None)
+            if set_remaining is not None:
+                with contextlib.suppress(Exception):
+                    set_remaining(self._remaining())
             try:
                 prepare(self.artifacts.workspace, self.artifacts.run_id)
             except SandboxError:
+                if self._expired():
+                    return "unsolved", "wall_limit", []
                 return self._error("sandbox_error", "sandbox")
             lifecycle = getattr(self.executor, "sandbox_lifecycle", None)
             if lifecycle is not None:
                 with contextlib.suppress(Exception):
                     self.artifacts.append_event("sandbox_lifecycle", lifecycle())
+            if self._expired():
+                return "unsolved", "wall_limit", []
         return self._run_active()
 
     def _cleanup_executor(self) -> None:
