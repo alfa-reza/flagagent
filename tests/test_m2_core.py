@@ -209,7 +209,7 @@ def test_snapshot_generic_value_error_remains_serialization_error(
 ):
     executor = PreparingExecutor([])
 
-    def fail_snapshot(_source_dir):
+    def fail_snapshot(_source_dir, _limits=None):
         raise ValueError("boom")
 
     monkeypatch.setattr("flagagent.loop._snapshot_source_files", fail_snapshot)
@@ -226,7 +226,7 @@ def test_snapshot_generic_value_error_remains_serialization_error(
     assert result["status:reason"] == "error:serialization_error"
     assert executor.prepared == []
 
-    def fail_invalid(_source_dir):
+    def fail_invalid(_source_dir, _limits=None):
         from flagagent.loop import InvalidChallengeSourceError
 
         raise InvalidChallengeSourceError("bad source")
@@ -246,7 +246,7 @@ def test_snapshot_generic_value_error_remains_serialization_error(
     assert result2["status:reason"] == "error:invalid_challenge_source"
     assert executor2.prepared == []
 
-    def fail_unicode(_source_dir):
+    def fail_unicode(_source_dir, _limits=None):
         raise UnicodeEncodeError("utf-8", "x", 0, 1, "surrogate")
 
     monkeypatch.setattr("flagagent.loop._snapshot_source_files", fail_unicode)
