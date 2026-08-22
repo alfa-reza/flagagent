@@ -14,6 +14,25 @@ def _json(path: Path) -> dict[str, Any]:
     return value
 
 
+def _code_span(value: Any) -> str:
+    text = str(value) if not isinstance(value, str) else value
+    text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
+    longest = 0
+    current = 0
+    for char in text:
+        if char == "`":
+            current += 1
+            longest = max(longest, current)
+        else:
+            current = 0
+    delim = "`" * (longest + 1)
+    if text.startswith("`") or text.endswith("`"):
+        return f"{delim} {text} {delim}"
+    if text.startswith(" ") and text.endswith(" ") and text.strip() != "":
+        return f"{delim} {text} {delim}"
+    return f"{delim}{text}{delim}"
+
+
 def _render_actions(events: list[dict[str, Any]]) -> list[str]:
     lines: list[str] = []
     for event in events:
@@ -28,18 +47,25 @@ def _render_actions(events: list[dict[str, Any]]) -> list[str]:
             if name == "shell" and isinstance(arguments, dict):
                 command = arguments.get("command")
                 if isinstance(command, str):
-                    command = command.replace("`", "\\`")
-                    lines.append(f"- `shell` call `{call_id}`: `{command}`")
+                    lines.append(
+                        f"- `shell` call {_code_span(call_id)}: {_code_span(command)}"
+                    )
                     continue
-            lines.append(f"- `{name}` call `{call_id}`")
+            lines.append(f"- {_code_span(name)} call {_code_span(call_id)}")
         elif event_type == "flag_submission":
-            lines.append(f"- `submit_flag` candidate: `{payload.get('candidate', '')}`")
+            lines.append(
+                f"- `submit_flag` candidate: {_code_span(payload.get('candidate', ''))}"
+            )
         elif event_type == "verifier_result":
-            lines.append(f"- verifier outcome: `{payload.get('outcome', '')}`")
+            lines.append(
+                f"- verifier outcome: {_code_span(payload.get('outcome', ''))}"
+            )
     return lines or ["- no tool actions recorded"]
 
 
-def _render(run: dict[str, Any], events: list[dict[str, Any]], result: dict[str, Any]) -> str:
+def _render(
+    run: dict[str, Any], events: list[dict[str, Any]], result: dict[str, Any]
+) -> str:
     challenge = run.get("challenge", {})
     model = run.get("model", {})
     prompt = run.get("prompt", {})
