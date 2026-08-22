@@ -146,6 +146,7 @@ class DockerExecutor:
     _network_id: str | None = field(default=None, init=False, repr=False)
     _network_name: str | None = field(default=None, init=False, repr=False)
     _resolved_image_id: str | None = field(default=None, init=False, repr=False)
+    _pending_cleanup_errors: list[str] = field(default_factory=list, init=False, repr=False)
     _preparation_remaining: float | None = field(default=None, init=False, repr=False)
     _preparation_deadline: float | None = field(default=None, init=False, repr=False)
 
@@ -276,9 +277,12 @@ class DockerExecutor:
         a result is committed does not rewrite that result; AgentLoop records
         it separately.
         """
+        pending = list(self._pending_cleanup_errors)
+        self._pending_cleanup_errors.clear()
         errors = self._remove_owned()
-        if errors:
-            raise SandboxError("cleanup failed: " + "; ".join(errors))
+        combined = pending + errors
+        if combined:
+            raise SandboxError("cleanup failed: " + "; ".join(combined))
 
     # -- provenance ----------------------------------------------------------
 
@@ -374,7 +378,10 @@ class DockerExecutor:
                 and self.monotonic() >= self._preparation_deadline
             ):
                 raise
-            self._remove_owned()
+    
+            errors = self._remove_owned()
+            if errors:
+                self._pending_cleanup_errors.extend(errors)
             raise
 
     def _create_agent(self, workspace: Path, run_id: str) -> None:
@@ -751,39 +758,44 @@ class DockerExecutor:
         """Best-effort remove all owned resources in order.
 
         Order is Agent, then Target, then network (a network cannot be removed
-        while containers are attached).  State is cleared before each removal
-        so a later failure does not double-remove.  Returns a list of error
-        strings (empty when fully successful); never raises.
+        while containers are attached).  Ownership state is only forgotten when
+        removal is known to have succeeded or the resource is deterministically
+        gone; a failed or ambiguous removal retains the IDs so a later cleanup
+        can retry or account for the resource.  Returns a list of error strings
+        (empty when fully successful); never raises.
         """
         errors: list[str] = []
         if self._container_id is not None:
             cid = self._container_id
-            self._container_id = None
-            self._container_name = None
-            self._resolved_image_id = None
             err = self._remove_container(cid)
             if err:
                 errors.append(f"agent({cid}): {err}")
+            else:
+                self._container_id = None
+                self._container_name = None
+                self._resolved_image_id = None
         else:
             self._container_name = None
             self._resolved_image_id = None
         if self._target_id is not None:
             tid = self._target_id
-            self._target_id = None
-            self._target_name = None
             err = self._remove_container(tid)
             if err:
                 errors.append(f"target({tid}): {err}")
+            else:
+                self._target_id = None
+                self._target_name = None
         else:
             self._target_name = None
         if self._network_id is not None:
             network_id = self._network_id
             network_name = self._network_name or network_id
-            self._network_name = None
-            self._network_id = None
             err = self._remove_network(network_id)
             if err:
                 errors.append(f"network({network_name}): {err}")
+            else:
+                self._network_id = None
+                self._network_name = None
         else:
             self._network_name = None
         return errors
