@@ -396,13 +396,16 @@ class DockerExecutor:
         if result.returncode != 0:
             detail = (result.stderr.strip() or result.stdout.strip() or "unknown error").strip()
             raise SandboxError(f"unable to validate Docker endpoint for context {name!r}: {detail}")
-        return result.stdout.strip()
+        host = result.stdout.strip()
+        if not host:
+            raise SandboxError(f"unable to validate Docker endpoint for context {name!r}: empty host")
+        return host
 
     @staticmethod
     def _is_local_endpoint(host: str) -> bool:
         h = host.strip()
         if not h:
-            return True
+            raise SandboxError("unable to validate Docker endpoint: empty host")
         lower = h.lower()
         if lower.startswith("unix://") or lower.startswith("npipe://") or lower.startswith("fd://"):
             return True

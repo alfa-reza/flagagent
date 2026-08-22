@@ -492,14 +492,18 @@ def test_prepare_rejects_double_prepare():
         "unix://./docker.sock",
         "npipe:////./pipe/docker_engine",
         "fd://3",
-        "",
-        "   ",
         "/var/run/docker.sock",
         "unix:///home/user/.docker/desktop/docker.sock",
     ],
 )
 def test_is_local_endpoint_accepts_local_sockets(local_host):
     assert DockerExecutor._is_local_endpoint(local_host) is True
+
+
+@pytest.mark.parametrize("empty_host", ["", "   ", "\t\n"])
+def test_is_local_endpoint_rejects_empty_host(empty_host):
+    with pytest.raises(SandboxError, match="empty host"):
+        DockerExecutor._is_local_endpoint(empty_host)
 
 
 @pytest.mark.parametrize(
@@ -652,8 +656,9 @@ def test_prepare_uses_effective_docker_host_precedence(monkeypatch, tmp_path):
 
         executor = DockerExecutor()
         if should_reject:
-            with pytest.raises(SandboxError, match="unsupported remote Docker endpoint"):
+            with pytest.raises(SandboxError, match="unsupported remote Docker endpoint") as exc:
                 executor.prepare(workspace, RUN_ID)
+            assert expected_host in str(exc.value)
             if docker_context is not None:
                 assert seen_inspect == [docker_context]
                 assert not seen_show[0]
@@ -665,6 +670,8 @@ def test_prepare_uses_effective_docker_host_precedence(monkeypatch, tmp_path):
         else:
             executor.prepare(workspace, RUN_ID)
             assert executor._container_id == "cid"
+            effective = inspect_hosts.get(docker_context or show_host, expected_host) if docker_context is not None or docker_host is None else docker_host
+            assert effective == expected_host
             executor._container_id = None
             executor._container_name = None
             executor._resolved_image_id = None
@@ -802,6 +809,49 @@ def test_prepare_rejects_docker_host_env_remote(monkeypatch, tmp_path):
         executor.prepare(workspace, RUN_ID)
     assert not any(a[1] == "run" for a in calls)
     assert not any(a[1] == "context" for a in calls)
+
+
+def test_prepare_fails_closed_on_empty_endpoint(monkeypatch, tmp_path):
+    """Empty context Host must fail closed before any docker run/network creation."""
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[1] == "context" and args[2] == "show":
+            return _FakeCompleted(stdout="default\n")
+        if args[1] == "context" and args[2] == "inspect":
+            return _FakeCompleted(stdout="\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = DockerExecutor()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with pytest.raises(SandboxError, match="empty host"):
+        executor.prepare(workspace, RUN_ID)
+    assert not any(a[1] == "run" for a in calls)
+    assert not any(a[1] == "network" for a in calls)
+
+
+def test_prepare_fails_closed_on_whitespace_endpoint(monkeypatch, tmp_path):
+    """Whitespace-only Host must fail closed before any docker run."""
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[1] == "context" and args[2] == "show":
+            return _FakeCompleted(stdout="default\n")
+        if args[1] == "context" and args[2] == "inspect":
+            return _FakeCompleted(stdout="   \n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = DockerExecutor()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with pytest.raises(SandboxError, match="empty host"):
+        executor.prepare(workspace, RUN_ID)
+    assert not any(a[1] == "run" for a in calls)
 
 
 def test_prepare_endpoint_validation_respects_preparation_deadline(monkeypatch, tmp_path):
