@@ -59,12 +59,22 @@ class Limits:
     command_timeout_seconds: float = 60
     max_model_tool_output_bytes: int = MODEL_TOOL_OUTPUT_BYTES
     max_logged_tool_output_bytes: int = LOGGED_TOOL_OUTPUT_BYTES
+    max_source_file_bytes: int = 10 * 1024 * 1024
+    max_source_total_bytes: int = 50 * 1024 * 1024
+    max_source_files: int = 1024
+    max_source_entries: int = 2048
+    max_source_depth: int = 16
 
     def __post_init__(self) -> None:
         integer_values = (
             self.max_model_turns,
             self.max_model_tool_output_bytes,
             self.max_logged_tool_output_bytes,
+            self.max_source_file_bytes,
+            self.max_source_total_bytes,
+            self.max_source_files,
+            self.max_source_entries,
+            self.max_source_depth,
         )
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
@@ -90,6 +100,11 @@ class Limits:
             "command_timeout_seconds": self.command_timeout_seconds,
             "max_model_tool_output_bytes": self.max_model_tool_output_bytes,
             "max_logged_tool_output_bytes": self.max_logged_tool_output_bytes,
+            "max_source_file_bytes": self.max_source_file_bytes,
+            "max_source_total_bytes": self.max_source_total_bytes,
+            "max_source_files": self.max_source_files,
+            "max_source_entries": self.max_source_entries,
+            "max_source_depth": self.max_source_depth,
         }
 
 
@@ -99,9 +114,12 @@ def _utc_timestamp(value: datetime) -> str:
 
 def _snapshot_source_files(
     source_dir: Path | None,
+    limits: Limits | None = None,
 ) -> tuple[list[tuple[Path, Path]], str | None, Any | None]:
     if source_dir is None:
         return [], None, None
+    if limits is None:
+        limits = Limits()
     temporary = tempfile.TemporaryDirectory(prefix="flagagent-source-")
     files: list[tuple[Path, Path]] = []
     try:
@@ -115,21 +133,34 @@ def _snapshot_source_files(
             "challenge source_dir must be a directory"
         ) from error
 
-    def visit(directory_fd: int, relative: Path) -> None:
+    total_bytes: int = 0
+    file_count: int = 0
+    total_entries: int = 0
+
+    def visit(directory_fd: int, relative: Path, depth: int) -> None:
+        nonlocal total_bytes, file_count, total_entries
+        if depth > limits.max_source_depth:
+            raise InvalidChallengeSourceError("challenge source too deep")
+        names: list[str] = []
         try:
-            entries = list(os.scandir(directory_fd))
+            with os.scandir(directory_fd) as it:
+                for entry in it:
+                    total_entries += 1
+                    if total_entries > limits.max_source_entries:
+                        raise InvalidChallengeSourceError(
+                            "challenge source has too many entries"
+                        )
+                    names.append(entry.name)
         except OSError as error:
             raise InvalidChallengeSourceError(
                 "challenge source cannot be read"
             ) from error
-        for entry in sorted(entries, key=lambda item: item.name):
-            entry_relative = relative / entry.name
+        for name in sorted(names):
+            entry_relative = relative / name
             if entry_relative.is_absolute() or ".." in entry_relative.parts:
                 raise InvalidChallengeSourceError("challenge source path is unsafe")
             try:
-                entry_stat = os.stat(
-                    entry.name, dir_fd=directory_fd, follow_symlinks=False
-                )
+                entry_stat = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
             except OSError as error:
                 raise InvalidChallengeSourceError(
                     "challenge source cannot be inspected"
@@ -140,7 +171,7 @@ def _snapshot_source_files(
             if stat.S_ISDIR(mode):
                 try:
                     child_fd = os.open(
-                        entry.name,
+                        name,
                         os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
                         dir_fd=directory_fd,
                     )
@@ -149,15 +180,19 @@ def _snapshot_source_files(
                         "challenge source directory changed"
                     ) from error
                 try:
-                    visit(child_fd, entry_relative)
+                    visit(child_fd, entry_relative, depth + 1)
                 finally:
                     os.close(child_fd)
             elif stat.S_ISREG(mode):
+                if file_count >= limits.max_source_files:
+                    raise InvalidChallengeSourceError(
+                        "challenge source has too many files"
+                    )
                 snapshot = Path(temporary.name) / entry_relative
                 snapshot.parent.mkdir(parents=True, exist_ok=True)
                 try:
                     source_fd = os.open(
-                        entry.name,
+                        name,
                         os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
                         dir_fd=directory_fd,
                     )
@@ -166,27 +201,55 @@ def _snapshot_source_files(
                         "challenge source file changed"
                     ) from error
                 try:
-                    if not stat.S_ISREG(os.fstat(source_fd).st_mode):
+                    st = os.fstat(source_fd)
+                    if not stat.S_ISREG(st.st_mode):
                         raise InvalidChallengeSourceError(
                             "challenge source contains a special file"
                         )
+                    logical_size = st.st_size
+                    if logical_size > limits.max_source_file_bytes:
+                        raise InvalidChallengeSourceError(
+                            "challenge source file too large"
+                        )
+                    if total_bytes + logical_size > limits.max_source_total_bytes:
+                        raise InvalidChallengeSourceError("challenge source too large")
                     with os.fdopen(source_fd, "rb") as source_handle:
                         source_fd = -1
                         with snapshot.open("wb") as snapshot_handle:
-                            shutil.copyfileobj(
-                                source_handle, snapshot_handle, 1024 * 1024
-                            )
+                            file_bytes = 0
+                            while True:
+                                chunk = source_handle.read(1024 * 1024)
+                                if not chunk:
+                                    break
+                                if (
+                                    file_bytes + len(chunk)
+                                    > limits.max_source_file_bytes
+                                ):
+                                    raise InvalidChallengeSourceError(
+                                        "challenge source file too large"
+                                    )
+                                if (
+                                    total_bytes + len(chunk)
+                                    > limits.max_source_total_bytes
+                                ):
+                                    raise InvalidChallengeSourceError(
+                                        "challenge source too large"
+                                    )
+                                snapshot_handle.write(chunk)
+                                file_bytes += len(chunk)
+                                total_bytes += len(chunk)
                 finally:
                     if source_fd >= 0:
                         os.close(source_fd)
                 files.append((snapshot, entry_relative))
+                file_count += 1
             else:
                 raise InvalidChallengeSourceError(
                     "challenge source contains a special file"
                 )
 
     try:
-        visit(root_fd, Path())
+        visit(root_fd, Path(), 0)
     except BaseException:
         os.close(root_fd)
         temporary.cleanup()
@@ -351,7 +414,7 @@ class AgentLoop:
         source_serialization_error: ValueError | None = None
         try:
             self._source_files, source_sha256, self._source_temporary = (
-                _snapshot_source_files(self.challenge.source_dir)
+                _snapshot_source_files(self.challenge.source_dir, self.limits)
             )
         except InvalidChallengeSourceError as error:
             self._source_files = []

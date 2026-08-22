@@ -154,6 +154,18 @@ The repository includes two small smoke challenges:
 
 They exercise the harness itself; they are not a benchmark of general CTF capability.
 
+Challenge source ingestion is bounded before sandbox preparation:
+
+| Limit | Default |
+| --- | --- |
+| Maximum individual source file size | 10 MiB |
+| Maximum aggregate source content | 50 MiB |
+| Maximum regular source files | 1024 |
+| Maximum source entries | 2048 |
+| Maximum directory depth | 16 |
+
+A challenge source exceeding these limits is rejected as `error:invalid_challenge_source` before sandbox preparation or model execution.
+
 <details>
 <summary>Run the local target challenge</summary>
 
