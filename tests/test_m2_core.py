@@ -188,7 +188,7 @@ def test_source_staging_failure_does_not_prepare_executor(tmp_path, monkeypatch)
     file_path.write_text("data")
     executor = PreparingExecutor([])
 
-    def fail_stage(workspace, files):
+    def fail_stage(workspace, files, expired=None):
         raise ValueError("source changed during staging")
 
     monkeypatch.setattr("flagagent.loop._stage_source_files", fail_stage)
