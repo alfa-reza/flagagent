@@ -213,3 +213,81 @@ def test_code_span_delimiter_selection():
     assert _code_span("`both`") == "`` `both` ``"
     assert _code_span("no ticks") == "`no ticks`"
     assert _code_span("") == "``"
+
+
+def test_writeup_multiline_injection_cannot_create_blocks(tmp_path):
+    evil = "echo `evil`\n# HACKED\n- injected item\n[evil](https://example.test)"
+    model = ScriptedModel(
+        [
+            ModelResponse(
+                tool_calls=(ToolCall("c1", "shell", {"command": evil}),),
+                usage={"input_tokens": 1, "output_tokens": 1},
+            ),
+            ModelResponse(
+                tool_calls=(
+                    ToolCall(
+                        "call`id\n# HACKED\n- list", "tool`name\n# HACKED", {"x": 1}
+                    ),
+                ),
+                usage={"input_tokens": 1, "output_tokens": 1},
+            ),
+            ModelResponse(
+                tool_calls=(ToolCall("f1", "submit_flag", {"candidate": evil}),),
+                usage={"input_tokens": 1, "output_tokens": 1},
+            ),
+        ]
+    )
+    loop = AgentLoop(
+        model=model,
+        executor=FakeExecutor([ShellResult("", "", 0, False)]),
+        verifier=ExactStringVerifier("Flag{ok}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(
+            max_model_turns=5, wall_timeout_seconds=100, command_timeout_seconds=10
+        ),
+        runs_root=tmp_path,
+        monotonic=lambda: 0,
+        utc_now=lambda: __import__("datetime").datetime.now(__import__("datetime").UTC),
+        run_id="FA-20260817T000000Z-multiline-escape",
+        model_identity="test-model",
+        protocol="openai-chat",
+    )
+    loop.run()
+    text = write_writeup(loop.artifacts.directory).read_text()
+    from flagagent.artifacts import read_events
+    from flagagent.writeup import _code_span
+
+    assert _code_span(evil) in text
+    assert "\n# HACKED" not in text
+    assert "\n- injected item" not in text
+    lines = text.splitlines()
+    assert not any(line.lstrip().startswith("# HACKED") for line in lines)
+    assert not any(line.strip() == "- injected item" for line in lines)
+    assert not any(line.strip() == "[evil](https://example.test)" for line in lines)
+    assert lines.count("# FlagAgent Run") == 1
+    assert lines.count("## Actions") == 1
+    assert lines.count("## Metrics") == 1
+    action_lines = [line for line in lines if line.startswith("- ")]
+    assert all("\n" not in line for line in action_lines)
+    assert any(
+        "# HACKED" in line and "- injected item" in line for line in action_lines
+    )
+    events = read_events(loop.artifacts.directory / "events.jsonl")
+    payloads = [e.get("payload", {}) for e in events]
+    assert any(p.get("arguments", {}).get("command") == evil for p in payloads)
+    assert any(p.get("candidate") == evil for p in payloads)
+    assert any(p.get("name") == "tool`name\n# HACKED" for p in payloads)
+    assert any(p.get("call_id") == "call`id\n# HACKED\n- list" for p in payloads)
+
+
+def test_code_span_normalizes_newlines_and_preserves_whitespace():
+    from flagagent.writeup import _code_span
+
+    assert _code_span("a\nb") == "`a b`"
+    assert _code_span("a\r\nb") == "`a b`"
+    assert _code_span("a\rb") == "`a b`"
+    assert _code_span("echo `evil`\n# HACKED") == "``echo `evil` # HACKED``"
+    assert _code_span(" hello ") == "`  hello  `"
+    assert _code_span(" hello") == "` hello`"
+    assert _code_span("hello ") == "`hello `"
+    assert _code_span(" ") == "` `"

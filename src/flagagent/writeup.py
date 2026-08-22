@@ -16,6 +16,7 @@ def _json(path: Path) -> dict[str, Any]:
 
 def _code_span(value: Any) -> str:
     text = str(value) if not isinstance(value, str) else value
+    text = text.replace("\r\n", " ").replace("\r", " ").replace("\n", " ")
     longest = 0
     current = 0
     for char in text:
@@ -26,6 +27,8 @@ def _code_span(value: Any) -> str:
             current = 0
     delim = "`" * (longest + 1)
     if text.startswith("`") or text.endswith("`"):
+        return f"{delim} {text} {delim}"
+    if text.startswith(" ") and text.endswith(" ") and text.strip() != "":
         return f"{delim} {text} {delim}"
     return f"{delim}{text}{delim}"
 
