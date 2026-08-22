@@ -143,8 +143,10 @@ def test_run_args_mount_only_workspace():
     executor = DockerExecutor()
     workspace = Path("/tmp/fa-ws")
     args = executor._run_args(workspace, RUN_ID)
-    mounts = _values(args, "-v")
-    assert mounts == [f"{workspace}:{WORKSPACE_TARGET}"]
+    mounts = _values(args, "--mount")
+    assert mounts == [f"type=bind,source={workspace},target={WORKSPACE_TARGET}"]
+    assert "-v" not in args
+    assert "--volume" not in args
 
 
 def test_run_args_exclude_privileged_hostnet_socket_and_extra_mounts():
@@ -156,7 +158,8 @@ def test_run_args_exclude_privileged_hostnet_socket_and_extra_mounts():
     assert "/var/run/docker.sock" not in args
     assert "/var/run" not in args
     # exactly one bind mount
-    assert len(_values(args, "-v")) == 1
+    assert len(_values(args, "--mount")) == 1
+    assert "-v" not in args
     # no --cap-add
     assert "--cap-add" not in args
 
@@ -194,6 +197,7 @@ def test_prepare_local_retains_target_on_failed_removal_and_pending_is_observabl
     executor = DockerExecutor(network_mode="local")
     workspace = tmp_path / "ws"
     workspace.mkdir()
+    monkeypatch.setattr(executor, "_validate_docker_endpoint", lambda: None)
 
     def fake_create_network(run_id):
         executor._network_id = "net123"
@@ -238,6 +242,7 @@ def test_prepare_local_retains_network_on_failed_removal_and_preserves_original_
     executor = DockerExecutor(network_mode="local")
     workspace = tmp_path / "ws"
     workspace.mkdir()
+    monkeypatch.setattr(executor, "_validate_docker_endpoint", lambda: None)
 
     def fake_create_network(run_id):
         executor._network_id = "net123"
@@ -307,6 +312,7 @@ def test_prepare_failure_preserved_and_cleanup_observable_via_loop(
     workspace = tmp_path / "ws"
     workspace.mkdir()
     executor = DockerExecutor(network_mode="local")
+    monkeypatch.setattr(executor, "_validate_docker_endpoint", lambda: None)
 
     def fake_create_network(run_id):
         executor._network_id = "net123"
@@ -453,7 +459,15 @@ def test_prepare_raises_sandbox_error_on_docker_run_failure(monkeypatch):
         stdout = ""
         stderr = "Error: no such image"
 
-    monkeypatch.setattr(subprocess, "run", lambda *a, **kw: FakeResult())
+    def fake_run(args, **kwargs):
+        if args[1] == "context":
+            if args[2] == "show":
+                return _FakeCompleted(stdout="default\n")
+            if args[2] == "inspect":
+                return _FakeCompleted(stdout="unix:///var/run/docker.sock\n")
+        return FakeResult()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
     executor = DockerExecutor()
     with pytest.raises(SandboxError, match="docker run failed"):
         executor.prepare(Path("/tmp/ws"), RUN_ID)
@@ -464,6 +478,362 @@ def test_prepare_rejects_double_prepare():
     executor._container_id = "existing"
     with pytest.raises(SandboxError, match="already prepared"):
         executor.prepare(Path("/tmp/ws"), RUN_ID)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — Docker endpoint/topology validation (no Docker required)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "local_host",
+    [
+        "unix:///var/run/docker.sock",
+        "unix://./docker.sock",
+        "npipe:////./pipe/docker_engine",
+        "fd://3",
+        "",
+        "   ",
+        "/var/run/docker.sock",
+        "unix:///home/user/.docker/desktop/docker.sock",
+    ],
+)
+def test_is_local_endpoint_accepts_local_sockets(local_host):
+    assert DockerExecutor._is_local_endpoint(local_host) is True
+
+
+@pytest.mark.parametrize(
+    "remote_host",
+    [
+        "tcp://192.168.1.10:2375",
+        "tcp://remote.example.com:2376",
+        "ssh://user@192.168.1.10",
+        "ssh://alice@remote.example.com/var/run/docker.sock",
+        "TCP://192.168.1.10:2375",
+        "SSH://user@host",
+    ],
+)
+def test_is_local_endpoint_rejects_tcp_and_ssh(remote_host):
+    assert DockerExecutor._is_local_endpoint(remote_host) is False
+
+
+def test_prepare_none_with_local_endpoint_proceeds(monkeypatch, tmp_path):
+    """Supported local endpoint allows prepare to proceed to docker run."""
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[1] == "context" and args[2] == "show":
+            return _FakeCompleted(stdout="default\n")
+        if args[1] == "context" and args[2] == "inspect":
+            return _FakeCompleted(stdout="unix:///var/run/docker.sock\n")
+        if args[1] == "run":
+            return _FakeCompleted(stdout="cid123\n")
+        if args[1] == "inspect" and "{{.State.Running}}" in args:
+            return _FakeCompleted(stdout="true\n")
+        if args[1] == "inspect" and "{{.Image}}" in args:
+            return _FakeCompleted(stdout="sha256:abc\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = DockerExecutor(network_mode="none")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    executor.prepare(workspace, RUN_ID)
+    assert executor._container_id == "cid123"
+    markers = [a for a in calls if a[:2] == ["docker", "run"]]
+    assert markers
+    assert f"type=bind,source={workspace},target={WORKSPACE_TARGET}" in markers[0]
+
+
+def test_prepare_rejects_tcp_endpoint_before_docker_run(monkeypatch, tmp_path):
+    """Unsupported TCP endpoint fails closed before docker run or network create."""
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[1] == "context" and args[2] == "show":
+            return _FakeCompleted(stdout="default\n")
+        if args[1] == "context" and args[2] == "inspect":
+            return _FakeCompleted(stdout="tcp://192.168.1.10:2375\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = DockerExecutor(network_mode="none")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with pytest.raises(SandboxError, match="unsupported remote Docker endpoint"):
+        executor.prepare(workspace, RUN_ID)
+    assert not any(a[1] == "run" for a in calls)
+    assert not any(a[1] == "network" for a in calls)
+    assert str(workspace) not in " ".join(" ".join(a) for a in calls)
+
+
+def test_prepare_rejects_ssh_endpoint_before_docker_run(monkeypatch, tmp_path):
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[1] == "context" and args[2] == "show":
+            return _FakeCompleted(stdout="default\n")
+        if args[1] == "context" and args[2] == "inspect":
+            return _FakeCompleted(stdout="ssh://user@remote.example.com\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = DockerExecutor(network_mode="none")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with pytest.raises(SandboxError, match="unsupported remote Docker endpoint"):
+        executor.prepare(workspace, RUN_ID)
+    assert not any(a[1] == "run" for a in calls)
+    assert not any(a[1] == "network" for a in calls)
+
+
+def test_prepare_rejects_tcp_endpoint_in_local_mode_before_network_create(
+    monkeypatch, tmp_path
+):
+    """In network_mode=local, remote rejection happens before network/Target creation."""
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[1] == "context" and args[2] == "show":
+            return _FakeCompleted(stdout="default\n")
+        if args[1] == "context" and args[2] == "inspect":
+            return _FakeCompleted(stdout="tcp://10.0.0.5:2375\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = DockerExecutor(network_mode="local")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with pytest.raises(SandboxError, match="unsupported remote Docker endpoint"):
+        executor.prepare(workspace, RUN_ID)
+    assert not any(a[1] == "run" for a in calls)
+    assert not any(a[1] == "network" for a in calls)
+
+
+def test_prepare_uses_effective_docker_host_precedence(monkeypatch, tmp_path):
+    """DOCKER_CONTEXT overrides DOCKER_HOST and context show; DOCKER_HOST overrides context show."""
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def scenario(docker_context, docker_host, show_host, inspect_hosts, expected_host, should_reject):
+        seen_inspect: list[str] = []
+        seen_show = [False]
+
+        def fake_run(args, **kwargs):
+            if args[1] == "context" and args[2] == "show":
+                seen_show[0] = True
+                if docker_context is not None or docker_host is not None:
+                    raise AssertionError("context show should not be called when env var is set")
+                return _FakeCompleted(stdout=show_host + "\n")
+            if args[1] == "context" and args[2] == "inspect":
+                seen_inspect.append(args[3])
+                host = inspect_hosts.get(args[3], "unix:///var/run/docker.sock")
+                return _FakeCompleted(stdout=host + "\n")
+            if args[1] == "run":
+                return _FakeCompleted(stdout="cid\n")
+            if args[1] == "inspect":
+                if "{{.State.Running}}" in args:
+                    return _FakeCompleted(stdout="true\n")
+                if "{{.Image}}" in args:
+                    return _FakeCompleted(stdout="sha256:abc\n")
+            return _FakeCompleted()
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        for key in ("DOCKER_CONTEXT", "DOCKER_HOST"):
+            monkeypatch.delenv(key, raising=False)
+        if docker_context is not None:
+            monkeypatch.setenv("DOCKER_CONTEXT", docker_context)
+        if docker_host is not None:
+            monkeypatch.setenv("DOCKER_HOST", docker_host)
+
+        executor = DockerExecutor()
+        if should_reject:
+            with pytest.raises(SandboxError, match="unsupported remote Docker endpoint"):
+                executor.prepare(workspace, RUN_ID)
+            if docker_context is not None:
+                assert seen_inspect == [docker_context]
+                assert not seen_show[0]
+            elif docker_host is not None:
+                assert seen_inspect == []
+                assert not seen_show[0]
+            else:
+                assert seen_inspect == [show_host]
+        else:
+            executor.prepare(workspace, RUN_ID)
+            assert executor._container_id == "cid"
+            executor._container_id = None
+            executor._container_name = None
+            executor._resolved_image_id = None
+            if docker_context is not None:
+                assert seen_inspect == [docker_context]
+            elif docker_host is not None:
+                assert seen_inspect == []
+            else:
+                assert seen_inspect == [show_host]
+
+    scenario(
+        docker_context="my-remote",
+        docker_host="tcp://docker-host-env:2375",
+        show_host="default",
+        inspect_hosts={"my-remote": "ssh://user@remote.example.com"},
+        expected_host="ssh://user@remote.example.com",
+        should_reject=True,
+    )
+    scenario(
+        docker_context=None,
+        docker_host="tcp://10.0.0.5:2375",
+        show_host="default",
+        inspect_hosts={},
+        expected_host="tcp://10.0.0.5:2375",
+        should_reject=True,
+    )
+    scenario(
+        docker_context=None,
+        docker_host=None,
+        show_host="default",
+        inspect_hosts={"default": "unix:///var/run/docker.sock"},
+        expected_host="unix:///var/run/docker.sock",
+        should_reject=False,
+    )
+
+
+def test_prepare_does_not_assume_context_name_is_local(monkeypatch, tmp_path):
+    """A context named 'default' with a remote Host must be rejected via effective endpoint."""
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[1] == "context" and args[2] == "show":
+            return _FakeCompleted(stdout="default\n")
+        if args[1] == "context" and args[2] == "inspect":
+            assert args[3] == "default"
+            return _FakeCompleted(stdout="tcp://192.168.1.10:2375\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = DockerExecutor(network_mode="none")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with pytest.raises(SandboxError, match="unsupported remote Docker endpoint"):
+        executor.prepare(workspace, RUN_ID)
+    assert not any(a[1] == "run" for a in calls)
+
+
+def test_prepare_rejects_when_context_inspect_reports_remote_for_custom_context(
+    monkeypatch, tmp_path
+):
+    """Custom context name with remote host also rejected."""
+    def fake_run(args, **kwargs):
+        if args[1] == "context" and args[2] == "show":
+            return _FakeCompleted(stdout="my-remote\n")
+        if args[1] == "context" and args[2] == "inspect":
+            assert args[3] == "my-remote"
+            return _FakeCompleted(stdout="tcp://remote:2375\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = DockerExecutor()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with pytest.raises(SandboxError, match="unsupported remote Docker endpoint"):
+        executor.prepare(workspace, RUN_ID)
+
+
+def test_prepare_fails_closed_when_endpoint_cannot_be_validated(monkeypatch, tmp_path):
+    """If context inspect fails, preparation must fail closed without docker run."""
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[1] == "context" and args[2] == "show":
+            return _FakeCompleted(stdout="default\n")
+        if args[1] == "context" and args[2] == "inspect":
+            return _FakeCompleted(returncode=1, stderr="no such context")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = DockerExecutor()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with pytest.raises(SandboxError, match="unable to validate Docker endpoint"):
+        executor.prepare(workspace, RUN_ID)
+    assert not any(a[1] == "run" for a in calls)
+
+
+def test_prepare_rejects_docker_context_env_remote_host(monkeypatch, tmp_path):
+    """DOCKER_CONTEXT env pointing at a remote Host must be rejected."""
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        if args[1] == "context" and args[2] == "inspect":
+            assert args[3] == "env-remote"
+            return _FakeCompleted(stdout="ssh://user@host\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setenv("DOCKER_CONTEXT", "env-remote")
+    executor = DockerExecutor()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with pytest.raises(SandboxError, match="unsupported remote Docker endpoint"):
+        executor.prepare(workspace, RUN_ID)
+    assert not any(a[1] == "run" for a in calls)
+
+
+def test_prepare_rejects_docker_host_env_remote(monkeypatch, tmp_path):
+    calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append(list(args))
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setenv("DOCKER_HOST", "tcp://10.0.0.1:2375")
+    monkeypatch.delenv("DOCKER_CONTEXT", raising=False)
+    executor = DockerExecutor()
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    with pytest.raises(SandboxError, match="unsupported remote Docker endpoint"):
+        executor.prepare(workspace, RUN_ID)
+    assert not any(a[1] == "run" for a in calls)
+    assert not any(a[1] == "context" for a in calls)
+
+
+def test_prepare_endpoint_validation_respects_preparation_deadline(monkeypatch, tmp_path):
+    """Docker probes from prepare remain bounded by the shared preparation deadline."""
+    timeouts: list[float | None] = []
+
+    def fake_run(args, **kwargs):
+        timeouts.append(kwargs.get("timeout"))
+        if args[1] == "context" and args[2] == "show":
+            return _FakeCompleted(stdout="default\n")
+        if args[1] == "context" and args[2] == "inspect":
+            return _FakeCompleted(stdout="unix:///var/run/docker.sock\n")
+        if args[1] == "run":
+            return _FakeCompleted(stdout="cid\n")
+        if args[1] == "inspect":
+            if "{{.State.Running}}" in args:
+                return _FakeCompleted(stdout="true\n")
+            if "{{.Image}}" in args:
+                return _FakeCompleted(stdout="sha256:abc\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    executor = DockerExecutor()
+    executor.monotonic = lambda: 0.0
+    executor.set_remaining(5.0)
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+    executor.prepare(workspace, RUN_ID)
+    assert timeouts
+    for t in timeouts:
+        if t is not None:
+            assert t <= 5.0
 
 
 # ---------------------------------------------------------------------------
@@ -523,6 +893,11 @@ def _fake_prepare_run(captured):
 
     def fake_run(args, **kwargs):
         captured.append(kwargs.get("timeout"))
+        if args[1] == "context":
+            if args[2] == "show":
+                return _FakeCompleted(stdout="default\n")
+            if args[2] == "inspect":
+                return _FakeCompleted(stdout="unix:///var/run/docker.sock\n")
         if args[1] == "network" and args[2] == "create":
             return _FakeCompleted(stdout="nid123\n")
         if args[1] == "run":
@@ -586,6 +961,11 @@ def test_prepare_local_skips_cleanup_when_budget_exhausted(monkeypatch):
 
     def fake_run(args, **kwargs):
         calls.append((list(args), kwargs.get("timeout")))
+        if args[1] == "context":
+            if args[2] == "show":
+                return _FakeCompleted(stdout="default\n")
+            if args[2] == "inspect":
+                return _FakeCompleted(stdout="unix:///var/run/docker.sock\n")
         if args[1] == "network" and args[2] == "create":
             return _FakeCompleted(stdout="nid123\n")
         if args[1] == "run":

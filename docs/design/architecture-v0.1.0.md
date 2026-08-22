@@ -503,7 +503,13 @@ The run workspace is intentionally writable and bind-mounted into the Agent cont
 
 Unrelated host paths are not mounted by default. In particular, the execution boundary does not require the Docker socket, full user home, provider credential directories, or the FlagAgent repository to be exposed to the solver.
 
-### 7.5 Containment limitations
+### 7.5 Supported Docker topology
+
+FlagAgent v0.1 supports local Docker Engine with a daemon reachable via a local socket (`unix://`, `npipe://`, `fd://`, or a direct filesystem path such as `/var/run/docker.sock`). The control process and daemon must share the same host filesystem so the Run workspace bind mount (`--mount type=bind,source=<workspace>,target=/workspace`) refers to the same path.
+
+Remote TCP (`tcp://`) and SSH (`ssh://`) daemon endpoints are unsupported and fail closed before any Run-scoped Docker resource is created. Endpoint validation resolves the effective Docker host using Docker's documented precedence — `DOCKER_CONTEXT` overrides `DOCKER_HOST`, which overrides the active context from `docker context show` / `docker context inspect` — and inspects the endpoint host string rather than assuming a name like `default` is always local. If the endpoint cannot be reliably determined, preparation also fails closed. The explicit `--mount type=bind,...` form converts a missing source on the daemon host into a deterministic failure rather than silently creating an empty directory, but remote topology validation remains the primary control.
+
+### 7.6 Containment limitations
 
 Docker is a practical containment baseline for v0.1.0, not a hardened isolation boundary:
 

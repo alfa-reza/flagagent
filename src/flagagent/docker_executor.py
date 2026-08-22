@@ -214,6 +214,7 @@ class DockerExecutor:
                 raise SandboxError("preparation budget exhausted")
             self._preparation_deadline = self.monotonic() + remaining
         try:
+            self._validate_docker_endpoint()
             if self.network_mode == "local":
                 self._prepare_local(workspace, run_id)
             else:
@@ -327,6 +328,89 @@ class DockerExecutor:
         if self._resolved_image_id is not None:
             info["image_id"] = self._resolved_image_id
         return info
+
+    def _validate_docker_endpoint(self) -> None:
+        try:
+            host = self._effective_docker_host()
+        except SandboxError:
+            raise
+        except Exception as error:
+            raise SandboxError(f"unable to validate Docker endpoint: {error}") from error
+        if not self._is_local_endpoint(host):
+            raise SandboxError(
+                f"unsupported remote Docker endpoint {host!r}; "
+                "FlagAgent v0.1 supports only local Docker Engine via unix/npipe/fd sockets; "
+                "check DOCKER_HOST, DOCKER_CONTEXT, and docker context"
+            )
+
+    def _effective_docker_host(self) -> str:
+        ctx = os.environ.get("DOCKER_CONTEXT", "")
+        ctx = ctx.strip() if isinstance(ctx, str) else ""
+        if ctx:
+            return self._host_for_context(ctx)
+        host = os.environ.get("DOCKER_HOST", "")
+        host = host.strip() if isinstance(host, str) else ""
+        if host:
+            return host
+        name = self._current_context_name()
+        return self._host_for_context(name)
+
+    def _current_context_name(self) -> str:
+        try:
+            result = subprocess.run(
+                [self.docker_bin, "context", "show"],
+                capture_output=True,
+                text=True,
+                timeout=self._preparation_timeout(5),
+                check=False,
+            )
+        except FileNotFoundError as error:
+            raise SandboxError("docker CLI not found") from error
+        except subprocess.TimeoutExpired as error:
+            raise SandboxError("unable to determine Docker context: timed out") from error
+        except OSError as error:
+            raise SandboxError(f"unable to determine Docker context: {error}") from error
+        if result.returncode != 0:
+            detail = (result.stderr.strip() or result.stdout.strip() or "unknown error").strip()
+            raise SandboxError(f"unable to determine Docker context: {detail}")
+        name = result.stdout.strip()
+        if not name:
+            raise SandboxError("unable to determine Docker context: empty context name")
+        return name
+
+    def _host_for_context(self, name: str) -> str:
+        try:
+            result = subprocess.run(
+                [self.docker_bin, "context", "inspect", name, "--format", "{{.Endpoints.docker.Host}}"],
+                capture_output=True,
+                text=True,
+                timeout=self._preparation_timeout(5),
+                check=False,
+            )
+        except FileNotFoundError as error:
+            raise SandboxError("docker CLI not found") from error
+        except subprocess.TimeoutExpired as error:
+            raise SandboxError(f"unable to validate Docker endpoint for context {name!r}: timed out") from error
+        except OSError as error:
+            raise SandboxError(f"unable to validate Docker endpoint for context {name!r}: {error}") from error
+        if result.returncode != 0:
+            detail = (result.stderr.strip() or result.stdout.strip() or "unknown error").strip()
+            raise SandboxError(f"unable to validate Docker endpoint for context {name!r}: {detail}")
+        return result.stdout.strip()
+
+    @staticmethod
+    def _is_local_endpoint(host: str) -> bool:
+        h = host.strip()
+        if not h:
+            return True
+        lower = h.lower()
+        if lower.startswith("unix://") or lower.startswith("npipe://") or lower.startswith("fd://"):
+            return True
+        if lower.startswith("unix:") or lower.startswith("npipe:") or lower.startswith("fd:"):
+            return True
+        if h.startswith("/"):
+            return True
+        return False
 
     def _docker_engine_info(self) -> dict[str, str | bool | None]:
         """Best-effort Docker Engine version and rootful/rootless observation."""
@@ -536,8 +620,8 @@ class DockerExecutor:
             _runtime_user(),
             "-w",
             WORKSPACE_TARGET,
-            "-v",
-            f"{workspace}:{WORKSPACE_TARGET}",
+            "--mount",
+            f"type=bind,source={workspace},target={WORKSPACE_TARGET}",
             "--memory",
             self.memory,
             "--cpus",
