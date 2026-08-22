@@ -65,9 +65,17 @@ from flagagent.tools import LOGGED_TOOL_OUTPUT_BYTES, SandboxError, ShellResult
 
 SANDBOX_IMAGE = "flagagent-sandbox:dev"
 WORKSPACE_TARGET = "/workspace"
+# Retained as the image's named default and for backwards compatibility.
+# Runtime containers use the invoking process's numeric UID/GID instead.
 AGENT_USER = "agent"
 KEEPALIVE_COMMAND = "sleep infinity"
 _VERSION = "0.1.0"
+
+
+def _runtime_user() -> str:
+    """Return the invoking process identity for Docker's numeric user flag."""
+    return f"{os.getuid()}:{os.getgid()}"
+
 
 # -- local networking target fixture --------------------------------------
 TARGET_IMAGE = "flagagent-target:dev"
@@ -162,6 +170,11 @@ class DockerExecutor:
             validate_run_id(run_id)
         except ValueError as error:
             raise SandboxError(f"invalid run id: {run_id!r}") from error
+        if os.getuid() == 0:
+            raise SandboxError(
+                "running the Docker sandbox as root is unsupported; "
+                "invoke FlagAgent as a non-root user"
+            )
         self._container_name = self._container_name_for(run_id)
         if self.network_mode == "local":
             self._prepare_local(workspace, run_id)
@@ -246,7 +259,7 @@ class DockerExecutor:
             "memory": self.memory,
             "cpus": self.cpus,
             "pids_limit": self.pids_limit,
-            "container_user": AGENT_USER,
+            "container_user": _runtime_user(),
             "security_relaxations": [],
             "docker_engine": engine["version"],
             "rootless": engine["rootless"],
@@ -442,7 +455,7 @@ class DockerExecutor:
             self._container_name_for(run_id),
             "--init",
             "--user",
-            AGENT_USER,
+            _runtime_user(),
             "-w",
             WORKSPACE_TARGET,
             "-v",
