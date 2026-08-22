@@ -518,8 +518,7 @@ class DockerExecutor:
             self._pending_network = True
             raise SandboxError("docker network create failed to start") from error
         if result.returncode != 0:
-            # ``docker network create`` fails atomically: a non-zero exit
-            # leaves no partial network behind, so this is not ambiguous.
+            self._pending_network = True
             raise SandboxError(f"docker network create failed: {result.stderr.strip()}")
         network_id = result.stdout.strip()
         if not network_id:

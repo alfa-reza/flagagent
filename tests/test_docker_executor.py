@@ -1762,32 +1762,92 @@ def test_pending_network_empty_id_recovers_by_id(monkeypatch, tmp_path):
     assert executor._network_name is None
 
 
-def test_pending_network_nonzero_is_not_ambiguous(monkeypatch, tmp_path):
-    """Network non-zero is atomic failure → not pending → no reconciliation."""
+def test_pending_network_nonzero_recovers_and_removes(monkeypatch, tmp_path):
+    """Network non-zero exit → pending → cleanup recovers committed network by ID."""
     executor = DockerExecutor(network_mode="local")
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
     def fake_run(args, **kwargs):
         if args[1] == "network" and args[2] == "create":
-            return _FakeCompleted(returncode=1, stderr="already exists")
+            return _FakeCompleted(returncode=1, stderr="decode error after create")
         raise AssertionError(f"unexpected: {args}")
 
     monkeypatch.setattr(subprocess, "run", fake_run)
     with pytest.raises(SandboxError, match="docker network create failed"):
         executor.prepare(workspace, RUN_ID)
-    assert executor._pending_network is False
-    assert executor._network_name is None  # cleared by _remove_owned immediately
+    assert executor._pending_network is True
+    expected = DockerExecutor._network_name_for(RUN_ID)
+    assert executor._network_name == expected
 
-    called = []
+    net_cand = {
+        "id": "net-nonzero-123",
+        "name": expected,
+        "labels": {
+            "flagagent.managed": "true",
+            "flagagent.run_id": RUN_ID,
+            "flagagent.role": "network",
+        },
+    }
+    calls: list[list[str]] = []
 
     def fake_list_ids(args):
-        called.append(args)
+        assert "network" in args or f"name={expected}" in " ".join(args)
+        return [net_cand["id"]]
+
+    def fake_inspect(ids, network=False):
+        if network:
+            return [net_cand] if net_cand["id"] in ids else []
         return []
 
     monkeypatch.setattr(executor, "_list_ids", fake_list_ids)
+    monkeypatch.setattr(executor, "_inspect_labeled", fake_inspect)
+
+    def fake_rm_net(nid):
+        calls.append(["docker", "network", "rm", nid])
+
+    monkeypatch.setattr(executor, "_remove_network", fake_rm_net)
+    monkeypatch.setattr(executor, "_remove_container", lambda cid: None)
+
     executor.cleanup(RUN_ID)
-    assert called == []  # no reconciliation attempted
+
+    assert ["docker", "network", "rm", "net-nonzero-123"] in calls
+    assert executor._pending_network is False
+    assert executor._network_name is None
+
+
+def test_pending_network_nonzero_nothing_created_no_deletion(monkeypatch, tmp_path):
+    """Network non-zero exit with nothing daemon-side → cleanup deletes nothing."""
+    executor = DockerExecutor(network_mode="local")
+    workspace = tmp_path / "ws"
+    workspace.mkdir()
+
+    def fake_run(args, **kwargs):
+        if args[1] == "network" and args[2] == "create":
+            return _FakeCompleted(returncode=1, stderr="pool overlaps")
+        raise AssertionError(f"unexpected: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    with pytest.raises(SandboxError, match="docker network create failed"):
+        executor.prepare(workspace, RUN_ID)
+    assert executor._pending_network is True
+
+    calls: list[list[str]] = []
+
+    monkeypatch.setattr(executor, "_list_ids", lambda args: [])
+    monkeypatch.setattr(executor, "_inspect_labeled", lambda ids, network=False: [])
+
+    def fake_rm_net(nid):
+        calls.append(["docker", "network", "rm", nid])
+
+    monkeypatch.setattr(executor, "_remove_network", fake_rm_net)
+    monkeypatch.setattr(executor, "_remove_container", lambda cid: calls.append(cid))
+
+    executor.cleanup(RUN_ID)
+
+    assert calls == []  # nothing found → no deletion attempted
+    assert executor._pending_network is False
+    assert executor._network_name is None
 
 
 def test_pending_target_timeout_recovers(monkeypatch, tmp_path):
