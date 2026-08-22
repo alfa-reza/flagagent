@@ -23,6 +23,7 @@ import pytest
 from flagagent.docker_executor import (
     KEEPALIVE_COMMAND,
     SANDBOX_IMAGE,
+    TARGET_MARKER,
     WORKSPACE_TARGET,
     DockerExecutor,
 )
@@ -308,6 +309,181 @@ def test_prepare_rejects_double_prepare():
     executor._container_id = "existing"
     with pytest.raises(SandboxError, match="already prepared"):
         executor.prepare(Path("/tmp/ws"), RUN_ID)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — preparation wall-budget bounding (no Docker required)
+# ---------------------------------------------------------------------------
+
+
+def test_preparation_timeout_returns_fixed_when_no_deadline():
+    executor = DockerExecutor()
+    assert executor._preparation_timeout(30) == 30
+    assert executor._preparation_timeout(60) == 60
+
+
+def test_preparation_timeout_clamps_to_remaining_budget():
+    executor = DockerExecutor()
+    executor._preparation_deadline = 10.0
+    executor.monotonic = lambda: 7.0  # 3 seconds remaining
+    assert executor._preparation_timeout(60) == 3.0
+    assert executor._preparation_timeout(2) == 2.0  # fixed < remaining
+
+
+def test_preparation_timeout_raises_when_budget_exhausted():
+    executor = DockerExecutor()
+    executor._preparation_deadline = 10.0
+    executor.monotonic = lambda: 10.0
+    with pytest.raises(SandboxError, match="preparation budget exhausted"):
+        executor._preparation_timeout(30)
+
+
+def test_set_remaining_stores_budget():
+    executor = DockerExecutor()
+    assert executor._preparation_remaining is None
+    executor.set_remaining(5.0)
+    assert executor._preparation_remaining == 5.0
+    executor.set_remaining(-1.0)
+    assert executor._preparation_remaining == 0.0
+
+
+def test_prepare_raises_sandbox_error_when_budget_already_exhausted(monkeypatch):
+    def fail(*args, **kwargs):
+        raise AssertionError(f"unexpected docker call: {args}")
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    monkeypatch.setattr(subprocess, "Popen", fail)
+    executor = DockerExecutor()
+    executor.set_remaining(0.0)
+    with pytest.raises(SandboxError, match="preparation budget exhausted"):
+        executor.prepare(Path("/tmp/ws"), RUN_ID)
+    assert executor._preparation_deadline is None
+    assert executor._preparation_remaining is None
+
+
+def _fake_prepare_run(captured):
+    """Return a fake_run that records all subprocess.run timeout kwargs."""
+
+    run_counter = [0]
+
+    def fake_run(args, **kwargs):
+        captured.append(kwargs.get("timeout"))
+        if args[1] == "network" and args[2] == "create":
+            return _FakeCompleted(stdout="nid123\n")
+        if args[1] == "run":
+            run_counter[0] += 1
+            return _FakeCompleted(stdout=f"cid{run_counter[0]}\n")
+        if args[1] == "inspect":
+            if "{{.State.Running}}" in args:
+                return _FakeCompleted(stdout="true\n")
+            if "{{.Image}}" in args:
+                return _FakeCompleted(stdout="sha256:abc\n")
+        if args[1] == "exec":
+            return _FakeCompleted(stdout=TARGET_MARKER)
+        return _FakeCompleted()
+
+    return fake_run
+
+
+def test_prepare_none_timeouts_bounded_by_shared_remaining_budget(monkeypatch):
+    """All subprocess.run timeouts during none-mode prepare are clamped to
+    the shared Run wall budget supplied via set_remaining."""
+    captured = []
+    monkeypatch.setattr(subprocess, "run", _fake_prepare_run(captured))
+
+    executor = DockerExecutor()
+    executor.monotonic = lambda: 0.0
+    executor.set_remaining(5.0)
+    executor.prepare(Path("/tmp/ws"), RUN_ID)
+
+    assert captured  # docker calls were made
+    for timeout in captured:
+        assert timeout <= 5.0
+    assert executor._preparation_deadline is None
+
+
+def test_prepare_local_timeouts_bounded_by_shared_remaining_budget(monkeypatch):
+    """All subprocess.run timeouts during local-mode prepare (network, target,
+    readiness probe, agent) are clamped to the shared Run wall budget."""
+    captured = []
+    monkeypatch.setattr(subprocess, "run", _fake_prepare_run(captured))
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    executor = DockerExecutor(network_mode="local")
+    executor.monotonic = lambda: 0.0
+    executor.set_remaining(5.0)
+    executor.prepare(Path("/tmp/ws"), RUN_ID)
+
+    assert captured
+    for timeout in captured:
+        assert timeout <= 5.0
+    assert executor._preparation_deadline is None
+
+
+def test_prepare_local_skips_cleanup_when_budget_exhausted(monkeypatch):
+    """When the shared preparation deadline is exhausted, the SandboxError
+    handler in _prepare_local must skip synchronous _remove_owned (whose
+    Docker removals use fresh fixed 30s timeouts).  Ownership of partial
+    resources stays recorded so AgentLoop's final cleanup can still remove
+    them with normal timeouts."""
+    clock = [0.0]
+    calls: list[tuple[list[str], float | None]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append((list(args), kwargs.get("timeout")))
+        if args[1] == "network" and args[2] == "create":
+            return _FakeCompleted(stdout="nid123\n")
+        if args[1] == "run":
+            return _FakeCompleted(stdout="tid123\n")
+        if args[1] == "inspect" and "{{.State.Running}}" in args:
+            return _FakeCompleted(stdout="true\n")
+        if args[1] == "exec":
+            # Readiness probe fails; advance the clock past the deadline so
+            # the next deadline check raises SandboxError.
+            clock[0] = 100.0
+            return _FakeCompleted(returncode=1)
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(time, "sleep", lambda _: None)
+
+    executor = DockerExecutor(network_mode="local")
+    executor.monotonic = lambda: clock[0]
+    executor.set_remaining(5.0)
+
+    with pytest.raises(SandboxError, match="preparation budget exhausted"):
+        executor.prepare(Path("/tmp/ws"), RUN_ID)
+
+    # No removal calls during prepare: _remove_owned was skipped because
+    # the deadline was exhausted when the SandboxError was caught.
+    prepare_call_count = len(calls)
+
+    def _removals(call_list):
+        return [
+            c
+            for c in call_list
+            if c[0][1] == "rm"
+            or (c[0][1] == "network" and len(c[0]) > 2 and c[0][2] == "rm")
+        ]
+
+    assert _removals(calls[:prepare_call_count]) == []
+
+    # Ownership of partial resources is retained for final cleanup.
+    assert executor._network_id == "nid123"
+    assert executor._target_id == "tid123"
+    assert executor._network_name is not None
+    assert executor._target_name is not None
+    assert executor._preparation_deadline is None
+
+    # Final cleanup removes the retained resources with normal 30s timeouts.
+    executor.cleanup(RUN_ID)
+
+    cleanup_removals = _removals(calls[prepare_call_count:])
+    assert len(cleanup_removals) == 2  # target container + network
+    for _, timeout in cleanup_removals:
+        assert timeout == 30
+    assert executor._network_id is None
+    assert executor._target_id is None
 
 
 # ---------------------------------------------------------------------------

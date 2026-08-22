@@ -146,6 +146,8 @@ class DockerExecutor:
     _network_id: str | None = field(default=None, init=False, repr=False)
     _network_name: str | None = field(default=None, init=False, repr=False)
     _resolved_image_id: str | None = field(default=None, init=False, repr=False)
+    _preparation_remaining: float | None = field(default=None, init=False, repr=False)
+    _preparation_deadline: float | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.network_mode not in ("none", "local"):
@@ -153,6 +155,34 @@ class DockerExecutor:
                 f"unsupported network_mode: {self.network_mode!r}; "
                 "only 'none' and 'local' are allowed"
             )
+
+    def set_remaining(self, remaining: float) -> None:
+        """Store the Run wall-budget remaining for preparation-time timeouts.
+
+        ``AgentLoop`` calls this (when available) right before ``prepare``
+        so that each blocking Docker operation reachable from ``prepare``
+        is bounded by the shared Run wall deadline instead of only its own
+        fixed default.  A subsequent ``prepare`` consumes and clears the
+        value; calling ``prepare`` without ``set_remaining`` keeps the
+        fixed default timeouts.
+        """
+        self._preparation_remaining = max(0.0, float(remaining))
+
+    def _preparation_timeout(self, fixed: float) -> float:
+        """Bound a fixed preparation timeout by the Run wall deadline.
+
+        When no preparation deadline is set (``set_remaining`` was not
+        called) the fixed default is returned unchanged.  Otherwise the
+        timeout is clamped to the remaining budget, and an exhausted
+        budget raises ``SandboxError`` before any Docker work.
+        """
+        deadline = self._preparation_deadline
+        if deadline is None:
+            return fixed
+        remaining = deadline - self.monotonic()
+        if remaining <= 0:
+            raise SandboxError("preparation budget exhausted")
+        return min(fixed, remaining)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -176,10 +206,19 @@ class DockerExecutor:
                 "invoke FlagAgent as a non-root user"
             )
         self._container_name = self._container_name_for(run_id)
-        if self.network_mode == "local":
-            self._prepare_local(workspace, run_id)
-        else:
-            self._prepare_none(workspace, run_id)
+        remaining = self._preparation_remaining
+        self._preparation_remaining = None
+        if remaining is not None:
+            if remaining <= 0:
+                raise SandboxError("preparation budget exhausted")
+            self._preparation_deadline = self.monotonic() + remaining
+        try:
+            if self.network_mode == "local":
+                self._prepare_local(workspace, run_id)
+            else:
+                self._prepare_none(workspace, run_id)
+        finally:
+            self._preparation_deadline = None
 
     def execute(self, command: str, timeout_seconds: float) -> ShellResult:
         """Run ``command`` as a fresh process in the Agent container."""
@@ -324,7 +363,17 @@ class DockerExecutor:
             self._create_agent(workspace, run_id)
         except SandboxError:
             # Best-effort cleanup of anything partially created, then
-            # propagate the original sandbox failure.
+            # propagate the original sandbox failure.  When the shared
+            # preparation deadline is exhausted, skip the synchronous
+            # removal: _remove_owned uses fresh fixed 30s timeouts that
+            # would block past the wall deadline.  Ownership stays
+            # recorded so AgentLoop's final cleanup path can still
+            # remove the partial resources.
+            if (
+                self._preparation_deadline is not None
+                and self.monotonic() >= self._preparation_deadline
+            ):
+                raise
             self._remove_owned()
             raise
 
@@ -332,7 +381,11 @@ class DockerExecutor:
         args = self._run_args(workspace, run_id)
         try:
             result = subprocess.run(
-                args, capture_output=True, text=True, timeout=60, check=False
+                args,
+                capture_output=True,
+                text=True,
+                timeout=self._preparation_timeout(60),
+                check=False,
             )
         except FileNotFoundError as error:
             raise SandboxError("docker CLI not found") from error
@@ -364,7 +417,11 @@ class DockerExecutor:
         args = self._network_create_args(run_id)
         try:
             result = subprocess.run(
-                args, capture_output=True, text=True, timeout=30, check=False
+                args,
+                capture_output=True,
+                text=True,
+                timeout=self._preparation_timeout(30),
+                check=False,
             )
         except FileNotFoundError as error:
             raise SandboxError("docker CLI not found") from error
@@ -383,7 +440,11 @@ class DockerExecutor:
         args = self._target_run_args(run_id)
         try:
             result = subprocess.run(
-                args, capture_output=True, text=True, timeout=60, check=False
+                args,
+                capture_output=True,
+                text=True,
+                timeout=self._preparation_timeout(60),
+                check=False,
             )
         except FileNotFoundError as error:
             raise SandboxError("docker CLI not found") from error
@@ -404,10 +465,16 @@ class DockerExecutor:
 
     def _wait_target_ready(self) -> None:
         """Bounded deterministic readiness poll for the Target fixture."""
+        deadline = self._preparation_deadline
         for _ in range(self.readiness_attempts):
+            if deadline is not None and self.monotonic() >= deadline:
+                raise SandboxError("preparation budget exhausted")
             if self._target_ready():
                 return
-            time.sleep(self.readiness_interval)
+            interval = self.readiness_interval
+            if deadline is not None:
+                interval = min(interval, max(0.0, deadline - self.monotonic()))
+            time.sleep(interval)
         raise SandboxError("target readiness check failed")
 
     def _target_ready(self) -> bool:
@@ -421,7 +488,11 @@ class DockerExecutor:
         ]
         try:
             result = subprocess.run(
-                args, capture_output=True, text=True, timeout=5, check=False
+                args,
+                capture_output=True,
+                text=True,
+                timeout=self._preparation_timeout(5),
+                check=False,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             return False
@@ -878,7 +949,11 @@ class DockerExecutor:
         ]
         try:
             result = subprocess.run(
-                args, capture_output=True, text=True, timeout=10, check=False
+                args,
+                capture_output=True,
+                text=True,
+                timeout=self._preparation_timeout(10),
+                check=False,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             return False
@@ -898,7 +973,11 @@ class DockerExecutor:
         ]
         try:
             result = subprocess.run(
-                args, capture_output=True, text=True, timeout=10, check=False
+                args,
+                capture_output=True,
+                text=True,
+                timeout=self._preparation_timeout(10),
+                check=False,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             return None
