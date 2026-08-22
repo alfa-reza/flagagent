@@ -14,6 +14,7 @@ persistence, and owned resource cleanup.
 """
 
 import json
+import os
 import secrets
 import subprocess
 from datetime import UTC, datetime
@@ -22,7 +23,7 @@ from pathlib import Path
 import pytest
 
 from flagagent.artifacts import read_events
-from flagagent.docker_executor import AGENT_USER, SANDBOX_IMAGE, DockerExecutor
+from flagagent.docker_executor import SANDBOX_IMAGE, DockerExecutor
 from flagagent.loop import AgentLoop, ChallengeInput, Limits
 from flagagent.model import ModelResponse, ScriptedModel, ToolCall
 from flagagent.tools import ExactStringVerifier, FakeExecutor, SandboxError, ShellResult
@@ -97,7 +98,7 @@ def test_sandbox_provenance_includes_resource_limits():
 
 def test_sandbox_provenance_includes_container_user():
     provenance = DockerExecutor().sandbox_provenance()
-    assert provenance["container_user"] == AGENT_USER
+    assert provenance["container_user"] == f"{os.getuid()}:{os.getgid()}"
 
 
 def test_sandbox_provenance_has_empty_security_relaxations():
@@ -427,7 +428,7 @@ def test_docker_e2e_solved_run_with_provenance_and_cleanup(tmp_path, sandbox_ima
     assert sandbox["memory"] == "2g"
     assert sandbox["cpus"] == "2"
     assert sandbox["pids_limit"] == 256
-    assert sandbox["container_user"] == AGENT_USER
+    assert sandbox["container_user"] == f"{os.getuid()}:{os.getgid()}"
     assert sandbox["security_relaxations"] == []
     assert sandbox["docker_engine"] is not None
     assert sandbox["rootless"] is not None
