@@ -206,6 +206,7 @@ def _snapshot_source_files(
                         raise InvalidChallengeSourceError(
                             "challenge source contains a special file"
                         )
+                    exec_bits = st.st_mode & 0o111
                     logical_size = st.st_size
                     if logical_size > limits.max_source_file_bytes:
                         raise InvalidChallengeSourceError(
@@ -238,6 +239,14 @@ def _snapshot_source_files(
                                 snapshot_handle.write(chunk)
                                 file_bytes += len(chunk)
                                 total_bytes += len(chunk)
+                    if exec_bits:
+                        try:
+                            snapshot_mode = snapshot.stat().st_mode
+                        except OSError as error:
+                            raise InvalidChallengeSourceError(
+                                "challenge source cannot be inspected"
+                            ) from error
+                        os.chmod(snapshot, snapshot_mode | exec_bits)
                 finally:
                     if source_fd >= 0:
                         os.close(source_fd)
@@ -280,6 +289,21 @@ def _stage_source_files(
         destination = workspace / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source, destination)
+        try:
+            mode = source.stat().st_mode
+        except OSError as error:
+            raise InvalidChallengeSourceError(
+                "challenge source cannot be inspected"
+            ) from error
+        exec_bits = mode & 0o111
+        if exec_bits:
+            try:
+                dest_mode = destination.stat().st_mode
+            except OSError as error:
+                raise InvalidChallengeSourceError(
+                    "challenge source cannot be inspected"
+                ) from error
+            os.chmod(destination, dest_mode | exec_bits)
 
 
 def _sanitize_api_base(value: str | None) -> str | None:
