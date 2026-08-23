@@ -72,6 +72,7 @@ def test_recovery_wall_exhausted_skips_restart_and_probe(monkeypatch):
     kill_calls = [c for c in calls if c[0] == "kill"]
     assert kill_calls
     assert kill_calls[0][1] <= 1.0
+    assert kill_calls[0][1] > 0
     assert waits and waits[0] <= 1.0
     assert not any(c[0] == "start" for c in calls)
     assert not any(c[0] == "exec" for c in calls)
@@ -122,6 +123,103 @@ def test_recovery_wall_budget_bounds_containment_timeouts(monkeypatch):
     assert waits[0] == pytest.approx(0.05, abs=0.02)
 
 
+def test_recovery_cumulative_shared_deadline(monkeypatch):
+    clock = [0.0]
+
+    def mono():
+        return clock[0]
+
+    executor = DockerExecutor(monotonic=mono)
+    executor._container_id = "cid"
+    executor.set_wall_remaining(1.0)
+    clock[0] = 0.9
+
+    monkeypatch.setattr(
+        executor,
+        "_collect",
+        lambda proc, deadline: (bytearray(b""), bytearray(b""), True, False),
+    )
+    calls: list[tuple[str, float | None]] = []
+
+    def fake_run(args, **kwargs):
+        timeout = kwargs.get("timeout")
+        calls.append((args[1], timeout))
+        if args[1] == "kill":
+            assert timeout == pytest.approx(0.1, abs=0.02)
+            clock[0] += 0.06
+        if args[1] == "inspect":
+            return _FakeCompleted(stdout="true\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    waits: list[float | None] = []
+
+    def fake_wait(self, timeout=None):
+        waits.append(timeout)
+        assert timeout == pytest.approx(0.04, abs=0.02)
+        clock[0] += 0.02
+        return 0
+
+    monkeypatch.setattr(_FakePopen, "wait", fake_wait)
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(os, "getpgid", lambda pid: 999)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: None)
+
+    executor.execute("sleep 1", 1)
+
+    assert any(c[0] == "kill" for c in calls)
+    assert waits
+    assert waits[0] < 0.1
+    assert waits[0] == pytest.approx(0.04, abs=0.02)
+
+
+def test_recovery_grace_not_refreshed_after_exhaustion(monkeypatch):
+    clock = [0.0]
+
+    def mono():
+        return clock[0]
+
+    executor = DockerExecutor(monotonic=mono)
+    executor._container_id = "cid"
+    executor.set_wall_remaining(0.2)
+
+    def fake_collect(proc, deadline):
+        clock[0] = 0.25
+        return bytearray(b""), bytearray(b""), True, False
+
+    monkeypatch.setattr(executor, "_collect", fake_collect)
+    kills: list[float | None] = []
+    waits: list[float | None] = []
+
+    def fake_run(args, **kwargs):
+        if args[1] == "kill":
+            kills.append(kwargs.get("timeout"))
+            clock[0] += 0.6
+            return _FakeCompleted()
+        if args[1] == "inspect":
+            return _FakeCompleted(stdout="true\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    def fake_wait(self, timeout=None):
+        waits.append(timeout)
+        return 0
+
+    monkeypatch.setattr(_FakePopen, "wait", fake_wait)
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(os, "getpgid", lambda pid: 999)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: None)
+
+    with pytest.raises(SandboxError, match="wall budget exhausted"):
+        executor.execute("sleep 1", 0.2)
+
+    assert kills[0] == pytest.approx(0.95, abs=0.02)
+    assert waits[0] == pytest.approx(0.35, abs=0.02)
+    assert waits[0] < kills[0]
+    assert waits[0] <= 1.0
+
+
 def test_recovery_budget_remaining_preserves_kill_restart_probe(monkeypatch):
     executor = DockerExecutor(monotonic=lambda: 0.0)
     executor._container_id = "cid"
@@ -160,6 +258,37 @@ def test_recovery_budget_remaining_preserves_kill_restart_probe(monkeypatch):
     assert [t for a, t in calls if a[1] == "start"][0] == 60
     assert [t for a, t in calls if a[1] == "exec"][0] == 30
     assert waits == [10]
+
+
+def test_collect_deadline_clamped_to_wall(monkeypatch):
+    clock = [0.0]
+
+    def mono():
+        return clock[0]
+
+    executor = DockerExecutor(monotonic=mono)
+    executor._container_id = "cid"
+    executor.set_wall_remaining(1.0)
+
+    def fake_is_running(cid):
+        clock[0] = 0.8
+        return True
+
+    monkeypatch.setattr(executor, "_is_container_running", fake_is_running)
+    captured: dict[str, float] = {}
+
+    def fake_collect(proc, deadline):
+        captured["deadline"] = deadline
+        return bytearray(b""), bytearray(b""), False, False
+
+    monkeypatch.setattr(executor, "_collect", fake_collect)
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(
+        subprocess, "run", lambda *a, **k: _FakeCompleted(stdout="true\n")
+    )
+
+    executor.execute("echo hi", 10)
+    assert captured["deadline"] == pytest.approx(1.0, abs=0.01)
 
 
 def test_loop_wall_exhausted_after_timed_shell_resolves_wall_limit(

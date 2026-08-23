@@ -76,9 +76,7 @@ def _to_anthropic_messages(
             index += 1
         elif role == "assistant":
             blocks: list[dict[str, Any]] = []
-            if thinking_history is not None and assistant_index < len(
-                thinking_history
-            ):
+            if thinking_history is not None and assistant_index < len(thinking_history):
                 for tb in thinking_history[assistant_index]:
                     blocks.append(dict(tb))
             content = message.get("content") or ""

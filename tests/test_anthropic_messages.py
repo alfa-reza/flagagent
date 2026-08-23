@@ -332,7 +332,9 @@ def test_sdk_error_raises_provider_error():
     ],
 )
 def test_malformed_response_raises_provider_error(content):
-    response = types.SimpleNamespace(content=content, usage=None, stop_reason="end_turn")
+    response = types.SimpleNamespace(
+        content=content, usage=None, stop_reason="end_turn"
+    )
     model, _ = _model([response])
 
     with pytest.raises(ProviderError):
@@ -527,9 +529,7 @@ def test_non_normal_stop_reason_raises_provider_error(stop_reason):
 
 
 def test_missing_stop_reason_raises_provider_error():
-    response = types.SimpleNamespace(
-        content=[_text_block("partial")], usage=None
-    )
+    response = types.SimpleNamespace(content=[_text_block("partial")], usage=None)
     model, _ = _model([response])
 
     with pytest.raises(ProviderError, match="non-normal stop reason"):
@@ -601,7 +601,11 @@ def test_thinking_plus_tool_use_replayed_on_next_turn():
     assistant = sent[1]
     assert assistant["role"] == "assistant"
     blocks = assistant["content"]
-    assert blocks[0] == {"type": "thinking", "thinking": thinking, "signature": signature}
+    assert blocks[0] == {
+        "type": "thinking",
+        "thinking": thinking,
+        "signature": signature,
+    }
     assert blocks[1] == {
         "type": "tool_use",
         "id": "c1",
@@ -653,7 +657,13 @@ def test_redacted_thinking_accepted_and_replayed_unchanged():
             "role": "tool",
             "call_id": "c2",
             "name": "shell",
-            "result": {"stdout": "uid=0", "stderr": "", "exit_code": 0, "timed_out": False, "truncated": False},
+            "result": {
+                "stdout": "uid=0",
+                "stderr": "",
+                "exit_code": 0,
+                "timed_out": False,
+                "truncated": False,
+            },
         },
     ]
     model.generate(history, TOOL_DEFINITIONS)
@@ -695,7 +705,11 @@ def test_thinking_text_tool_use_replay_preserves_order_and_text():
     model.generate(history, TOOL_DEFINITIONS)
 
     blocks = msgs.calls[1]["messages"][1]["content"]
-    assert blocks[0] == {"type": "thinking", "thinking": thinking, "signature": signature}
+    assert blocks[0] == {
+        "type": "thinking",
+        "thinking": thinking,
+        "signature": signature,
+    }
     assert blocks[1] == {"type": "text", "text": "progress"}
     assert blocks[2]["type"] == "tool_use"
 

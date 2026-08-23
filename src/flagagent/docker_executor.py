@@ -251,9 +251,16 @@ class DockerExecutor:
         remaining = self._wall_remaining()
         if remaining is None:
             return fixed
-        if remaining <= 0:
+        if remaining > 0:
+            return min(fixed, remaining)
+        deadline = self._wall_deadline
+        if deadline is None:
             return min(fixed, 1.0)
-        return min(fixed, remaining)
+        grace_deadline = deadline + 1.0
+        grace_remaining = grace_deadline - self.monotonic()
+        if grace_remaining <= 0:
+            return 0.0
+        return min(fixed, grace_remaining)
 
     def _wall_timeout(self, fixed: float) -> float:
         remaining = self._wall_remaining()
@@ -329,7 +336,11 @@ class DockerExecutor:
             raise SandboxError("docker CLI not found") from error
         except OSError as error:
             raise SandboxError("docker exec failed to start") from error
-        deadline = self.monotonic() + timeout_seconds
+        exec_deadline = self.monotonic() + timeout_seconds
+        wall_deadline = self._wall_deadline if self._wall_budget_set else None
+        if wall_deadline is not None:
+            exec_deadline = min(exec_deadline, wall_deadline)
+        deadline = exec_deadline
         stdout_b, stderr_b, timed_out, truncated = self._collect(process, deadline)
         stdout_text = stdout_b.decode("utf-8", errors="ignore")
         stderr_text = stderr_b.decode("utf-8", errors="ignore")
@@ -428,7 +439,9 @@ class DockerExecutor:
         except SandboxError:
             raise
         except Exception as error:
-            raise SandboxError(f"unable to validate Docker endpoint: {error}") from error
+            raise SandboxError(
+                f"unable to validate Docker endpoint: {error}"
+            ) from error
         if not self._is_local_endpoint(host):
             raise SandboxError(
                 f"unsupported remote Docker endpoint {host!r}; "
@@ -460,11 +473,17 @@ class DockerExecutor:
         except FileNotFoundError as error:
             raise SandboxError("docker CLI not found") from error
         except subprocess.TimeoutExpired as error:
-            raise SandboxError("unable to determine Docker context: timed out") from error
+            raise SandboxError(
+                "unable to determine Docker context: timed out"
+            ) from error
         except OSError as error:
-            raise SandboxError(f"unable to determine Docker context: {error}") from error
+            raise SandboxError(
+                f"unable to determine Docker context: {error}"
+            ) from error
         if result.returncode != 0:
-            detail = (result.stderr.strip() or result.stdout.strip() or "unknown error").strip()
+            detail = (
+                result.stderr.strip() or result.stdout.strip() or "unknown error"
+            ).strip()
             raise SandboxError(f"unable to determine Docker context: {detail}")
         name = result.stdout.strip()
         if not name:
@@ -474,7 +493,14 @@ class DockerExecutor:
     def _host_for_context(self, name: str) -> str:
         try:
             result = subprocess.run(
-                [self.docker_bin, "context", "inspect", name, "--format", "{{.Endpoints.docker.Host}}"],
+                [
+                    self.docker_bin,
+                    "context",
+                    "inspect",
+                    name,
+                    "--format",
+                    "{{.Endpoints.docker.Host}}",
+                ],
                 capture_output=True,
                 text=True,
                 timeout=self._preparation_timeout(5),
@@ -483,15 +509,25 @@ class DockerExecutor:
         except FileNotFoundError as error:
             raise SandboxError("docker CLI not found") from error
         except subprocess.TimeoutExpired as error:
-            raise SandboxError(f"unable to validate Docker endpoint for context {name!r}: timed out") from error
+            raise SandboxError(
+                f"unable to validate Docker endpoint for context {name!r}: timed out"
+            ) from error
         except OSError as error:
-            raise SandboxError(f"unable to validate Docker endpoint for context {name!r}: {error}") from error
+            raise SandboxError(
+                f"unable to validate Docker endpoint for context {name!r}: {error}"
+            ) from error
         if result.returncode != 0:
-            detail = (result.stderr.strip() or result.stdout.strip() or "unknown error").strip()
-            raise SandboxError(f"unable to validate Docker endpoint for context {name!r}: {detail}")
+            detail = (
+                result.stderr.strip() or result.stdout.strip() or "unknown error"
+            ).strip()
+            raise SandboxError(
+                f"unable to validate Docker endpoint for context {name!r}: {detail}"
+            )
         host = result.stdout.strip()
         if not host:
-            raise SandboxError(f"unable to validate Docker endpoint for context {name!r}: empty host")
+            raise SandboxError(
+                f"unable to validate Docker endpoint for context {name!r}: empty host"
+            )
         return host
 
     @staticmethod
@@ -500,9 +536,17 @@ class DockerExecutor:
         if not h:
             raise SandboxError("unable to validate Docker endpoint: empty host")
         lower = h.lower()
-        if lower.startswith("unix://") or lower.startswith("npipe://") or lower.startswith("fd://"):
+        if (
+            lower.startswith("unix://")
+            or lower.startswith("npipe://")
+            or lower.startswith("fd://")
+        ):
             return True
-        if lower.startswith("unix:") or lower.startswith("npipe:") or lower.startswith("fd:"):
+        if (
+            lower.startswith("unix:")
+            or lower.startswith("npipe:")
+            or lower.startswith("fd:")
+        ):
             return True
         if h.startswith("/"):
             return True
@@ -968,7 +1012,11 @@ class DockerExecutor:
             raise SandboxError(
                 "timeout recovery failed: exec client did not exit"
             ) from error
-        if self._wall_budget_set and self._wall_remaining() is not None and self._wall_remaining() <= 0:  # type: ignore[operator]
+        if (
+            self._wall_budget_set
+            and self._wall_remaining() is not None
+            and self._wall_remaining() <= 0
+        ):  # type: ignore[operator]
             raise SandboxError("wall budget exhausted")
         if not self._docker_ok(
             [self.docker_bin, "start", cid], timeout=self._wall_timeout(60)
