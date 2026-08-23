@@ -634,6 +634,12 @@ class AgentLoop:
                     "wall_limit",
                     [call.call_id for call in response.tool_calls],
                 )
+            if getattr(response, "truncated", False):
+                return (
+                    "unsolved",
+                    "model_output_limit",
+                    [call.call_id for call in response.tool_calls],
+                )
             if not response.tool_calls:
                 return "unsolved", "model_stop", []
             terminal = self._dispatch(response)
@@ -711,12 +717,7 @@ class AgentLoop:
         return None
 
     def _shell(self, call_id: str, command: str) -> tuple[str, str, list[str]] | None:
-        remaining = self._remaining()
-        timeout = min(self.limits.command_timeout_seconds, remaining)
-        set_wall = getattr(self.executor, "set_wall_remaining", None)
-        if set_wall is not None:
-            with contextlib.suppress(Exception):
-                set_wall(remaining)
+        timeout = min(self.limits.command_timeout_seconds, self._remaining())
         try:
             raw_result = self.executor.execute(command, timeout)
             model_result, logged_result = normalize_shell_result(

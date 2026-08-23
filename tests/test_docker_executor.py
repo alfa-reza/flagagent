@@ -637,14 +637,7 @@ def test_prepare_uses_effective_docker_host_precedence(monkeypatch, tmp_path):
     workspace = tmp_path / "ws"
     workspace.mkdir()
 
-    def scenario(
-        docker_context,
-        docker_host,
-        show_host,
-        inspect_hosts,
-        expected_host,
-        should_reject,
-    ):
+    def scenario(docker_context, docker_host, show_host, inspect_hosts, expected_host, should_reject):
         seen_inspect: list[str] = []
         seen_show = [False]
 
@@ -652,9 +645,7 @@ def test_prepare_uses_effective_docker_host_precedence(monkeypatch, tmp_path):
             if args[1] == "context" and args[2] == "show":
                 seen_show[0] = True
                 if docker_context is not None or docker_host is not None:
-                    raise AssertionError(
-                        "context show should not be called when env var is set"
-                    )
+                    raise AssertionError("context show should not be called when env var is set")
                 return _FakeCompleted(stdout=show_host + "\n")
             if args[1] == "context" and args[2] == "inspect":
                 seen_inspect.append(args[3])
@@ -679,9 +670,7 @@ def test_prepare_uses_effective_docker_host_precedence(monkeypatch, tmp_path):
 
         executor = DockerExecutor()
         if should_reject:
-            with pytest.raises(
-                SandboxError, match="unsupported remote Docker endpoint"
-            ) as exc:
+            with pytest.raises(SandboxError, match="unsupported remote Docker endpoint") as exc:
                 executor.prepare(workspace, RUN_ID)
             assert expected_host in str(exc.value)
             if docker_context is not None:
@@ -695,11 +684,7 @@ def test_prepare_uses_effective_docker_host_precedence(monkeypatch, tmp_path):
         else:
             executor.prepare(workspace, RUN_ID)
             assert executor._container_id == "cid"
-            effective = (
-                inspect_hosts.get(docker_context or show_host, expected_host)
-                if docker_context is not None or docker_host is None
-                else docker_host
-            )
+            effective = inspect_hosts.get(docker_context or show_host, expected_host) if docker_context is not None or docker_host is None else docker_host
             assert effective == expected_host
             executor._container_id = None
             executor._container_name = None
@@ -763,7 +748,6 @@ def test_prepare_rejects_when_context_inspect_reports_remote_for_custom_context(
     monkeypatch, tmp_path
 ):
     """Custom context name with remote host also rejected."""
-
     def fake_run(args, **kwargs):
         if args[1] == "context" and args[2] == "show":
             return _FakeCompleted(stdout="my-remote\n")
@@ -884,9 +868,7 @@ def test_prepare_fails_closed_on_whitespace_endpoint(monkeypatch, tmp_path):
     assert not any(a[1] == "run" for a in calls)
 
 
-def test_prepare_endpoint_validation_respects_preparation_deadline(
-    monkeypatch, tmp_path
-):
+def test_prepare_endpoint_validation_respects_preparation_deadline(monkeypatch, tmp_path):
     """Docker probes from prepare remain bounded by the shared preparation deadline."""
     timeouts: list[float | None] = []
 

@@ -552,3 +552,61 @@ def test_staging_respects_active_deadline(tmp_path):
     assert result["status:reason"] == "unsolved:wall_limit"
     assert result["model_calls"] == 0
     assert executor.prepared == []
+
+
+def test_truncated_model_response_does_not_execute_tools_and_records_limit(tmp_path):
+    executor = FakeExecutor([ShellResult("should not run", "", 0, False)])
+    responses = [
+        ModelResponse(
+            content="partial",
+            usage={"input_tokens": 5, "output_tokens": 7},
+            truncated=True,
+        ),
+    ]
+    loop, result = run_loop(tmp_path, responses, executor=executor)
+
+    assert result["status:reason"] == "unsolved:model_output_limit"
+    assert result["input_tokens"] == 5
+    assert result["output_tokens"] == 7
+    assert executor.calls == []
+    events = read_events(loop.artifacts.events_path)
+    assert [e["type"] for e in events if e["type"] == "tool_call"] == []
+    model_events = [e for e in events if e["type"] == "model_response"]
+    assert model_events[0]["payload"]["truncated"] is True
+    assert model_events[0]["payload"]["content"] == "partial"
+    assistant_msgs = [m for m in loop.messages if m["role"] == "assistant"]
+    assert assistant_msgs[0]["content"] == "partial"
+
+
+def test_truncated_response_with_tool_calls_does_not_execute_partial_tools(tmp_path):
+    executor = FakeExecutor([ShellResult("should not run", "", 0, False)])
+    responses = [
+        ModelResponse(
+            content="partial",
+            tool_calls=(ToolCall("c1", "shell", {"command": "rm -rf /"}),),
+            truncated=True,
+        ),
+    ]
+    loop, result = run_loop(tmp_path, responses, executor=executor)
+
+    assert result["status:reason"] == "unsolved:model_output_limit"
+    assert executor.calls == []
+    events = read_events(loop.artifacts.events_path)
+    assert [e["type"] for e in events if e["type"] == "tool_call"] == []
+    assert result["tool_calls"] == 0
+
+
+def test_natural_model_stop_is_not_truncation(tmp_path):
+    _, result = run_loop(tmp_path, [ModelResponse(content="done")])
+    assert result["status:reason"] == "unsolved:model_stop"
+
+    _, result2 = run_loop(
+        tmp_path / "second",
+        [ModelResponse(content="done", truncated=False)],
+    )
+    assert result2["status:reason"] == "unsolved:model_stop"
+
+
+def test_provider_error_still_maps_to_error(tmp_path):
+    _, result = run_loop(tmp_path, [RuntimeError("provider down")])
+    assert result["status:reason"] == "error:provider_error"

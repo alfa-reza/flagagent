@@ -62,16 +62,10 @@ def test_layered_file_fixture_runs_in_none_sandbox(tmp_path, sandbox_image):
         [
             ModelResponse(
                 tool_calls=(
-                    ToolCall(
-                        "s",
-                        "shell",
-                        {"command": "cat evidence.txt | base64 -d | base64 -d"},
-                    ),
+                    ToolCall("s", "shell", {"command": "cat evidence.txt | base64 -d | base64 -d"}),
                 )
             ),
-            ModelResponse(
-                tool_calls=(ToolCall("f", "submit_flag", {"candidate": expected}),)
-            ),
+            ModelResponse(tool_calls=(ToolCall("f", "submit_flag", {"candidate": expected}),)),
         ]
     )
     loop = AgentLoop(
@@ -79,9 +73,7 @@ def test_layered_file_fixture_runs_in_none_sandbox(tmp_path, sandbox_image):
         executor=executor,
         verifier=ExactStringVerifier(expected),
         challenge=challenge,
-        limits=Limits(
-            max_model_turns=5, wall_timeout_seconds=120, command_timeout_seconds=30
-        ),
+        limits=Limits(max_model_turns=5, wall_timeout_seconds=120, command_timeout_seconds=30),
         runs_root=tmp_path,
         monotonic=time.monotonic,
         utc_now=lambda: datetime.now(UTC),
@@ -102,9 +94,7 @@ def test_local_marker_fixture_runs_against_audited_target(tmp_path, sandbox_imag
             ModelResponse(
                 tool_calls=(ToolCall("s", "shell", {"command": "nc -w 2 target 9999"}),)
             ),
-            ModelResponse(
-                tool_calls=(ToolCall("f", "submit_flag", {"candidate": expected}),)
-            ),
+            ModelResponse(tool_calls=(ToolCall("f", "submit_flag", {"candidate": expected}),)),
         ]
     )
     loop = AgentLoop(
@@ -112,9 +102,7 @@ def test_local_marker_fixture_runs_against_audited_target(tmp_path, sandbox_imag
         executor=executor,
         verifier=ExactStringVerifier(expected),
         challenge=challenge,
-        limits=Limits(
-            max_model_turns=5, wall_timeout_seconds=120, command_timeout_seconds=30
-        ),
+        limits=Limits(max_model_turns=5, wall_timeout_seconds=120, command_timeout_seconds=30),
         runs_root=tmp_path,
         monotonic=time.monotonic,
         utc_now=lambda: datetime.now(UTC),

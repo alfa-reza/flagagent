@@ -76,7 +76,9 @@ def _to_anthropic_messages(
             index += 1
         elif role == "assistant":
             blocks: list[dict[str, Any]] = []
-            if thinking_history is not None and assistant_index < len(thinking_history):
+            if thinking_history is not None and assistant_index < len(
+                thinking_history
+            ):
                 for tb in thinking_history[assistant_index]:
                     blocks.append(dict(tb))
             content = message.get("content") or ""
@@ -130,7 +132,8 @@ def _parse_anthropic_response(
     response: Any,
 ) -> tuple[ModelResponse, list[dict[str, Any]]]:
     stop_reason = getattr(response, "stop_reason", None)
-    if stop_reason not in ("end_turn", "tool_use"):
+    truncated = stop_reason == "max_tokens"
+    if not truncated and stop_reason not in ("end_turn", "tool_use"):
         raise ProviderError("messages response has non-normal stop reason")
     content_list = getattr(response, "content", None)
     if not isinstance(content_list, list) or not content_list:
@@ -168,6 +171,8 @@ def _parse_anthropic_response(
                 )
             thinking_blocks.append({"type": "redacted_thinking", "data": data})
         elif block_type == "tool_use":
+            if truncated:
+                continue
             call_id = getattr(block, "id", None)
             if not isinstance(call_id, str) or not call_id:
                 raise ProviderError("tool use missing id")
@@ -186,14 +191,17 @@ def _parse_anthropic_response(
             seen_tool_use = True
         else:
             raise ProviderError("unsupported content block type")
-    if stop_reason == "tool_use" and not tool_calls:
-        raise ProviderError("tool_use stop reason without client tool_use block")
-    if stop_reason == "end_turn" and tool_calls:
-        raise ProviderError("end_turn stop reason with client tool_use block")
+    if not truncated:
+        if stop_reason == "tool_use" and not tool_calls:
+            raise ProviderError("tool_use stop reason without client tool_use block")
+        if stop_reason == "end_turn" and tool_calls:
+            raise ProviderError("end_turn stop reason with client tool_use block")
     content = "".join(text_parts)
     usage = _normalize_anthropic_usage(getattr(response, "usage", None))
     return (
-        ModelResponse(content=content, tool_calls=tuple(tool_calls), usage=usage),
+        ModelResponse(
+            content=content, tool_calls=tuple(tool_calls), usage=usage, truncated=truncated
+        ),
         thinking_blocks,
     )
 
