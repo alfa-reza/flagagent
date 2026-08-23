@@ -142,7 +142,8 @@ def _parse_chat_response(response: Any) -> ModelResponse:
         raise ProviderError("chat completions response has no choices")
     choice = choices[0]
     finish_reason = getattr(choice, "finish_reason", None)
-    if finish_reason not in {"stop", "tool_calls"}:
+    truncated = finish_reason == "length"
+    if not truncated and finish_reason not in {"stop", "tool_calls"}:
         raise ProviderError("chat completions finish reason is not normal")
     message = getattr(choice, "message", None)
     if message is None:
@@ -150,36 +151,41 @@ def _parse_chat_response(response: Any) -> ModelResponse:
     raw_content = getattr(message, "content", None)
     content = raw_content if isinstance(raw_content, str) else ""
     raw_tool_calls = getattr(message, "tool_calls", None)
-    if raw_tool_calls is None:
-        raw_tool_calls = []
-    elif not isinstance(raw_tool_calls, list):
-        raise ProviderError("tool calls must be a list")
-    tool_calls: list[ToolCall] = []
-    for raw in raw_tool_calls:
-        call_id = getattr(raw, "id", None)
-        if not isinstance(call_id, str) or not call_id:
-            raise ProviderError("tool call missing id")
-        function = getattr(raw, "function", None)
-        if function is None:
-            raise ProviderError("tool call missing function")
-        name = getattr(function, "name", None)
-        if not isinstance(name, str) or not name:
-            raise ProviderError("tool call missing function name")
-        arguments_str = getattr(function, "arguments", None)
-        if not isinstance(arguments_str, str) or not arguments_str.strip():
-            raise ProviderError("tool call arguments missing")
-        try:
-            arguments = json.loads(arguments_str)
-        except ValueError as error:
-            raise ProviderError("tool call arguments are not valid JSON") from error
-        if not isinstance(arguments, dict):
-            raise ProviderError("tool call arguments must be a JSON object")
-        try:
-            tool_calls.append(ToolCall(call_id=call_id, name=name, arguments=arguments))
-        except (TypeError, ValueError) as error:
-            raise ProviderError("tool call arguments are not strict JSON") from error
+    if truncated:
+        tool_calls: list[ToolCall] = []
+    else:
+        if raw_tool_calls is None:
+            raw_tool_calls = []
+        elif not isinstance(raw_tool_calls, list):
+            raise ProviderError("tool calls must be a list")
+        tool_calls = []
+        for raw in raw_tool_calls:
+            call_id = getattr(raw, "id", None)
+            if not isinstance(call_id, str) or not call_id:
+                raise ProviderError("tool call missing id")
+            function = getattr(raw, "function", None)
+            if function is None:
+                raise ProviderError("tool call missing function")
+            name = getattr(function, "name", None)
+            if not isinstance(name, str) or not name:
+                raise ProviderError("tool call missing function name")
+            arguments_str = getattr(function, "arguments", None)
+            if not isinstance(arguments_str, str) or not arguments_str.strip():
+                raise ProviderError("tool call arguments missing")
+            try:
+                arguments = json.loads(arguments_str)
+            except ValueError as error:
+                raise ProviderError("tool call arguments are not valid JSON") from error
+            if not isinstance(arguments, dict):
+                raise ProviderError("tool call arguments must be a JSON object")
+            try:
+                tool_calls.append(ToolCall(call_id=call_id, name=name, arguments=arguments))
+            except (TypeError, ValueError) as error:
+                raise ProviderError("tool call arguments are not strict JSON") from error
     usage = _normalize_usage(getattr(response, "usage", None))
-    return ModelResponse(content=content, tool_calls=tuple(tool_calls), usage=usage)
+    return ModelResponse(
+        content=content, tool_calls=tuple(tool_calls), usage=usage, truncated=truncated
+    )
 
 
 @dataclass
