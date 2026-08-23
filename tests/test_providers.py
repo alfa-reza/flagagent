@@ -404,14 +404,39 @@ def test_length_is_truncated_and_ignores_partial_tool_calls():
     assert "c1" not in json.dumps(result.to_dict())
 
 
+def test_length_with_incomplete_json_does_not_raise_and_is_truncated():
+    incomplete = '{"command": "ls'
+    response = _response(
+        content="partial",
+        tool_calls=[_tool_call("c1", "shell", incomplete)],
+        usage=types.SimpleNamespace(prompt_tokens=2, completion_tokens=3),
+        finish_reason="length",
+    )
+    model, _ = _model([response])
+
+    result = model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+    assert result.truncated is True
+    assert result.content == "partial"
+    assert result.tool_calls == ()
+    assert result.usage == {"input_tokens": 2, "output_tokens": 3}
+    assert "c1" not in json.dumps(result.to_dict())
+
+
 def test_normal_chat_responses_are_not_truncated():
     stop = _response(content="done", finish_reason="stop")
     model1, _ = _model([stop])
-    assert model1.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS).truncated is False
+    assert (
+        model1.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS).truncated
+        is False
+    )
 
     tool = _response(
         tool_calls=[_tool_call("c1", "shell", json.dumps({"command": "ls"}))],
         finish_reason="tool_calls",
     )
     model2, _ = _model([tool])
-    assert model2.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS).truncated is False
+    assert (
+        model2.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS).truncated
+        is False
+    )
