@@ -610,3 +610,165 @@ def test_natural_model_stop_is_not_truncation(tmp_path):
 def test_provider_error_still_maps_to_error(tmp_path):
     _, result = run_loop(tmp_path, [RuntimeError("provider down")])
     assert result["status:reason"] == "error:provider_error"
+
+
+class _SandboxFailExecutor(FakeExecutor):
+    def execute(self, command, timeout_seconds):
+        self.calls.append((command, timeout_seconds))
+        raise SandboxError("timeout recovery failed: kill")
+
+
+def test_shell_sets_execution_deadline_before_execute(tmp_path):
+    clock = Clock(10.0)
+    executor = FakeExecutor([ShellResult("ok", "", 0, False)])
+    loop = AgentLoop(
+        model=ScriptedModel(
+            [ModelResponse(tool_calls=(ToolCall("s", "shell", {"command": "x"}),))]
+        ),
+        executor=executor,
+        verifier=ExactStringVerifier("Flag{ok}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(
+            max_model_turns=1, wall_timeout_seconds=100, command_timeout_seconds=10
+        ),
+        runs_root=tmp_path,
+        monotonic=clock,
+        utc_now=lambda: NOW,
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    loop.run()
+    assert executor.execution_deadlines == [110.0]
+
+
+def test_execution_deadline_shared_across_shell_calls(tmp_path):
+    clock = Clock(0.0)
+    executor = FakeExecutor(
+        [ShellResult("one", "", 0, False), ShellResult("two", "", 0, False)]
+    )
+    responses = [
+        ModelResponse(
+            tool_calls=(
+                ToolCall("c1", "shell", {"command": "one"}),
+                ToolCall("c2", "shell", {"command": "two"}),
+            )
+        ),
+        ModelResponse(content="done"),
+    ]
+    _loop, _ = run_loop(
+        tmp_path,
+        responses,
+        executor=executor,
+        clock=clock,
+        limits=Limits(
+            max_model_turns=10, wall_timeout_seconds=100, command_timeout_seconds=10
+        ),
+    )
+    assert len(executor.execution_deadlines) == 2
+    assert executor.execution_deadlines[0] == executor.execution_deadlines[1]
+
+
+def test_execution_sandbox_error_before_wall_limit_is_sandbox_error(tmp_path):
+    """SandboxError while wall not expired remains sandbox_error."""
+    executor = _SandboxFailExecutor([])
+    clock = Clock(0.0)
+    loop = AgentLoop(
+        model=ScriptedModel(
+            [ModelResponse(tool_calls=(ToolCall("s", "shell", {"command": "x"}),))]
+        ),
+        executor=executor,
+        verifier=ExactStringVerifier("Flag{ok}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(
+            max_model_turns=5, wall_timeout_seconds=100, command_timeout_seconds=10
+        ),
+        runs_root=tmp_path,
+        monotonic=clock,
+        utc_now=lambda: NOW,
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    result = loop.run()
+    assert result["status:reason"] == "error:sandbox_error"
+
+
+def test_execution_budget_exhausted_maps_to_wall_limit(tmp_path):
+    class StepClock:
+        def __init__(self):
+            self.calls = 0
+
+        def __call__(self):
+            self.calls += 1
+            if self.calls == 1:
+                return 0.0
+            return 11.0
+
+    step = StepClock()
+    loop = AgentLoop(
+        model=ScriptedModel(
+            [ModelResponse(tool_calls=(ToolCall("s", "shell", {"command": "x"}),))]
+        ),
+        executor=_SandboxFailExecutor([]),
+        verifier=ExactStringVerifier("Flag{ok}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(
+            max_model_turns=5, wall_timeout_seconds=10, command_timeout_seconds=10
+        ),
+        runs_root=tmp_path / "wall",
+        monotonic=step,
+        utc_now=lambda: NOW,
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    result = loop.run()
+    assert result["status:reason"] == "unsolved:wall_limit"
+
+
+def test_cleanup_runs_after_wall_limit_with_execution_deadline(tmp_path):
+    clock = Clock(0.0)
+
+    class LateExecutor(_SandboxFailExecutor):
+        def execute(self, command, timeout_seconds):
+            self.calls.append((command, timeout_seconds))
+            clock.value = 200.0
+            raise SandboxError("execution budget exhausted")
+
+    executor = LateExecutor([])
+    loop = AgentLoop(
+        model=ScriptedModel(
+            [ModelResponse(tool_calls=(ToolCall("s", "shell", {"command": "x"}),))]
+        ),
+        executor=executor,
+        verifier=ExactStringVerifier("Flag{ok}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(
+            max_model_turns=5, wall_timeout_seconds=10, command_timeout_seconds=10
+        ),
+        runs_root=tmp_path,
+        monotonic=clock,
+        utc_now=lambda: NOW,
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    result = loop.run()
+    assert result["status:reason"] == "unsolved:wall_limit"
+    assert executor.cleaned == ["FA-20260814T161530Z-a13f4c2d"]
+    assert result["reason"] == "wall_limit"
+
+
+def test_non_docker_executor_without_deadline_seam_still_works(tmp_path):
+    class MinimalExecutor:
+        def __init__(self):
+            self.calls: list[tuple[str, float]] = []
+
+        def execute(self, command, timeout_seconds):
+            self.calls.append((command, timeout_seconds))
+            return ShellResult("ok", "", 0, False)
+
+    executor = MinimalExecutor()
+    _loop, result = run_loop(
+        tmp_path,
+        [
+            ModelResponse(tool_calls=(ToolCall("s", "shell", {"command": "x"}),)),
+            ModelResponse(content="done"),
+        ],
+        executor=executor,
+    )
+    assert result["status:reason"] == "unsolved:model_stop"
+    assert executor.calls == [("x", 10)]

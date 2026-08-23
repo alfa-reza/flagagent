@@ -1,5 +1,17 @@
 """M1 Docker CLI executor for contained shell execution.
 
+- Run wall bounding (Issue 39): when ``AgentLoop`` provides the shared Run
+  wall deadline via :meth:`set_execution_deadline`, every blocking Docker
+  operation reachable from ``execute`` (the pre-execution running check,
+  output collection, post-command waits/probes, and timeout recovery) is
+  clamped to that absolute deadline instead of only its own fixed default,
+  so pre-execution time is never re-granted to later operations.  Once the
+  deadline is exhausted, no blocking Docker operation may begin: recovery
+  performs only non-blocking host hygiene (SIGKILL to the exec client's
+  process group plus a non-blocking reap) and raises ``SandboxError`` so
+  ``AgentLoop`` resolves the Run to ``wall_limit``, leaving final
+  containment to the best-effort ``cleanup`` outside the active budget.
+
 One ``DockerExecutor`` owns one Run-scoped Agent container created in
 ``prepare`` and removed in ``cleanup``.  Each ``execute`` call first
 verifies the owned container is running, then runs ``/bin/bash -lc
@@ -191,6 +203,7 @@ class DockerExecutor:
     )
     _preparation_remaining: float | None = field(default=None, init=False, repr=False)
     _preparation_deadline: float | None = field(default=None, init=False, repr=False)
+    _execution_deadline: float | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.network_mode not in ("none", "local"):
@@ -225,6 +238,45 @@ class DockerExecutor:
         remaining = deadline - self.monotonic()
         if remaining <= 0:
             raise SandboxError("preparation budget exhausted")
+        return min(fixed, remaining)
+
+    def set_execution_deadline(
+        self, deadline: float, monotonic: Callable[[], float] | None = None
+    ) -> None:
+        """Store the absolute Run wall deadline bounding execution-time work.
+
+        ``AgentLoop`` calls this (when available) right before each
+        ``execute`` with the Run's absolute wall deadline so that every
+        blocking operation reachable from ``execute`` — the pre-execution
+        running check, output collection, post-command waits/probes, and
+        timeout recovery — is bounded by the shared Run wall deadline
+        instead of only its own fixed default.  A subsequent ``execute``
+        consumes and clears the value; calling ``execute`` without
+        ``set_execution_deadline`` keeps the fixed default timeouts.
+        Final ``cleanup`` deliberately stays outside this budget.
+
+        When ``monotonic`` is supplied, the executor adopts the same clock
+        as the Run loop so deadline comparisons remain clock-consistent.
+        Otherwise the executor's own monotonic source is used.
+        """
+        self._execution_deadline = float(deadline)
+        if monotonic is not None:
+            self.monotonic = monotonic
+
+    def _execution_timeout(self, fixed: float) -> float:
+        """Bound a fixed execution timeout by the Run wall deadline.
+
+        When no execution deadline is set (``set_execution_deadline`` was
+        not called) the fixed default is returned unchanged.  Otherwise
+        the timeout is clamped to the remaining budget, and an exhausted
+        budget raises ``SandboxError`` before any blocking work begins.
+        """
+        deadline = self._execution_deadline
+        if deadline is None:
+            return fixed
+        remaining = deadline - self.monotonic()
+        if remaining <= 0:
+            raise SandboxError("execution budget exhausted")
         return min(fixed, remaining)
 
     # -- lifecycle -----------------------------------------------------------
@@ -268,42 +320,65 @@ class DockerExecutor:
         """Run ``command`` as a fresh process in the Agent container."""
         if self._container_id is None:
             raise SandboxError("agent container is not prepared")
-        if not self._is_container_running(self._container_id):
-            raise SandboxError("agent container is not running")
-        args = self._exec_args(command)
         try:
-            process = subprocess.Popen(
-                args,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                start_new_session=True,
+            if not self._is_container_running(
+                self._container_id, timeout=self._execution_timeout(10)
+            ):
+                raise SandboxError("agent container is not running")
+            args = self._exec_args(command)
+            try:
+                process = subprocess.Popen(
+                    args,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    start_new_session=True,
+                )
+            except FileNotFoundError as error:
+                raise SandboxError("docker CLI not found") from error
+            except OSError as error:
+                raise SandboxError("docker exec failed to start") from error
+            deadline = self.monotonic() + timeout_seconds
+            if self._execution_deadline is not None:
+                # Pre-execution checks already consumed part of the shared
+                # Run wall budget; the command must never be granted time
+                # past the absolute deadline (Issue 39).
+                deadline = min(deadline, self._execution_deadline)
+            stdout_b, stderr_b, timed_out, truncated = self._collect(
+                process, deadline
             )
-        except FileNotFoundError as error:
-            raise SandboxError("docker CLI not found") from error
-        except OSError as error:
-            raise SandboxError("docker exec failed to start") from error
-        deadline = self.monotonic() + timeout_seconds
-        stdout_b, stderr_b, timed_out, truncated = self._collect(process, deadline)
-        stdout_text = stdout_b.decode("utf-8", errors="ignore")
-        stderr_text = stderr_b.decode("utf-8", errors="ignore")
-        if timed_out:
-            self._recover_after_timeout(process)
-            return ShellResult(stdout_text, stderr_text, None, True, truncated)
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self._recover_after_timeout(process)
-            return ShellResult(stdout_text, stderr_text, None, True, truncated)
-        if self._is_control_failure(process.returncode, stderr_text) and (
-            not self._is_container_running(self._container_id)
-            or not self._docker_ok(
-                [self.docker_bin, "exec", self._container_id, "/bin/true"], timeout=10
+            stdout_text = stdout_b.decode("utf-8", errors="ignore")
+            stderr_text = stderr_b.decode("utf-8", errors="ignore")
+            if timed_out:
+                self._recover_after_timeout(process)
+                return ShellResult(stdout_text, stderr_text, None, True, truncated)
+            try:
+                process.wait(timeout=self._execution_timeout(5))
+            except subprocess.TimeoutExpired:
+                self._recover_after_timeout(process)
+                return ShellResult(stdout_text, stderr_text, None, True, truncated)
+            except SandboxError:
+                # The wall budget expired before the reap could start:
+                # perform only the non-blocking hygiene, then propagate so
+                # AgentLoop can resolve the Run to wall_limit.
+                process.poll()
+                raise
+            if self._is_control_failure(process.returncode, stderr_text) and (
+                not self._is_container_running(
+                    self._container_id, timeout=self._execution_timeout(10)
+                )
+                or not self._docker_ok(
+                    [self.docker_bin, "exec", self._container_id, "/bin/true"],
+                    timeout=self._execution_timeout(10),
+                )
+            ):
+                raise SandboxError(
+                    f"docker exec control failure: {stderr_text.strip()}"
+                )
+            return ShellResult(
+                stdout_text, stderr_text, process.returncode, False, truncated
             )
-        ):
-            raise SandboxError(f"docker exec control failure: {stderr_text.strip()}")
-        return ShellResult(
-            stdout_text, stderr_text, process.returncode, False, truncated
-        )
+        finally:
+            self._execution_deadline = None
 
     @staticmethod
     def _is_control_failure(exit_code: int | None, stderr_text: str) -> bool:
@@ -895,11 +970,38 @@ class DockerExecutor:
         container (preserving container identity, workspace, and mounts), and
         probe that it is usable again.  Raise ``SandboxError`` on any failure
         so timed-out evidence is only returned for a proven-healthy sandbox.
+
+        When the shared Run wall deadline is already exhausted at entry, no
+        blocking Docker operation may begin (no fresh active budget, no
+        grace): only immediate non-blocking host hygiene runs — SIGKILL to
+        the exec client's process group plus a non-blocking reap — and
+        ``SandboxError`` is raised promptly so ``AgentLoop`` resolves the
+        Run to ``wall_limit``.  Final containment is then owned by the
+        best-effort terminal ``cleanup`` (``docker rm -f``), which runs
+        outside the active budget.
         """
         cid = self._container_id
         if cid is None:
             raise SandboxError("timeout recovery failed: no owned agent container")
-        if not self._docker_ok([self.docker_bin, "kill", cid], timeout=30):
+        deadline = self._execution_deadline
+        if deadline is not None and self.monotonic() >= deadline:
+            # The Run wall budget is already exhausted: no blocking Docker
+            # operation may begin (no fresh active timeout, no grace).  Only
+            # immediate non-blocking host hygiene runs — SIGKILL the exec
+            # client's process group and reap without waiting — then fail
+            # promptly so AgentLoop can resolve wall_limit.  Final
+            # containment is owned by the best-effort terminal cleanup
+            # (cleanup -> docker rm -f), which runs outside the active
+            # budget.
+            try:
+                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+            except (ProcessLookupError, OSError):
+                pass
+            process.poll()
+            raise SandboxError("execution budget exhausted")
+        if not self._docker_ok(
+            [self.docker_bin, "kill", cid], timeout=self._execution_timeout(30)
+        ):
             raise SandboxError(
                 "timeout recovery failed: could not kill agent container"
             )
@@ -908,20 +1010,25 @@ class DockerExecutor:
         except (ProcessLookupError, OSError):
             pass
         try:
-            process.wait(timeout=10)
+            process.wait(timeout=self._execution_timeout(10))
         except subprocess.TimeoutExpired as error:
             raise SandboxError(
                 "timeout recovery failed: exec client did not exit"
             ) from error
-        if not self._docker_ok([self.docker_bin, "start", cid], timeout=60):
+        if not self._docker_ok(
+            [self.docker_bin, "start", cid], timeout=self._execution_timeout(60)
+        ):
             raise SandboxError(
                 "timeout recovery failed: could not restart agent container"
             )
-        if not self._is_container_running(cid):
+        if not self._is_container_running(cid, timeout=self._execution_timeout(10)):
             raise SandboxError(
                 "timeout recovery failed: agent container not running after restart"
             )
-        if not self._docker_ok([self.docker_bin, "exec", cid, "/bin/true"], timeout=30):
+        if not self._docker_ok(
+            [self.docker_bin, "exec", cid, "/bin/true"],
+            timeout=self._execution_timeout(30),
+        ):
             raise SandboxError(
                 "timeout recovery failed: agent container not usable after restart"
             )
@@ -1284,7 +1391,9 @@ class DockerExecutor:
 
     # -- helpers -------------------------------------------------------------
 
-    def _is_container_running(self, container_id: str | None) -> bool:
+    def _is_container_running(
+        self, container_id: str | None, timeout: float | None = None
+    ) -> bool:
         if container_id is None:
             return False
         args = [
@@ -1294,12 +1403,14 @@ class DockerExecutor:
             "{{.State.Running}}",
             container_id,
         ]
+        if timeout is None:
+            timeout = self._preparation_timeout(10)
         try:
             result = subprocess.run(
                 args,
                 capture_output=True,
                 text=True,
-                timeout=self._preparation_timeout(10),
+                timeout=timeout,
                 check=False,
             )
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):

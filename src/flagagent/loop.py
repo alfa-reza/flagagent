@@ -718,6 +718,10 @@ class AgentLoop:
 
     def _shell(self, call_id: str, command: str) -> tuple[str, str, list[str]] | None:
         timeout = min(self.limits.command_timeout_seconds, self._remaining())
+        set_execution_deadline = getattr(self.executor, "set_execution_deadline", None)
+        if set_execution_deadline is not None:
+            with contextlib.suppress(Exception):
+                set_execution_deadline(self._deadline, self.monotonic)
         try:
             raw_result = self.executor.execute(command, timeout)
             model_result, logged_result = normalize_shell_result(
