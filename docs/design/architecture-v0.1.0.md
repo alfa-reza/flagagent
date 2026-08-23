@@ -311,7 +311,7 @@ The run enforces independent bounds for:
 - logged tool output;
 - container CPU, memory, and PID usage.
 
-A shell command timeout is normally returned as tool evidence. If the overall run deadline is exhausted, terminal handling resolves to `unsolved:wall_limit` once control returns.
+A shell command timeout is normally returned as tool evidence. If the overall run deadline is exhausted, terminal handling resolves to `unsolved:wall_limit` once control returns. Execution-phase blocking Docker operations are bounded by that same Run wall deadline, so pre-execution time is never re-granted and an already-exhausted deadline does not start fresh long timeouts to restore the sandbox — only non-blocking host hygiene runs before control returns to terminal, leaving final containment to the best-effort cleanup outside the active Run budget.
 
 Output collection is bounded while stdout and stderr are drained. The host does not intentionally buffer an unbounded command result and truncate only after process completion.
 

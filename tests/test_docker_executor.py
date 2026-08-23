@@ -74,7 +74,10 @@ class _FakePopen:
         self.stdout = None
         self.stderr = None
 
-    def wait(self, timeout=None):
+    def wait(self, timeout=None):  # type: ignore[arg-type]
+        return self.returncode
+
+    def poll(self):
         return self.returncode
 
 
@@ -1395,6 +1398,393 @@ def test_collect_returns_timeout_when_deadline_exceeded():
     # clean up the still-running subprocess
     process.kill()
     process.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
+# Unit tests — execution wall-budget bounding (no Docker, Issue #39)
+# ---------------------------------------------------------------------------
+
+
+def test_execution_timeout_returns_fixed_when_no_deadline():
+    executor = DockerExecutor()
+    assert executor._execution_timeout(30) == 30
+    assert executor._execution_timeout(60) == 60
+
+
+def test_execution_timeout_clamps_to_remaining_budget():
+    executor = DockerExecutor()
+    executor._execution_deadline = 10.0
+    executor.monotonic = lambda: 7.0
+    assert executor._execution_timeout(60) == 3.0
+    assert executor._execution_timeout(2) == 2.0
+
+
+def test_execution_timeout_raises_when_budget_exhausted():
+    executor = DockerExecutor()
+    executor._execution_deadline = 10.0
+    executor.monotonic = lambda: 10.0
+    with pytest.raises(SandboxError, match="execution budget exhausted"):
+        executor._execution_timeout(30)
+    executor.monotonic = lambda: 11.0
+    with pytest.raises(SandboxError, match="execution budget exhausted"):
+        executor._execution_timeout(5)
+
+
+def test_set_execution_deadline_stores_absolute_deadline():
+    executor = DockerExecutor()
+    assert executor._execution_deadline is None
+    executor.set_execution_deadline(123.5)
+    assert executor._execution_deadline == 123.5
+    executor.set_execution_deadline(200.0)
+    assert executor._execution_deadline == 200.0
+
+
+def test_execute_ordinary_timeout_with_ample_budget_preserves_full_recovery(
+    monkeypatch,
+):
+    """Scenario A: remaining >> command timeout — full kill/reap/start/probe."""
+    calls: list[tuple[list[str], float | None]] = []
+
+    def fake_run(args, **kwargs):
+        calls.append((list(args), kwargs.get("timeout")))
+        sub = args[1] if len(args) > 1 else ""
+        if sub == "inspect":
+            return _FakeCompleted(stdout="true\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+
+    executor = DockerExecutor(monotonic=lambda: 100.0)
+    executor._container_id = "cid"
+    executor.set_execution_deadline(200.0)  # remaining 100
+    monkeypatch.setattr(
+        executor, "_collect", lambda process, deadline: (b"partial", b"", True, False)
+    )
+
+    result = executor.execute("sleep 1000", 10)
+
+    assert result.timed_out is True
+    assert executor._execution_deadline is None
+    timeouts = [t for _, t in calls if t is not None]
+    for t in timeouts:
+        assert t <= 100.0
+    kill_timeouts = [t for a, t in calls if len(a) > 1 and a[1] == "kill"]
+    assert kill_timeouts and kill_timeouts[0] == 30
+    start_timeouts = [t for a, t in calls if len(a) > 1 and a[1] == "start"]
+    assert start_timeouts and start_timeouts[0] == 60
+    exec_timeouts = [
+        t for a, t in calls if len(a) > 1 and a[1] == "exec" and "/bin/true" in a
+    ]
+    assert exec_timeouts and exec_timeouts[0] == 30
+
+
+def test_execute_small_positive_budget_clamps_recovery_timeouts(
+    monkeypatch,
+):
+    """Scenario B: small positive remaining — later ops receive only remaining."""
+    captured: list[float] = []
+    clock = [0.0]
+
+    def fake_run(args, **kwargs):
+        t = kwargs.get("timeout")
+        if t is not None:
+            captured.append(float(t))
+        clock[0] += 2.0
+        sub = args[1] if len(args) > 1 else ""
+        if sub == "inspect":
+            return _FakeCompleted(stdout="true\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+
+    executor = DockerExecutor(monotonic=lambda: clock[0])
+    executor._container_id = "cid"
+    executor.set_execution_deadline(5.0)
+    monkeypatch.setattr(
+        executor, "_collect", lambda process, deadline: (b"", b"", True, False)
+    )
+
+    with pytest.raises(SandboxError):
+        executor.execute("sleep 1000", 10)
+
+    assert captured
+    for t in captured:
+        assert t <= 5.0
+    if len(captured) >= 2:
+        assert captured[-1] < captured[0]
+
+
+def test_execute_recovery_no_blocking_ops_after_deadline_exhausted(
+    monkeypatch,
+):
+    """Scenario C: wall already exhausted before recovery — no blocking Docker ops.
+
+    The already-expired deadline is reached via wall expiry during _collect
+    (collection deadline hit), not at pre-exec, so is_running stub capped to
+    remaining passes and _collect reports timed_out, then _recover sees exhausted.
+    """
+    docker_calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        docker_calls.append(list(args))
+        sub = args[1] if len(args) > 1 else ""
+        if sub == "inspect":
+            return _FakeCompleted(stdout="true\n")
+        return _FakeCompleted()
+
+    class FakeProc:
+        pid = 12345
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: FakeProc())
+
+    killed: list[tuple[int, int]] = []
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
+    monkeypatch.setattr(os, "getpgid", lambda pid: 999)
+
+    # is_running stub captures deadline-clamped timeout and advances clock to expiry
+    clock = [9.0]
+
+    def is_running_with_advance(cid, timeout=None):
+        # limit is 1s remaining -> clamped to 1, then time advances to expiry
+        clock[0] = 10.0
+        return True
+
+    executor = DockerExecutor(monotonic=lambda: clock[0])
+    executor._container_id = "cid"
+    executor._container_name = "flagagent-agent-FA-test"
+    executor.set_execution_deadline(10.0)
+    monkeypatch.setattr(executor, "_is_container_running", is_running_with_advance)
+    monkeypatch.setattr(
+        executor, "_collect", lambda process, deadline: (b"", b"", True, False)
+    )
+
+    with pytest.raises(SandboxError, match="execution budget exhausted"):
+        executor.execute("sleep 1000", 1)
+
+    assert all(a[1] != "kill" for a in docker_calls)
+    assert all(a[1] != "start" for a in docker_calls)
+    assert not any("/bin/true" in a for a in docker_calls)
+    assert killed
+    assert executor._execution_deadline is None
+    assert executor._container_id == "cid"
+
+
+def test_execute_pre_exec_consumption_not_regranted(monkeypatch):
+    """Scenario D: pre-exec time consumed must not be re-granted to _collect."""
+    clock = [0.0]
+    captured_deadline: list[float] = []
+
+    def fake_is_running(cid, timeout=None):
+        clock[0] += 4.0
+        return True
+
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+
+    executor = DockerExecutor(monotonic=lambda: clock[0])
+    executor._container_id = "cid"
+    executor.set_execution_deadline(10.0)
+    monkeypatch.setattr(executor, "_is_container_running", fake_is_running)
+
+    def capture_collect(process, deadline):
+        captured_deadline.append(deadline)
+        return (b"", b"", False, False)
+
+    monkeypatch.setattr(executor, "_collect", capture_collect)
+    monkeypatch.setattr(executor, "_docker_ok", lambda args, timeout: True)
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: _FakeCompleted(stdout="true\n"))
+
+    executor.execute("echo hi", 10)
+
+    assert captured_deadline
+    assert captured_deadline[0] == 10.0
+    assert executor._execution_deadline is None
+
+
+def test_execute_deadline_isolated_across_sequential_calls(monkeypatch):
+    """Deadline state must not leak between sequential shell calls."""
+    monkeypatch.setattr(subprocess, "run", _inspect_running("true\n"))
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+
+    executor = DockerExecutor(monotonic=lambda: 0.0)
+    executor._container_id = "cid"
+    monkeypatch.setattr(
+        executor, "_collect", lambda process, deadline: (b"", b"", False, False)
+    )
+    monkeypatch.setattr(executor, "_docker_ok", lambda args, timeout: True)
+
+    executor.set_execution_deadline(100.0)
+    executor.execute("echo one", 5)
+    assert executor._execution_deadline is None
+
+    executor.execute("echo two", 5)
+    assert executor._execution_deadline is None
+
+    executor.set_execution_deadline(50.0)
+    executor.execute("echo three", 5)
+    assert executor._execution_deadline is None
+
+
+def test_execute_deadline_cleared_after_failure(monkeypatch):
+    """Deadline must be cleared even when recovery exhausts and raises."""
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    executor = DockerExecutor(monotonic=lambda: 10.0)
+    executor._container_id = "cid"
+    executor.set_execution_deadline(10.0)
+    monkeypatch.setattr(executor, "_is_container_running", lambda cid, timeout=None: True)
+    monkeypatch.setattr(
+        executor, "_collect", lambda process, deadline: (b"", b"", True, False)
+    )
+    monkeypatch.setattr(os, "killpg", lambda *a, **k: None)
+    monkeypatch.setattr(os, "getpgid", lambda pid: 999)
+
+    class P:
+        pid = 1
+
+        def poll(self):
+            return None
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: P())
+
+    with pytest.raises(SandboxError, match="execution budget exhausted"):
+        executor.execute("sleep 1000", 1)
+
+    assert executor._execution_deadline is None
+
+    executor.monotonic = lambda: 0.0
+    executor.set_execution_deadline(100.0)
+    monkeypatch.setattr(subprocess, "run", _recovery_run([]))
+    monkeypatch.setattr(subprocess, "Popen", _FakePopen)
+    monkeypatch.setattr(
+        executor, "_collect", lambda process, deadline: (b"", b"", True, False)
+    )
+    result = executor.execute("sleep 1000", 5)
+    assert result.timed_out is True
+
+
+def test_execute_uses_execution_deadline_for_post_command_wait_and_probes(
+    monkeypatch,
+):
+    """Post-command wait and control probes must be bounded by execution deadline."""
+    captured: list[float | None] = []
+    clock = [0.0]
+
+    def fake_run(args, **kwargs):
+        captured.append(kwargs.get("timeout"))
+        sub = args[1] if len(args) > 1 else ""
+        if sub == "inspect":
+            return _FakeCompleted(stdout="true\n")
+        if sub == "exec":
+            return _FakeCompleted(stdout="true\n")
+        return _FakeCompleted()
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+
+    class Proc:
+        pid = 1
+        returncode = 0
+        stdout = stderr = None
+
+        def wait(self, timeout=None):
+            captured.append(timeout)
+            return 0
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: Proc())
+
+    executor = DockerExecutor(monotonic=lambda: clock[0])
+    executor._container_id = "cid"
+    executor.set_execution_deadline(3.0)
+
+    orig_collect = lambda process, deadline: (
+        b"",
+        b"Error response from daemon: is not running",
+        False,
+        False,
+    )
+
+    def collect_and_advance(process, deadline):
+        clock[0] += 2.0
+        return orig_collect(process, deadline)
+
+    monkeypatch.setattr(executor, "_collect", collect_and_advance)
+
+    class FakeProc2(Proc):
+        returncode = 125
+
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: FakeProc2())
+
+    try:
+        executor.execute("cmd", 10)
+    except SandboxError:
+        pass
+
+    assert captured
+    for t in captured:
+        if t is not None:
+            assert t <= 3.0
+
+
+def test_execute_expired_post_collect_wait_does_host_hygiene_not_blocking_wait(
+    monkeypatch,
+):
+    """Expired post-collect wait path must killpg + poll, not blocking wait/ Docker."""
+    killed: list[tuple[int, int]] = []
+    polled: list[int] = []
+    waited: list[float | None] = []
+    docker_calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        docker_calls.append(list(args))
+        sub = args[1] if len(args) > 1 else ""
+        if sub == "inspect":
+            return _FakeCompleted(stdout="true\n")
+        return _FakeCompleted()
+
+    class FakeProc:
+        pid = 12345
+        returncode = 0
+
+        def wait(self, timeout=None):
+            waited.append(timeout)
+            return 0
+
+        def poll(self):
+            polled.append(1)
+            return None
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: FakeProc())
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
+    monkeypatch.setattr(os, "getpgid", lambda pid: 999)
+
+    clock = [9.0]
+    executor = DockerExecutor(monotonic=lambda: clock[0])
+    executor._container_id = "cid"
+    executor.set_execution_deadline(10.0)
+    # is_running pre-exec uses 1s remaining, then clock advances to expired before wait
+    def is_running_advance(cid, timeout=None):
+        clock[0] = 10.0
+        return True
+
+    monkeypatch.setattr(executor, "_is_container_running", is_running_advance)
+    monkeypatch.setattr(
+        executor, "_collect", lambda process, deadline: (b"", b"", False, False)
+    )
+
+    with pytest.raises(SandboxError, match="execution budget exhausted"):
+        executor.execute("echo hi", 10)
+
+    assert waited == []  # blocking wait never started
+    assert killed  # host killpg sent
+    assert polled  # non-blocking poll done
+    assert all(a[1] != "kill" for a in docker_calls)
+    assert all(a[1] != "start" for a in docker_calls)
+    assert executor._execution_deadline is None
 
 
 # ---------------------------------------------------------------------------
