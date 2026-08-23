@@ -301,9 +301,7 @@ def test_completed_status_returns_normal_response():
     assert result.tool_calls == ()
 
 
-@pytest.mark.parametrize(
-    "status", ["failed", "cancelled", "queued", "in_progress", "incomplete"]
-)
+@pytest.mark.parametrize("status", ["failed", "cancelled", "queued", "in_progress"])
 def test_non_completed_top_level_status_raises_provider_error_with_valid_output(status):
     response_with_status = types.SimpleNamespace(
         status=status, output=[message_item("ok")], usage=None
@@ -311,4 +309,117 @@ def test_non_completed_top_level_status_raises_provider_error_with_valid_output(
     model, _ = make_model([response_with_status])
 
     with pytest.raises(ProviderError):
+        generate(model)
+
+
+def test_incomplete_without_max_output_tokens_is_provider_error():
+    response_with_status = types.SimpleNamespace(
+        status="incomplete",
+        output=[message_item("ok")],
+        usage=None,
+        incomplete_details={"reason": "content_filter"},
+    )
+    model, _ = make_model([response_with_status])
+
+    with pytest.raises(ProviderError):
+        generate(model)
+
+
+def test_incomplete_max_output_tokens_is_truncated_with_text_usage_and_no_tool_calls():
+    usage = types.SimpleNamespace(input_tokens=3, output_tokens=7)
+    resp = types.SimpleNamespace(
+        status="incomplete",
+        incomplete_details={"reason": "max_output_tokens"},
+        output=[message_item("partial text")],
+        usage=usage,
+    )
+    model, _ = make_model([resp])
+
+    result = generate(model)
+
+    assert isinstance(result, ModelResponse)
+    assert result.truncated is True
+    assert result.content == "partial text"
+    assert result.usage == {"input_tokens": 3, "output_tokens": 7}
+    assert result.tool_calls == ()
+    assert result.to_dict()["truncated"] is True
+
+
+def test_incomplete_max_output_tokens_object_details_is_truncated():
+    resp = types.SimpleNamespace(
+        status="incomplete",
+        incomplete_details=types.SimpleNamespace(reason="max_output_tokens"),
+        output=[message_item("partial")],
+        usage=None,
+    )
+    model, _ = make_model([resp])
+
+    result = generate(model)
+
+    assert result.truncated is True
+    assert result.content == "partial"
+    assert result.tool_calls == ()
+
+
+def test_truncated_max_output_tokens_suppresses_invalid_partial_function_call_and_replay():
+    invalid_call = function_call_item("c1", "shell", '{"command": "incomplete')
+    truncated = types.SimpleNamespace(
+        status="incomplete",
+        incomplete_details={"reason": "max_output_tokens"},
+        output=[message_item("partial"), invalid_call],
+        usage=types.SimpleNamespace(input_tokens=4, output_tokens=6),
+    )
+    follow = types.SimpleNamespace(
+        status="completed", output=[message_item("done")], usage=None
+    )
+    model, responses = make_model([truncated, follow])
+
+    result = generate(model)
+
+    assert result.truncated is True
+    assert result.content == "partial"
+    assert result.tool_calls == ()
+    assert result.usage == {"input_tokens": 4, "output_tokens": 6}
+    assert "c1" not in json.dumps(result.to_dict())
+    assert all(item.get("call_id") != "c1" for item in model._built_input)
+    assert all(item.get("type") != "function_call" for item in model._built_input)
+
+    generate(
+        model,
+        [
+            {"role": "user", "content": "solve"},
+            {"role": "assistant", "content": result.content, "tool_calls": []},
+            {"role": "user", "content": "next turn"},
+        ],
+    )
+    second_input = responses.calls[1]["input"]
+    assert not any(
+        item.get("type") == "function_call" and item.get("call_id") == "c1"
+        for item in second_input
+    )
+    assert not any(item.get("type") == "function_call" for item in second_input)
+
+
+def test_content_filter_is_not_truncation_and_remains_provider_error():
+    for details in [
+        {"reason": "content_filter"},
+        types.SimpleNamespace(reason="content_filter"),
+    ]:
+        resp = types.SimpleNamespace(
+            status="incomplete",
+            incomplete_details=details,
+            output=[message_item("partial")],
+            usage=None,
+        )
+        model, _ = make_model([resp])
+        with pytest.raises(ProviderError, match="incomplete"):
+            generate(model)
+
+    resp_none = types.SimpleNamespace(
+        status="incomplete",
+        output=[message_item("partial")],
+        usage=None,
+    )
+    model, _ = make_model([resp_none])
+    with pytest.raises(ProviderError, match="incomplete"):
         generate(model)
