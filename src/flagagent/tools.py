@@ -153,6 +153,7 @@ class FakeExecutor:
     prepared: list[tuple[Path, str]] = field(default_factory=list, init=False)
     cleaned: list[str] = field(default_factory=list, init=False)
     remaining_budgets: list[float] = field(default_factory=list, init=False)
+    execution_deadlines: list[float] = field(default_factory=list, init=False)
     _index: int = field(default=0, init=False)
 
     def prepare(self, workspace: Path, run_id: str) -> None:
@@ -160,6 +161,11 @@ class FakeExecutor:
 
     def set_remaining(self, remaining: float) -> None:
         self.remaining_budgets.append(remaining)
+
+    def set_execution_deadline(
+        self, deadline: float, monotonic=None
+    ) -> None:  # type: ignore[no-untyped-def]
+        self.execution_deadlines.append(deadline)
 
     def execute(self, command: str, timeout_seconds: float) -> ShellResult:
         self.calls.append((command, timeout_seconds))
