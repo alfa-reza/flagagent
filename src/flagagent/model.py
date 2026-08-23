@@ -41,6 +41,7 @@ class ModelResponse:
     content: str = ""
     tool_calls: tuple[ToolCall, ...] = ()
     usage: Any | None = None
+    truncated: bool = False
 
     def __post_init__(self) -> None:
         if not isinstance(self.content, str):
@@ -53,12 +54,15 @@ class ModelResponse:
         object.__setattr__(self, "tool_calls", calls)
         if self.usage is not None:
             object.__setattr__(self, "usage", _snapshot_json(self.usage))
+        if not isinstance(self.truncated, bool):
+            raise TypeError("truncated must be a bool")
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "content": self.content,
             "tool_calls": [call.to_dict() for call in self.tool_calls],
             "usage": deepcopy(self.usage),
+            "truncated": bool(self.truncated),
         }
 
 
@@ -95,4 +99,5 @@ class ScriptedModel:
                 for call in item.tool_calls
             ),
             usage=item.usage,
+            truncated=item.truncated,
         )

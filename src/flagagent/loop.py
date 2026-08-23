@@ -634,6 +634,12 @@ class AgentLoop:
                     "wall_limit",
                     [call.call_id for call in response.tool_calls],
                 )
+            if getattr(response, "truncated", False):
+                return (
+                    "unsolved",
+                    "model_output_limit",
+                    [call.call_id for call in response.tool_calls],
+                )
             if not response.tool_calls:
                 return "unsolved", "model_stop", []
             terminal = self._dispatch(response)
