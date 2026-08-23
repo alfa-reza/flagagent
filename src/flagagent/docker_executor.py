@@ -358,9 +358,10 @@ class DockerExecutor:
                 return ShellResult(stdout_text, stderr_text, None, True, truncated)
             except SandboxError:
                 # The wall budget expired before the reap could start:
-                # perform only the non-blocking hygiene, then propagate so
-                # AgentLoop can resolve the Run to wall_limit.
-                process.poll()
+                # do non-blocking host hygiene (killpg + poll) like
+                # _recover_after_timeout's already-expired path, then
+                # propagate so AgentLoop can resolve the Run to wall_limit.
+                self._kill_exec_client(process)
                 raise
             if self._is_control_failure(process.returncode, stderr_text) and (
                 not self._is_container_running(
@@ -993,11 +994,7 @@ class DockerExecutor:
             # containment is owned by the best-effort terminal cleanup
             # (cleanup -> docker rm -f), which runs outside the active
             # budget.
-            try:
-                os.killpg(os.getpgid(process.pid), signal.SIGKILL)
-            except (ProcessLookupError, OSError):
-                pass
-            process.poll()
+            self._kill_exec_client(process)
             raise SandboxError("execution budget exhausted")
         if not self._docker_ok(
             [self.docker_bin, "kill", cid], timeout=self._execution_timeout(30)
@@ -1032,6 +1029,18 @@ class DockerExecutor:
             raise SandboxError(
                 "timeout recovery failed: agent container not usable after restart"
             )
+
+    def _kill_exec_client(self, process: subprocess.Popen) -> None:
+        """Non-blocking host-side exec client hygiene (Issue 39).
+
+        SIGKILL the client process group if still alive, then non-blocking
+        reap.  No Docker operations, no blocking timeout.
+        """
+        try:
+            os.killpg(os.getpgid(process.pid), signal.SIGKILL)
+        except (ProcessLookupError, OSError):
+            pass
+        process.poll()
 
     def _docker_ok(self, args: list[str], timeout: float) -> bool:
         try:

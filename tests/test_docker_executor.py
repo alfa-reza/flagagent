@@ -1729,6 +1729,64 @@ def test_execute_uses_execution_deadline_for_post_command_wait_and_probes(
             assert t <= 3.0
 
 
+def test_execute_expired_post_collect_wait_does_host_hygiene_not_blocking_wait(
+    monkeypatch,
+):
+    """Expired post-collect wait path must killpg + poll, not blocking wait/ Docker."""
+    killed: list[tuple[int, int]] = []
+    polled: list[int] = []
+    waited: list[float | None] = []
+    docker_calls: list[list[str]] = []
+
+    def fake_run(args, **kwargs):
+        docker_calls.append(list(args))
+        sub = args[1] if len(args) > 1 else ""
+        if sub == "inspect":
+            return _FakeCompleted(stdout="true\n")
+        return _FakeCompleted()
+
+    class FakeProc:
+        pid = 12345
+        returncode = 0
+
+        def wait(self, timeout=None):
+            waited.append(timeout)
+            return 0
+
+        def poll(self):
+            polled.append(1)
+            return None
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    monkeypatch.setattr(subprocess, "Popen", lambda *a, **k: FakeProc())
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: killed.append((pgid, sig)))
+    monkeypatch.setattr(os, "getpgid", lambda pid: 999)
+
+    clock = [9.0]
+    executor = DockerExecutor(monotonic=lambda: clock[0])
+    executor._container_id = "cid"
+    executor.set_execution_deadline(10.0)
+    # is_running pre-exec uses 1s remaining, then clock advances to expired before wait
+    def is_running_advance(cid, timeout=None):
+        clock[0] = 10.0
+        return True
+
+    monkeypatch.setattr(executor, "_is_container_running", is_running_advance)
+    monkeypatch.setattr(
+        executor, "_collect", lambda process, deadline: (b"", b"", False, False)
+    )
+
+    with pytest.raises(SandboxError, match="execution budget exhausted"):
+        executor.execute("echo hi", 10)
+
+    assert waited == []  # blocking wait never started
+    assert killed  # host killpg sent
+    assert polled  # non-blocking poll done
+    assert all(a[1] != "kill" for a in docker_calls)
+    assert all(a[1] != "start" for a in docker_calls)
+    assert executor._execution_deadline is None
+
+
 # ---------------------------------------------------------------------------
 # Docker integration tests
 # ---------------------------------------------------------------------------
