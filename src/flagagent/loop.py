@@ -711,7 +711,12 @@ class AgentLoop:
         return None
 
     def _shell(self, call_id: str, command: str) -> tuple[str, str, list[str]] | None:
-        timeout = min(self.limits.command_timeout_seconds, self._remaining())
+        remaining = self._remaining()
+        timeout = min(self.limits.command_timeout_seconds, remaining)
+        set_wall = getattr(self.executor, "set_wall_remaining", None)
+        if set_wall is not None:
+            with contextlib.suppress(Exception):
+                set_wall(remaining)
         try:
             raw_result = self.executor.execute(command, timeout)
             model_result, logged_result = normalize_shell_result(

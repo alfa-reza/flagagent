@@ -191,6 +191,8 @@ class DockerExecutor:
     )
     _preparation_remaining: float | None = field(default=None, init=False, repr=False)
     _preparation_deadline: float | None = field(default=None, init=False, repr=False)
+    _wall_deadline: float | None = field(default=None, init=False, repr=False)
+    _wall_budget_set: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.network_mode not in ("none", "local"):
@@ -202,14 +204,24 @@ class DockerExecutor:
     def set_remaining(self, remaining: float) -> None:
         """Store the Run wall-budget remaining for preparation-time timeouts.
 
-        ``AgentLoop`` calls this (when available) right before ``prepare``
-        so that each blocking Docker operation reachable from ``prepare``
-        is bounded by the shared Run wall deadline instead of only its own
-        fixed default.  A subsequent ``prepare`` consumes and clears the
-        value; calling ``prepare`` without ``set_remaining`` keeps the
-        fixed default timeouts.
+        ``AgentLoop`` calls this before ``prepare`` so that blocking Docker
+        work during preparation is bounded by the shared Run wall deadline.
         """
-        self._preparation_remaining = max(0.0, float(remaining))
+        value = max(0.0, float(remaining))
+        self._preparation_remaining = value
+        self._wall_deadline = self.monotonic() + value
+        self._wall_budget_set = True
+
+    def set_wall_remaining(self, remaining: float) -> None:
+        """Store the Run wall-budget remaining for active execution recovery.
+
+        ``AgentLoop`` calls this before each ``execute`` so that blocking
+        Docker work during timeout recovery is bounded by the shared Run wall
+        deadline without affecting preparation state.
+        """
+        value = max(0.0, float(remaining))
+        self._wall_deadline = self.monotonic() + value
+        self._wall_budget_set = True
 
     def _preparation_timeout(self, fixed: float) -> float:
         """Bound a fixed preparation timeout by the Run wall deadline.
@@ -226,6 +238,41 @@ class DockerExecutor:
         if remaining <= 0:
             raise SandboxError("preparation budget exhausted")
         return min(fixed, remaining)
+
+    def _wall_remaining(self) -> float | None:
+        if not self._wall_budget_set:
+            return None
+        deadline = self._wall_deadline
+        if deadline is None:
+            return None
+        return deadline - self.monotonic()
+
+    def _containment_timeout(self, fixed: float) -> float:
+        remaining = self._wall_remaining()
+        if remaining is None:
+            return fixed
+        if remaining <= 0:
+            return min(fixed, 1.0)
+        return min(fixed, remaining)
+
+    def _wall_timeout(self, fixed: float) -> float:
+        remaining = self._wall_remaining()
+        if remaining is None:
+            return fixed
+        if remaining <= 0:
+            raise SandboxError("wall budget exhausted")
+        return min(fixed, remaining)
+
+    def _operation_timeout(self, fixed: float) -> float:
+        if self._preparation_deadline is not None:
+            prep = self._preparation_timeout(fixed)
+            wall = self._wall_remaining()
+            if wall is not None:
+                if wall <= 0:
+                    raise SandboxError("wall budget exhausted")
+                return min(prep, wall)
+            return prep
+        return self._wall_timeout(fixed)
 
     # -- lifecycle -----------------------------------------------------------
 
@@ -895,11 +942,19 @@ class DockerExecutor:
         container (preserving container identity, workspace, and mounts), and
         probe that it is usable again.  Raise ``SandboxError`` on any failure
         so timed-out evidence is only returned for a proven-healthy sandbox.
+
+        Containment (kill + host exec reap) is always attempted even when the
+        Run wall budget is exhausted, but with a clamped timeout so recovery
+        cannot outlive the wall deadline.  Restart and probe are skipped when
+        the wall budget is exhausted because they exist only to resume an
+        already-terminal Run.
         """
         cid = self._container_id
         if cid is None:
             raise SandboxError("timeout recovery failed: no owned agent container")
-        if not self._docker_ok([self.docker_bin, "kill", cid], timeout=30):
+        if not self._docker_ok(
+            [self.docker_bin, "kill", cid], timeout=self._containment_timeout(30)
+        ):
             raise SandboxError(
                 "timeout recovery failed: could not kill agent container"
             )
@@ -908,12 +963,16 @@ class DockerExecutor:
         except (ProcessLookupError, OSError):
             pass
         try:
-            process.wait(timeout=10)
+            process.wait(timeout=self._containment_timeout(10))
         except subprocess.TimeoutExpired as error:
             raise SandboxError(
                 "timeout recovery failed: exec client did not exit"
             ) from error
-        if not self._docker_ok([self.docker_bin, "start", cid], timeout=60):
+        if self._wall_budget_set and self._wall_remaining() is not None and self._wall_remaining() <= 0:  # type: ignore[operator]
+            raise SandboxError("wall budget exhausted")
+        if not self._docker_ok(
+            [self.docker_bin, "start", cid], timeout=self._wall_timeout(60)
+        ):
             raise SandboxError(
                 "timeout recovery failed: could not restart agent container"
             )
@@ -921,7 +980,10 @@ class DockerExecutor:
             raise SandboxError(
                 "timeout recovery failed: agent container not running after restart"
             )
-        if not self._docker_ok([self.docker_bin, "exec", cid, "/bin/true"], timeout=30):
+        if not self._docker_ok(
+            [self.docker_bin, "exec", cid, "/bin/true"],
+            timeout=self._wall_timeout(30),
+        ):
             raise SandboxError(
                 "timeout recovery failed: agent container not usable after restart"
             )
@@ -1299,9 +1361,11 @@ class DockerExecutor:
                 args,
                 capture_output=True,
                 text=True,
-                timeout=self._preparation_timeout(10),
+                timeout=self._operation_timeout(10),
                 check=False,
             )
+        except SandboxError:
+            raise
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             return False
         return result.returncode == 0 and result.stdout.strip() == "true"
@@ -1323,9 +1387,11 @@ class DockerExecutor:
                 args,
                 capture_output=True,
                 text=True,
-                timeout=self._preparation_timeout(10),
+                timeout=self._operation_timeout(10),
                 check=False,
             )
+        except SandboxError:
+            return None
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
             return None
         if result.returncode != 0:
