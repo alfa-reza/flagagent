@@ -1,8 +1,11 @@
+import types
 from datetime import UTC, datetime
 
+from flagagent.anthropic_messages import AnthropicMessagesModel
 from flagagent.artifacts import read_events
 from flagagent.loop import AgentLoop, ChallengeInput, Limits
 from flagagent.model import ModelResponse, ScriptedModel, ToolCall
+from flagagent.responses import ResponsesModel
 from flagagent.tools import ExactStringVerifier, FakeExecutor, SandboxError, ShellResult
 
 NOW = datetime(2026, 8, 14, 16, 15, 30, tzinfo=UTC)
@@ -772,3 +775,112 @@ def test_non_docker_executor_without_deadline_seam_still_works(tmp_path):
     )
     assert result["status:reason"] == "unsolved:model_stop"
     assert executor.calls == [("x", 10)]
+
+
+def _run_loop_with_model(tmp_path, model, executor=None):
+    loop = AgentLoop(
+        model=model,
+        executor=executor or FakeExecutor([]),
+        verifier=ExactStringVerifier("Flag{ok}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(
+            max_model_turns=10, wall_timeout_seconds=100, command_timeout_seconds=10
+        ),
+        runs_root=tmp_path,
+        monotonic=Clock(),
+        utc_now=lambda: NOW,
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    return loop, loop.run()
+
+
+def test_responses_truncation_via_agent_loop_is_model_output_limit(tmp_path):
+    output = [
+        {
+            "type": "message",
+            "id": "msg_1",
+            "role": "assistant",
+            "status": "completed",
+            "content": [{"type": "output_text", "text": "partial truncation"}],
+        },
+        {
+            "type": "function_call",
+            "call_id": "c1",
+            "name": "shell",
+            "arguments": '{"command":"partial-bad}',
+        },
+    ]
+    fake = types.SimpleNamespace(
+        status="incomplete",
+        incomplete_details={"reason": "max_output_tokens"},
+        output=output,
+        usage=types.SimpleNamespace(input_tokens=9, output_tokens=11),
+    )
+
+    class FakeResponses:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return fake
+
+    responses = FakeResponses()
+    client = types.SimpleNamespace(responses=responses)
+    model = ResponsesModel("test-model", "sk-test", client=client)
+    executor = FakeExecutor([ShellResult("should not run", "", 0, False)])
+    loop, result = _run_loop_with_model(tmp_path, model, executor=executor)
+
+    assert result["status:reason"] == "unsolved:model_output_limit"
+    assert result["input_tokens"] == 9
+    assert result["output_tokens"] == 11
+    assert result["model_calls"] == 1
+    assert result["tool_calls"] == 0
+    assert executor.calls == []
+    events = read_events(loop.artifacts.events_path)
+    assert [e["type"] for e in events if e["type"] == "tool_call"] == []
+    model_events = [e for e in events if e["type"] == "model_response"]
+    assert model_events[0]["payload"]["truncated"] is True
+    assert model_events[0]["payload"]["content"] == "partial truncation"
+    assert all(item.get("call_id") != "c1" for item in model._built_input)
+
+
+def test_anthropic_context_window_truncation_via_agent_loop_is_model_output_limit(
+    tmp_path,
+):
+    response = types.SimpleNamespace(
+        content=[
+            types.SimpleNamespace(type="text", text="partial anthropic"),
+            types.SimpleNamespace(
+                type="tool_use", id="c1", name="shell", input={"command": "ls"}
+            ),
+        ],
+        usage=types.SimpleNamespace(input_tokens=8, output_tokens=12),
+        stop_reason="model_context_window_exceeded",
+    )
+
+    class FakeMessages:
+        def __init__(self):
+            self.calls: list[dict] = []
+
+        def create(self, **kwargs):
+            self.calls.append(kwargs)
+            return response
+
+    messages = FakeMessages()
+    client = types.SimpleNamespace(messages=messages)
+    model = AnthropicMessagesModel("test-model", "sk-test", client=client)
+    executor = FakeExecutor([ShellResult("should not run", "", 0, False)])
+    loop, result = _run_loop_with_model(tmp_path, model, executor=executor)
+
+    assert result["status:reason"] == "unsolved:model_output_limit"
+    assert result["input_tokens"] == 8
+    assert result["output_tokens"] == 12
+    assert result["model_calls"] == 1
+    assert result["tool_calls"] == 0
+    assert executor.calls == []
+    events = read_events(loop.artifacts.events_path)
+    assert [e["type"] for e in events if e["type"] == "tool_call"] == []
+    model_events = [e for e in events if e["type"] == "model_response"]
+    assert model_events[0]["payload"]["truncated"] is True
+    assert model_events[0]["payload"]["content"] == "partial anthropic"
