@@ -360,12 +360,22 @@ def test_finish_reason_tool_calls_is_normal_tool_call_response():
     assert result.tool_calls[0].call_id == "c1"
 
 
-def test_finish_reason_length_raises_provider_error():
-    response = _response(content="partial", finish_reason="length")
+def test_finish_reason_length_is_truncated_response():
+    response = _response(
+        content="partial",
+        usage=types.SimpleNamespace(prompt_tokens=3, completion_tokens=5),
+        finish_reason="length",
+    )
     model, _ = _model([response])
 
-    with pytest.raises(ProviderError, match="finish reason is not normal"):
-        model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+    result = model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+    assert isinstance(result, ModelResponse)
+    assert result.content == "partial"
+    assert result.truncated is True
+    assert result.tool_calls == ()
+    assert result.usage == {"input_tokens": 3, "output_tokens": 5}
+    assert result.to_dict()["truncated"] is True
 
 
 def test_finish_reason_content_filter_raises_provider_error():
@@ -374,3 +384,34 @@ def test_finish_reason_content_filter_raises_provider_error():
 
     with pytest.raises(ProviderError, match="finish reason is not normal"):
         model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+
+def test_length_is_truncated_and_ignores_partial_tool_calls():
+    response = _response(
+        content="partial",
+        tool_calls=[_tool_call("c1", "shell", json.dumps({"command": "ls"}))],
+        usage=types.SimpleNamespace(prompt_tokens=2, completion_tokens=3),
+        finish_reason="length",
+    )
+    model, _ = _model([response])
+
+    result = model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+    assert result.truncated is True
+    assert result.content == "partial"
+    assert result.tool_calls == ()
+    assert result.usage == {"input_tokens": 2, "output_tokens": 3}
+    assert "c1" not in json.dumps(result.to_dict())
+
+
+def test_normal_chat_responses_are_not_truncated():
+    stop = _response(content="done", finish_reason="stop")
+    model1, _ = _model([stop])
+    assert model1.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS).truncated is False
+
+    tool = _response(
+        tool_calls=[_tool_call("c1", "shell", json.dumps({"command": "ls"}))],
+        finish_reason="tool_calls",
+    )
+    model2, _ = _model([tool])
+    assert model2.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS).truncated is False
