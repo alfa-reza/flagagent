@@ -151,11 +151,15 @@ def _parse_function_call(item_dict: dict[str, Any]) -> ToolCall:
 
 def _parse_responses_output(
     output: Any,
+    *,
+    truncated: bool = False,
 ) -> tuple[str, list[ToolCall], list[dict[str, Any]]]:
     """Parse Responses output into content, tool calls, and replay items.
 
     Returns ``(content, tool_calls, replay_items)`` where ``replay_items`` are
     the provider output-item dicts to replay in the next stateless request.
+    When ``truncated`` is True, incomplete function-call material is not
+    executed or replayed.
     """
     if not isinstance(output, list) or not output:
         raise ProviderError("responses output has no items")
@@ -169,6 +173,8 @@ def _parse_responses_output(
             content_parts.append(_extract_message_text(item_dict))
             replay_items.append(item_dict)
         elif item_type == "function_call":
+            if truncated:
+                continue
             tool_calls.append(_parse_function_call(item_dict))
             replay_items.append(item_dict)
         elif item_type == "reasoning":
@@ -266,14 +272,31 @@ class ResponsesModel:
             raise ProviderError("responses request failed") from error
         try:
             status = getattr(response, "status", None)
-            if status is not None and status != "completed":
+            truncated = False
+            if status == "incomplete":
+                details = getattr(response, "incomplete_details", None)
+                if isinstance(details, Mapping):
+                    reason = details.get("reason")
+                elif details is not None:
+                    reason = getattr(details, "reason", None)
+                else:
+                    reason = None
+                if reason == "max_output_tokens":
+                    truncated = True
+                else:
+                    raise ProviderError(f"responses {status}")
+            elif status is not None and status != "completed":
                 raise ProviderError(f"responses {status}")
             output = getattr(response, "output", None)
-            content, tool_calls, replay_items = _parse_responses_output(output)
+            content, tool_calls, replay_items = _parse_responses_output(
+                output, truncated=truncated
+            )
             usage = _normalize_responses_usage(getattr(response, "usage", None))
         except ProviderError:
             raise
         except (AttributeError, TypeError, ValueError, IndexError, KeyError) as error:
             raise ProviderError("malformed responses output") from error
         self._built_input.extend(replay_items)
-        return ModelResponse(content=content, tool_calls=tuple(tool_calls), usage=usage)
+        return ModelResponse(
+            content=content, tool_calls=tuple(tool_calls), usage=usage, truncated=truncated
+        )
