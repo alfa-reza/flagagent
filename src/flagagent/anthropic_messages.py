@@ -132,7 +132,7 @@ def _parse_anthropic_response(
     response: Any,
 ) -> tuple[ModelResponse, list[dict[str, Any]]]:
     stop_reason = getattr(response, "stop_reason", None)
-    truncated = stop_reason == "max_tokens"
+    truncated = stop_reason in ("max_tokens", "model_context_window_exceeded")
     if not truncated and stop_reason not in ("end_turn", "tool_use"):
         raise ProviderError("messages response has non-normal stop reason")
     content_list = getattr(response, "content", None)

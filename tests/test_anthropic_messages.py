@@ -332,7 +332,9 @@ def test_sdk_error_raises_provider_error():
     ],
 )
 def test_malformed_response_raises_provider_error(content):
-    response = types.SimpleNamespace(content=content, usage=None, stop_reason="end_turn")
+    response = types.SimpleNamespace(
+        content=content, usage=None, stop_reason="end_turn"
+    )
     model, _ = _model([response])
 
     with pytest.raises(ProviderError):
@@ -537,9 +539,7 @@ def test_non_normal_stop_reason_raises_provider_error(stop_reason):
 
 
 def test_missing_stop_reason_raises_provider_error():
-    response = types.SimpleNamespace(
-        content=[_text_block("partial")], usage=None
-    )
+    response = types.SimpleNamespace(content=[_text_block("partial")], usage=None)
     model, _ = _model([response])
 
     with pytest.raises(ProviderError, match="non-normal stop reason"):
@@ -611,7 +611,11 @@ def test_thinking_plus_tool_use_replayed_on_next_turn():
     assistant = sent[1]
     assert assistant["role"] == "assistant"
     blocks = assistant["content"]
-    assert blocks[0] == {"type": "thinking", "thinking": thinking, "signature": signature}
+    assert blocks[0] == {
+        "type": "thinking",
+        "thinking": thinking,
+        "signature": signature,
+    }
     assert blocks[1] == {
         "type": "tool_use",
         "id": "c1",
@@ -663,7 +667,13 @@ def test_redacted_thinking_accepted_and_replayed_unchanged():
             "role": "tool",
             "call_id": "c2",
             "name": "shell",
-            "result": {"stdout": "uid=0", "stderr": "", "exit_code": 0, "timed_out": False, "truncated": False},
+            "result": {
+                "stdout": "uid=0",
+                "stderr": "",
+                "exit_code": 0,
+                "timed_out": False,
+                "truncated": False,
+            },
         },
     ]
     model.generate(history, TOOL_DEFINITIONS)
@@ -705,7 +715,11 @@ def test_thinking_text_tool_use_replay_preserves_order_and_text():
     model.generate(history, TOOL_DEFINITIONS)
 
     blocks = msgs.calls[1]["messages"][1]["content"]
-    assert blocks[0] == {"type": "thinking", "thinking": thinking, "signature": signature}
+    assert blocks[0] == {
+        "type": "thinking",
+        "thinking": thinking,
+        "signature": signature,
+    }
     assert blocks[1] == {"type": "text", "text": "progress"}
     assert blocks[2]["type"] == "tool_use"
 
@@ -751,14 +765,79 @@ def test_max_tokens_is_truncated_and_does_not_execute_partial_tool_call():
     assert "c1" not in _json.dumps(result.to_dict())
 
 
+def test_model_context_window_exceeded_is_truncated_with_partial_text_usage_and_no_tool_calls():
+    response = _response(
+        content=[_text_block("partial context")],
+        usage=types.SimpleNamespace(input_tokens=10, output_tokens=20),
+        stop_reason="model_context_window_exceeded",
+    )
+    model, _ = _model([response])
+
+    result = model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+    assert isinstance(result, ModelResponse)
+    assert result.truncated is True
+    assert result.content == "partial context"
+    assert result.tool_calls == ()
+    assert result.usage == {"input_tokens": 10, "output_tokens": 20}
+    assert result.to_dict()["truncated"] is True
+
+
+def test_model_context_window_exceeded_suppresses_tool_use_and_prevents_replay():
+    truncated = _response(
+        content=[
+            _text_block("partial"),
+            _tool_use_block("c1", "shell", {"command": "ls"}),
+            _tool_use_block("c2", "submit_flag", {"candidate": "Flag{x}"}),
+        ],
+        usage=types.SimpleNamespace(input_tokens=2, output_tokens=3),
+        stop_reason="model_context_window_exceeded",
+    )
+    follow = _response(content=[_text_block("done")])
+    model, msgs = _model([truncated, follow])
+
+    result = model.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS)
+
+    assert result.truncated is True
+    assert result.content == "partial"
+    assert result.tool_calls == ()
+    assert "c1" not in json.dumps(result.to_dict())
+    assert "c2" not in json.dumps(result.to_dict())
+    assert len(model._thinking_history) == 1
+    assert model._thinking_history[0] == []
+
+    history = [
+        {"role": "user", "content": "hi"},
+        {
+            "role": "assistant",
+            "content": result.content,
+            "tool_calls": [],
+        },
+        {"role": "tool", "call_id": "c1", "name": "shell", "result": "ok"},
+    ]
+    model.generate(history, TOOL_DEFINITIONS)
+
+    assistant_blocks = msgs.calls[1]["messages"][1]["content"]
+    assert not any(
+        b.get("type") == "tool_use" and b.get("id") in {"c1", "c2"}
+        for b in assistant_blocks
+    )
+
+
 def test_normal_responses_are_not_truncated():
     end_turn = _response(content=[_text_block("done")], stop_reason="end_turn")
     model1, _ = _model([end_turn])
-    assert model1.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS).truncated is False
+    assert (
+        model1.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS).truncated
+        is False
+    )
 
     tool_use = _response(
         content=[_tool_use_block("c1", "shell", {"command": "ls"})],
         stop_reason="tool_use",
     )
     model2, _ = _model([tool_use])
-    assert model2.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS).truncated is False
+    assert (
+        model2.generate([{"role": "user", "content": "hi"}], TOOL_DEFINITIONS).truncated
+        is False
+    )
