@@ -5,6 +5,7 @@ import os
 import shutil
 import stat
 import tempfile
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -588,15 +589,58 @@ class AgentLoop:
             if self._model_calls >= self.limits.max_model_turns:
                 return "unsolved", "model_turn_limit", []
             self._model_calls += 1
+            remaining = self._remaining()
+            if remaining <= 0:
+                return "unsolved", "wall_limit", []
             try:
                 set_remaining = getattr(self.model, "set_remaining", None)
                 if set_remaining is not None:
-                    set_remaining(self._remaining())
-                response = self.model.generate(self.messages, TOOL_DEFINITIONS)
+                    set_remaining(remaining)
             except Exception:
+                pass
+            # Run generate in an owned joinable worker so the absolute wall
+            # deadline remains authoritative. First terminal condition wins:
+            # if the deadline expires first, we interrupt the request-owned
+            # transport, join within bounded grace, discard any late result,
+            # and return wall_limit.
+            _result: dict[str, Any] = {}
+
+            def _target() -> None:
+                try:
+                    _result["response"] = self.model.generate(
+                        self.messages, TOOL_DEFINITIONS
+                    )
+                except BaseException as exc:
+                    _result["exc"] = exc
+
+            worker = threading.Thread(target=_target, daemon=False)
+            worker.start()
+            deadline = self._deadline
+            wait = deadline - self.monotonic()
+            if wait > 0:
+                worker.join(timeout=wait)
+            if worker.is_alive():
+                # Absolute deadline won first — interrupt request-owned socket.
+                abort = getattr(self.model, "abort_request", None)
+                if abort is None:
+                    abort = getattr(self.model, "abort", None)
+                if callable(abort):
+                    with contextlib.suppress(Exception):
+                        abort()
+                # Bounded cleanup grace. Worker is not daemon, so run does
+                # not return until it is joined or the grace expires.
+                worker.join(timeout=3.0)
+                return "unsolved", "wall_limit", []
+            # Worker finished before the join deadline. Preserve existing
+            # post-response wall contract: even if monotonic now shows wall
+            # expiry (clock advanced inside the worker, e.g. legacy test
+            # doubles that mutate the fake clock), record usage/response
+            # evidence before returning wall_limit and discarding dispatch.
+            if "exc" in _result:
                 if self._expired():
                     return "unsolved", "wall_limit", []
                 return self._error("provider_error", "model")
+            response = _result.get("response")
             if not isinstance(response, ModelResponse):
                 if self._expired():
                     return "unsolved", "wall_limit", []
