@@ -196,7 +196,6 @@ def _parse_chat_response(response: Any) -> ModelResponse:
 
 
 @dataclass
-@dataclass
 class ChatCompletionsModel:
     model: str
     api_key: str = field(repr=False)

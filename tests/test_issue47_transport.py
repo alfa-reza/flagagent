@@ -1,27 +1,23 @@
-"""Issue #47 transport regressions: real SDK clients against local stub
-HTTP servers.
+"""Issue #47 transport regressions: real SDK clients via supervised process.
 
 Matrix (3 adapters x 2 stall phases):
 
 - ``ChatCompletionsModel`` / ``ResponsesModel`` / ``AnthropicMessagesModel``
-  are constructed exactly as production does (``api_key`` + ``base_url``),
-  so the budget-bounded isolated ``httpx2``/``httpx`` client with socket
-  capture is exercised.
-- Body drip: valid provider JSON is streamed 15 bytes per 0.5 s so the full
-  body takes far longer than the Run wall budget.
-- Header stall: the server accepts the POST but waits before sending
-  response headers.
+  are constructed as production does (``api_key`` + ``base_url``), so a real
+  SDK request is issued from the supervised child process.
+- Body drip: valid provider JSON is streamed 15 bytes per 0.5 s so the body
+  takes far longer than the Run wall budget.
+- Header stall: the server accepts the POST but delays response headers.
 
 For every combination the loop must return ``unsolved:wall_limit`` near the
 wall (well before the stub would finish), record no tool_call evidence, and
-the stub server must observe the abort-induced disconnect.  Two additional
-tests pin the public ``get_extra_info("socket")`` capture surface on the
-pinned httpx2/httpx versions and fail clearly if it disappears, plus one
-control matrix proving each stub payload parses into a normal
-:class:`ModelResponse` when delivered immediately.
+the stub server must observe disconnect because the provider child process
+dies/closes its socket.  The parent ``AgentLoop`` owns the absolute wall
+deadline and kills/verifies the provider child; SDK ``timeout=remaining`` /
+``max_retries=0`` is defense in depth only.
 
-These tests are deterministic, use only loopback networking, and require no
-Docker marker.
+Control matrix proves each stub payload parses into a normal ``ModelResponse``
+when delivered immediately without stall/drip.
 """
 
 import json
@@ -161,7 +157,6 @@ class _StubProviderHandler(BaseHTTPRequestHandler):
                 self.wfile.flush()
                 time.sleep(DRIP_INTERVAL_SECONDS)
         except OSError:
-            # The abort shutdown surfaces here as broken pipe / reset.
             state.disconnect.set()
 
     def _stall_before_headers(self):
@@ -172,8 +167,6 @@ class _StubProviderHandler(BaseHTTPRequestHandler):
             if readable:
                 try:
                     if connection.recv(1, socket.MSG_PEEK) == b"":
-                        # Client aborted: FIN observed while we still hold
-                        # the response headers back.
                         self.server.state.disconnect.set()
                 except OSError:
                     self.server.state.disconnect.set()
@@ -222,9 +215,6 @@ def make_loop(tmp_path, model, wall=WALL_SECONDS):
 
 
 def make_adapter(cls, base_url):
-    """Production-style construction: no injected client, so the adapter
-    builds its own SDK client and the budget-bounded isolated transport is
-    exercised."""
     return cls(model="test-model", api_key="sk-test", base_url=base_url)
 
 
@@ -238,9 +228,9 @@ def assert_wall_limit_outcome(loop, result, executor):
 
 @pytest.mark.parametrize(("name", "cls", "payload"), ADAPTERS, ids=ADAPTER_IDS)
 def test_drip_body_deadline_wins(tmp_path, stub_provider, name, cls, payload):
-    """A slowly dripping response body must lose to the wall deadline: the
-    request arrives, the loop returns wall_limit near the wall with no tool
-    execution, and the server observes the abort disconnect."""
+    """A slowly dripping body must lose to the absolute Run deadline: the
+    provider child is killed, wall_limit wins, and the server observes
+    disconnect because the child's socket is closed."""
     stub_provider.mode = "drip"
     stub_provider.payload = payload
     base_url = f"http://127.0.0.1:{stub_provider.server_address[1]}"
@@ -250,15 +240,13 @@ def test_drip_body_deadline_wins(tmp_path, stub_provider, name, cls, payload):
     result = loop.run()
     assert stub_provider.state.requests == 1
     assert_wall_limit_outcome(loop, result, executor)
-    # server must have observed the abort-induced disconnect (broken pipe)
     assert stub_provider.state.disconnect.wait(timeout=5.0)
 
 
 @pytest.mark.parametrize(("name", "cls", "payload"), ADAPTERS, ids=ADAPTER_IDS)
 def test_header_stall_deadline_wins(tmp_path, stub_provider, name, cls, payload):
-    """A header stall (server accepts POST but delays headers) must lose to the
-    wall: the connection is established, the abort shuts the socket, and the
-    loop returns wall_limit before the stalled server would respond."""
+    """A header stall must lose to the absolute Run wall: the provider child
+    is killed and wall_limit wins even though the server still holds headers."""
     stub_provider.mode = "stall"
     stub_provider.payload = payload
     base_url = f"http://127.0.0.1:{stub_provider.server_address[1]}"
@@ -266,7 +254,6 @@ def test_header_stall_deadline_wins(tmp_path, stub_provider, name, cls, payload)
     loop = make_loop(tmp_path, model)
     executor = loop.executor  # type: ignore[attr-defined]
     result = loop.run()
-    # With process spawn, wall may win before TCP connect under parallel load
     assert stub_provider.state.requests in (0, 1)
     assert_wall_limit_outcome(loop, result, executor)
     if stub_provider.state.requests == 1:
@@ -275,8 +262,7 @@ def test_header_stall_deadline_wins(tmp_path, stub_provider, name, cls, payload)
 
 @pytest.mark.parametrize(("name", "cls", "payload"), ADAPTERS, ids=ADAPTER_IDS)
 def test_ok_payload_still_parses(tmp_path, stub_provider, name, cls, payload):
-    """Control: when the stub responds immediately, each payload still parses
-    into a normal ModelResponse and the loop ends model_stop."""
+    """Control: immediate stub response parses into a normal ModelResponse."""
     stub_provider.mode = "ok"
     stub_provider.payload = payload
     base_url = f"http://127.0.0.1:{stub_provider.server_address[1]}"
@@ -285,8 +271,3 @@ def test_ok_payload_still_parses(tmp_path, stub_provider, name, cls, payload):
     result = loop.run()
     assert result["status:reason"] == "unsolved:model_stop"
     assert result["model_calls"] == 1
-
-
-# Removed: get_extra_info socket pin tests were tied to the old
-# thread/socket abort machinery. The process boundary is now the
-# authoritative deadline enforcement.

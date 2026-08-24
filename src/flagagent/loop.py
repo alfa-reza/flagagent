@@ -7,6 +7,7 @@ import os
 import shutil
 import stat
 import tempfile
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -545,10 +546,9 @@ class AgentLoop:
         )
         self._started = self.monotonic()
         self._deadline = self._started + self.limits.wall_timeout_seconds
-        # One persistent provider child per Run — start eagerly so the first
-        # model turn does not pay spawn overhead against the wall budget.
-        # Spawn context "spawn" requires this to run outside __main__ import;
-        # pytest and normal CLI satisfy that (AgentLoop.run is not top-level).
+        # One persistent provider child per Run. Child spawn occurs inside Run
+        # wall accounting (after _started/_deadline) and is supervised by the
+        # absolute deadline via process termination if the Run expires.
         if self._uses_provider_process():
             with contextlib.suppress(Exception):
                 self._ensure_provider_process()
@@ -634,66 +634,157 @@ class AgentLoop:
         )
         self._provider_process = ProviderProcess(cfg)
 
-    def _call_provider_via_process(
-        self, remaining: float
-    ) -> tuple[str, dict[str, Any]] | None:
-        """Send generate to persistent child, wait on deadline, or kill.
-
-        Returns (kind, payload) for response/provider_error/worker_error, or
-        None if the absolute deadline won and the child has been killed.
-        First terminal condition wins: if deadline reached, deadline wins even
-        if a response became readable at the same time.
-        """
-        self._ensure_provider_process()
-        proc = self._provider_process
-
-        # Use monotonic absolute deadline, not remaining recompute.
-        conn = proc.conn
-        try:
-            with contextlib.suppress(Exception):
-                conn.send(
-                    {
-                        "type": "generate",
-                        "messages": list(self.messages),
-                        "tools": list(TOOL_DEFINITIONS),
-                        "remaining": float(remaining),
-                    }
-                )
-        except Exception:
-            # Pipe broken → child dead before deadline.
-            return ("worker_error", {"error": "pipe_send"})
-
+    def _wait_for_ready(self, proc) -> bool:
         deadline = self._deadline
+        if self.monotonic() >= deadline:
+            with contextlib.suppress(Exception):
+                self._terminate_for_deadline(proc)
+            return False
+        if getattr(proc, "_ready", False):
+            return True
+        resp = proc.response_rx
+        sentinel = proc.proc.sentinel
         while True:
             now = self.monotonic()
             wait = deadline - now
             if wait <= 0:
-                # Absolute deadline won.
-                self._kill_provider_process(proc)
+                with contextlib.suppress(Exception):
+                    self._terminate_for_deadline(proc)
+                return False
+            try:
+                ready = multiprocessing.connection.wait([resp, sentinel], timeout=wait)
+            except Exception:
+                ready = []
+            if self.monotonic() >= deadline:
+                with contextlib.suppress(Exception):
+                    self._terminate_for_deadline(proc)
+                return False
+            if not ready:
+                continue
+            if sentinel in ready:
+                return False
+            if resp in ready:
+                try:
+                    msg = resp.recv()
+                except Exception:
+                    return False
+                if isinstance(msg, dict) and msg.get("type") == "ready":
+                    proc._ready = True  # type: ignore[attr-defined]
+                    return True
+                if isinstance(msg, dict) and msg.get("type") == "worker_error":
+                    return False
+                return False
+
+    def _terminate_for_deadline(self, proc) -> None:
+        alive_before = False
+        try:
+            proc.terminate_for_deadline()
+        finally:
+            try:
+                alive_before = bool(proc.is_alive() or proc.exitcode is None)
+            except Exception:
+                alive_before = True
+            if getattr(self, "_provider_process", None) is proc and not alive_before:
+                self._provider_process = None
+
+    def _call_provider_via_process(
+        self, remaining: float
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Send generate to persistent child under absolute deadline supervision."""
+        self._ensure_provider_process()
+        proc = self._provider_process
+        if not self._wait_for_ready(proc):
+            if self.monotonic() >= self._deadline:
                 return None
-            # Prefer blocking on readiness rather than polling.
+            return ("worker_error", {"error": "child_init_failed"})
+
+        deadline = self._deadline
+        payload = {
+            "type": "generate",
+            "messages": list(self.messages),
+            "tools": list(TOOL_DEFINITIONS),
+            "remaining": float(remaining),
+        }
+        send_done = threading.Event()
+        send_error: dict[str, Exception] = {}
+
+        def _do_send() -> None:
+            try:
+                proc.request_tx.send(payload)
+            except Exception as exc:
+                send_error["exc"] = exc
+            finally:
+                send_done.set()
+
+        sender = threading.Thread(target=_do_send, daemon=True)
+        sender.start()
+
+        while not send_done.is_set():
+            now = self.monotonic()
+            if now >= deadline:
+                with contextlib.suppress(Exception):
+                    self._terminate_for_deadline(proc)
+                sender.join(timeout=2.0)
+                if sender.is_alive():
+                    sender.join(timeout=1.0)
+                return None
+            if not proc.is_alive():
+                sender.join(timeout=0.5)
+                if send_done.is_set():
+                    break
+                sender.join(timeout=1.0)
+                if "exc" in send_error:
+                    sender.join(timeout=0.5)
+                    if self.monotonic() >= deadline:
+                        with contextlib.suppress(Exception):
+                            self._terminate_for_deadline(proc)
+                        return None
+                    return ("worker_error", {"error": "pipe_send"})
+                continue
+            send_done.wait(timeout=0.02)
+
+        sender.join(timeout=1.0)
+        if sender.is_alive():
+            with contextlib.suppress(Exception):
+                self._terminate_for_deadline(proc)
+            sender.join(timeout=2.0)
+            return None
+        if self.monotonic() >= deadline:
+            with contextlib.suppress(Exception):
+                self._terminate_for_deadline(proc)
+            return None
+        if "exc" in send_error:
+            if self.monotonic() >= deadline:
+                with contextlib.suppress(Exception):
+                    self._terminate_for_deadline(proc)
+                return None
+            return ("worker_error", {"error": "pipe_send"})
+
+        resp_rx = proc.response_rx
+        sentinel = proc.proc.sentinel
+        while True:
+            now = self.monotonic()
+            wait = deadline - now
+            if wait <= 0:
+                with contextlib.suppress(Exception):
+                    self._terminate_for_deadline(proc)
+                return None
             try:
                 ready = multiprocessing.connection.wait(
-                    [conn, proc.proc.sentinel], timeout=wait
+                    [resp_rx, sentinel], timeout=wait
                 )
             except Exception:
                 ready = []
-            # Re-check deadline after wait return — deadline always wins even
-            # if a response became readable at the same time.
             if self.monotonic() >= deadline:
-                self._kill_provider_process(proc)
+                with contextlib.suppress(Exception):
+                    self._terminate_for_deadline(proc)
                 return None
             if not ready:
-                # Timeout with wait >0 but no fd ready → loop to re-check.
-                # This can happen if wait elapsed without ready.
                 continue
-            if proc.proc.sentinel in ready:
-                # Child died without valid response before deadline.
-                # Drain any pending message before classifying.
+            if sentinel in ready:
                 try:
-                    if conn in ready:
-                        # Child may have sent error just before exit; prefer it.
-                        msg = conn.recv()
+                    if resp_rx in ready:
+                        msg = resp_rx.recv()
                         if (
                             isinstance(msg, dict)
                             and msg.get("type") == "provider_error"
@@ -704,11 +795,9 @@ class AgentLoop:
                 except Exception:
                     pass
                 return ("worker_error", {"error": "child_exit"})
-
-            if conn in ready:
-                # Response available before deadline — accept it.
+            if resp_rx in ready:
                 try:
-                    msg = conn.recv()
+                    msg = resp_rx.recv()
                 except EOFError:
                     return ("worker_error", {"error": "eof"})
                 except Exception:
@@ -722,53 +811,24 @@ class AgentLoop:
                     return ("provider_error", msg)
                 if t == "worker_error":
                     return ("worker_error", msg)
+                if t == "ready":
+                    continue
                 return ("worker_error", {"error": f"unknown:{t}"})
-
-    def _kill_provider_process(self, proc) -> None:
-        # Mark result as no longer consumable by discarding pipe after kill.
-        try:
-            # Bounded graceful attempt, then kill.
-            try:
-                proc.conn.send({"type": "close"})
-            except Exception:
-                pass
-            # Small grace for child to exit if it was mid-SDK close.
-            proc.proc.join(timeout=0.4)
-            if proc.proc.is_alive():
-                with contextlib.suppress(Exception):
-                    proc.proc.terminate()
-                proc.proc.join(timeout=0.4)
-            if proc.proc.is_alive():
-                with contextlib.suppress(Exception):
-                    proc.proc.kill()
-                proc.proc.join(timeout=0.4)
-            with contextlib.suppress(Exception):
-                proc.conn.close()
-        except Exception:
-            pass
-        finally:
-            # Do not reuse IPC after kill.
-            try:
-                if getattr(self, "_provider_process", None) is proc:
-                    self._provider_process = None
-            except Exception:
-                pass
-            # Ensure closed flag so next turn creates new child (but Run is
-            # terminal after wall_limit, so this is just for hygiene).
-            with contextlib.suppress(Exception):
-                setattr(proc, "_closed", True)
 
     def _cleanup_provider_process(self) -> None:
         proc = getattr(self, "_provider_process", None)
         if proc is None:
             return
+        still_alive = False
         try:
-            with contextlib.suppress(Exception):
-                proc.conn.send({"type": "close"})
             proc.close()
         except Exception:
             pass
-        finally:
+        try:
+            still_alive = bool(proc.is_alive() or proc.exitcode is None)
+        except Exception:
+            still_alive = True
+        if not still_alive:
             self._provider_process = None
 
     def _cleanup_executor(self) -> None:
