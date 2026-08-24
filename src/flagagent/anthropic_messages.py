@@ -12,11 +12,10 @@ Design constraints (PRD-M2):
 - a fixed explicit ``ANTHROPIC_MAX_TOKENS`` constant is used for v0.1.0;
 - default SDK retry behavior is left in place for standalone use; when
   ``AgentLoop`` sets a Run wall budget via :meth:`set_remaining`, the
-  request is bounded with ``timeout=remaining`` and ``max_retries=0`` which
-  bounds transport phases via SDK timeout; ``AgentLoop`` enforces the
-  absolute Run wall deadline for supported in-flight phases by shutting
-  down the live socket; platform DNS resolution is not bounded by connect
-  timeout; isolated per-request ``httpx`` client pools remain separate;
+  request uses ``timeout=remaining`` and ``max_retries=0`` which bounds
+  transport phases via SDK timeout; ``AgentLoop`` enforces the absolute Run
+  wall deadline by terminating a supervised provider child process; platform
+  DNS resolution is not bounded by connect timeout;
 - client injection (``client=``) supports deterministic tests without a
   dependency-injection framework;
 - malformed provider output raises :class:`ProviderError` rather than
@@ -26,10 +25,7 @@ Design constraints (PRD-M2):
 - API keys and raw exception text are never persisted or logged here.
 """
 
-import contextlib
 import math
-import socket
-import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -39,98 +35,12 @@ from anthropic import Anthropic
 from flagagent.model import ModelResponse, ToolCall
 from flagagent.providers import (
     ProviderError,
-    _capture_to_list,
     _client_for_budget,
     _to_json,
     _usage_field,
 )
 
 ANTHROPIC_MAX_TOKENS = 4096
-
-
-def _build_httpx_isolated_client(
-    budget: float,
-    sockets: list[Any],
-    lock: threading.Lock,
-    abort_flag: Any | None = None,
-) -> Any:
-    """Build isolated httpx.Client that captures live socket.
-
-    Same capture surfaces as OpenAI httpx2 path but via ``httpx`` (Anthropic
-    stack: anthropic 0.122.0 / httpx 0.28.1 / httpcore 1.0.9). Uses public
-    ``get_extra_info("socket")``.
-    """
-    try:
-        import httpx
-        from httpx import Timeout as HttpxTimeout
-    except Exception as error:  # pragma: no cover
-        raise RuntimeError("httpx unavailable") from error
-
-    def _capture(sock: Any) -> None:
-        _capture_to_list(sock, sockets, lock, abort_flag)
-
-    base_transport = httpx.HTTPTransport
-
-    class TracingTransport(base_transport):  # type: ignore[valid-type]
-        def handle_request(self, request: Any) -> Any:  # type: ignore[override]
-            original_trace = request.extensions.get("trace")
-
-            def _trace(name: str, info: dict[str, Any]) -> None:
-                try:
-                    if name.endswith("connect_tcp.complete") or name.endswith(
-                        "connect_unix_socket.complete"
-                    ):
-                        rv = info.get("return_value")
-                        if rv is not None:
-                            try:
-                                sock = rv.get_extra_info("socket")
-                            except Exception:
-                                sock = None
-                            if sock is not None:
-                                _capture(sock)
-                except Exception:
-                    pass
-                if original_trace is not None:
-                    try:
-                        return original_trace(name, info)
-                    except Exception:
-                        pass
-
-            request.extensions["trace"] = _trace
-            return super().handle_request(request)
-
-    def _response_hook(response: Any) -> None:
-        try:
-            stream = None
-            ext = getattr(response, "extensions", None)
-            if isinstance(ext, dict):
-                stream = ext.get("network_stream")
-            else:
-                try:
-                    stream = response.extensions.get("network_stream")  # type: ignore
-                except Exception:
-                    stream = None
-            if stream is not None:
-                try:
-                    sock = stream.get_extra_info("socket")
-                except Exception:
-                    sock = None
-                if sock is not None:
-                    _capture(sock)
-        except Exception:
-            pass
-
-    transport = TracingTransport()
-    try:
-        timeout = HttpxTimeout(budget)
-    except Exception:
-        timeout = budget
-    client = httpx.Client(
-        transport=transport,
-        event_hooks={"response": [_response_hook]},
-        timeout=timeout,
-    )
-    return client
 
 
 def _build_anthropic_client(api_key: str, base_url: str | None) -> Anthropic:
@@ -308,47 +218,18 @@ class AnthropicMessagesModel:
     _thinking_history: list[list[dict[str, Any]]] = field(
         default_factory=list, init=False, repr=False
     )
-    _abort_sockets: list[Any] = field(default_factory=list, init=False, repr=False)
-    _abort_lock: threading.Lock = field(
-        default_factory=threading.Lock, init=False, repr=False
-    )
-    _isolated_http: Any = field(default=None, init=False, repr=False)
-    _abort_requested: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.client is None:
             self.client = _build_anthropic_client(self.api_key, self.base_url)
 
     def set_remaining(self, remaining: float) -> None:
-        """Receive the Run wall-budget remaining (seconds) from ``AgentLoop``.
-
-        When set to a positive value, the next budget-bounded request uses an
-        isolated ``httpx`` client with ``timeout=remaining`` and
-        ``max_retries=0`` which bounds transport phases. AgentLoop enforces
-        the absolute Run wall deadline for supported in-flight phases by
-        shutting down the captured socket; DNS resolution is not bounded by
-        connect timeout. ``AgentLoop`` invokes this via an optional
-        ``getattr`` seam, so models without it (including the M0
-        ``ScriptedModel``) are unaffected.
-        """
         if isinstance(remaining, bool) or not isinstance(remaining, (int, float)):
             raise TypeError("remaining budget must be a number")
         value = float(remaining)
         if not math.isfinite(value):
             raise ValueError("remaining budget must be a finite number")
         self._remaining_budget = value
-        with self._abort_lock:
-            self._abort_sockets.clear()
-            self._abort_requested = False
-
-    def abort_request(self) -> None:
-        """Abort in-flight request by shutting down captured socket(s)."""
-        with self._abort_lock:
-            self._abort_requested = True
-            sockets = list(self._abort_sockets)
-        for sock in sockets:
-            with contextlib.suppress(Exception):
-                sock.shutdown(socket.SHUT_RDWR)
 
     def generate(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
@@ -374,69 +255,16 @@ class AnthropicMessagesModel:
         }
         if system_prompt is not None:
             kwargs["system"] = system_prompt
-        use_isolated = self._remaining_budget is not None and self._remaining_budget > 0
-        isolated_client: Any | None = None
-        if self._remaining_budget is not None and self._remaining_budget <= 0:
-            raise ProviderError("messages request budget exhausted")
-        if use_isolated:
-            is_test_double = type(self.client).__name__ in (
-                "SimpleNamespace",
-                "_WithOptionsClient",
-            ) or not hasattr(self.client, "with_options")
-            if is_test_double:
-                client, extra = _client_for_budget(
-                    self.client,
-                    float(self._remaining_budget),  # type: ignore[arg-type]
-                )
-                kwargs.update(extra)
-            else:
-                # Abort state already reset in set_remaining(); do not clear
-                # it again here — abort after worker.start() must stay latched.
-                isolated_client = None
-                try:
-                    isolated_client = _build_httpx_isolated_client(
-                        float(self._remaining_budget),  # type: ignore[arg-type]
-                        self._abort_sockets,
-                        self._abort_lock,
-                        lambda: self._abort_requested,
-                    )
-                    self._isolated_http = isolated_client
-                    isolated_sdk = Anthropic(
-                        api_key=self.api_key,
-                        base_url=self.base_url,
-                        http_client=isolated_client,
-                        max_retries=0,
-                    )
-                    kwargs["timeout"] = float(self._remaining_budget)  # type: ignore[arg-type]
-                    client = isolated_sdk  # type: ignore[assignment]
-                except Exception as error:
-                    with contextlib.suppress(Exception):
-                        if isolated_client is not None:
-                            isolated_client.close()
-                    self._isolated_http = None
-                    isolated_client = None
-                    if isinstance(error, ProviderError):
-                        raise
-                    raise ProviderError(
-                        "messages isolated transport unavailable"
-                    ) from error
-        else:
-            client = self.client
-            if self._remaining_budget is not None:
-                client, extra = _client_for_budget(
-                    self.client, float(self._remaining_budget)
-                )  # type: ignore[arg-type]
-                kwargs.update(extra)
-
+        client = self.client
+        if self._remaining_budget is not None:
+            if self._remaining_budget <= 0:
+                raise ProviderError("messages request budget exhausted")
+            client, extra = _client_for_budget(self.client, self._remaining_budget)
+            kwargs.update(extra)
         try:
             response = client.messages.create(**kwargs)
         except Exception as error:
             raise ProviderError("messages request failed") from error
-        finally:
-            if isolated_client is not None:
-                with contextlib.suppress(Exception):
-                    isolated_client.close()
-                self._isolated_http = None
         try:
             model_response, thinking_blocks = _parse_anthropic_response(response)
             self._thinking_history.append(thinking_blocks)

@@ -1,11 +1,12 @@
 import contextlib
 import hashlib
 import math
+import multiprocessing
+import multiprocessing.connection
 import os
 import shutil
 import stat
 import tempfile
-import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -362,6 +363,40 @@ class AgentLoop:
         self._output_tokens: int | None = None
         self._source_files: list[tuple[Path, Path]] = []
         self._source_temporary: Any | None = None
+        self._provider_process: Any | None = None
+
+    def _uses_provider_process(self) -> bool:
+        # Only real provider adapters (real SDK client) need a supervised
+        # child so the wall can kill uncooperative work (DNS etc.).
+        # ScriptedModel / injected test doubles (SimpleNamespace client or
+        # _WithOptionsClient wrapper) run inline so tests remain fast and
+        # spawn re-import is not triggered from a __main__ script.
+        try:
+            kind = type(self.model).__name__
+            if kind not in (
+                "ChatCompletionsModel",
+                "ResponsesModel",
+                "AnthropicMessagesModel",
+            ):
+                return False
+            # Injected test doubles use a SimpleNamespace client (or
+            # _WithOptionsClient wrapper around it) — keep them inline.
+            cli = getattr(self.model, "client", None)
+            if cli is not None and type(cli).__name__ in (
+                "SimpleNamespace",
+                "_WithOptionsClient",
+            ):
+                return False
+        except Exception:
+            return False
+        # Real CLI path sets protocol explicitly; otherwise fall back to
+        # adapter class name (direct provider tests with real http).
+        if self.protocol in ("openai-chat", "openai-responses", "anthropic"):
+            return True
+        # Direct adapter construction without protocol (e.g.
+        # test_issue47_transport make_adapter) still uses process for
+        # wall-deadline correctness on real HTTP.
+        return True
 
     def _remaining(self) -> float:
         return max(0.0, self._deadline - self.monotonic())
@@ -510,6 +545,13 @@ class AgentLoop:
         )
         self._started = self.monotonic()
         self._deadline = self._started + self.limits.wall_timeout_seconds
+        # One persistent provider child per Run — start eagerly so the first
+        # model turn does not pay spawn overhead against the wall budget.
+        # Spawn context "spawn" requires this to run outside __main__ import;
+        # pytest and normal CLI satisfy that (AgentLoop.run is not top-level).
+        if self._uses_provider_process():
+            with contextlib.suppress(Exception):
+                self._ensure_provider_process()
         terminal_written = False
         try:
             if source_error is not None:
@@ -541,6 +583,7 @@ class AgentLoop:
             result = self._result("error", "serialization_error")
             self.artifacts.commit_result(result)
         finally:
+            self._cleanup_provider_process()
             self._cleanup_executor()
             self.artifacts.close()
             if self._source_temporary is not None:
@@ -569,6 +612,165 @@ class AgentLoop:
                 return "unsolved", "wall_limit", []
         return self._run_active()
 
+    def _ensure_provider_process(self) -> None:
+        proc = getattr(self, "_provider_process", None)
+        if proc is not None and not getattr(proc, "_closed", False) and proc.is_alive():
+            return
+        from flagagent.provider_process import ProviderConfig, ProviderProcess
+
+        protocol = self.protocol
+        if protocol not in ("openai-chat", "openai-responses", "anthropic"):
+            name = type(self.model).__name__
+            protocol = {
+                "ChatCompletionsModel": "openai-chat",
+                "ResponsesModel": "openai-responses",
+                "AnthropicMessagesModel": "anthropic",
+            }.get(name, "openai-chat")
+        api_key = getattr(self.model, "api_key", "")
+        base_url = getattr(self.model, "base_url", None)
+        model_name = getattr(self.model, "model", "")
+        cfg = ProviderConfig(
+            protocol=protocol, model=model_name, api_key=api_key, base_url=base_url
+        )
+        self._provider_process = ProviderProcess(cfg)
+
+    def _call_provider_via_process(
+        self, remaining: float
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Send generate to persistent child, wait on deadline, or kill.
+
+        Returns (kind, payload) for response/provider_error/worker_error, or
+        None if the absolute deadline won and the child has been killed.
+        First terminal condition wins: if deadline reached, deadline wins even
+        if a response became readable at the same time.
+        """
+        self._ensure_provider_process()
+        proc = self._provider_process
+
+        # Use monotonic absolute deadline, not remaining recompute.
+        conn = proc.conn
+        try:
+            with contextlib.suppress(Exception):
+                conn.send(
+                    {
+                        "type": "generate",
+                        "messages": list(self.messages),
+                        "tools": list(TOOL_DEFINITIONS),
+                        "remaining": float(remaining),
+                    }
+                )
+        except Exception:
+            # Pipe broken → child dead before deadline.
+            return ("worker_error", {"error": "pipe_send"})
+
+        deadline = self._deadline
+        while True:
+            now = self.monotonic()
+            wait = deadline - now
+            if wait <= 0:
+                # Absolute deadline won.
+                self._kill_provider_process(proc)
+                return None
+            # Prefer blocking on readiness rather than polling.
+            try:
+                ready = multiprocessing.connection.wait(
+                    [conn, proc.proc.sentinel], timeout=wait
+                )
+            except Exception:
+                ready = []
+            # Re-check deadline after wait return — deadline always wins even
+            # if a response became readable at the same time.
+            if self.monotonic() >= deadline:
+                self._kill_provider_process(proc)
+                return None
+            if not ready:
+                # Timeout with wait >0 but no fd ready → loop to re-check.
+                # This can happen if wait elapsed without ready.
+                continue
+            if proc.proc.sentinel in ready:
+                # Child died without valid response before deadline.
+                # Drain any pending message before classifying.
+                try:
+                    if conn in ready:
+                        # Child may have sent error just before exit; prefer it.
+                        msg = conn.recv()
+                        if (
+                            isinstance(msg, dict)
+                            and msg.get("type") == "provider_error"
+                        ):
+                            return ("provider_error", msg)
+                        if isinstance(msg, dict) and msg.get("type") == "worker_error":
+                            return ("worker_error", msg)
+                except Exception:
+                    pass
+                return ("worker_error", {"error": "child_exit"})
+
+            if conn in ready:
+                # Response available before deadline — accept it.
+                try:
+                    msg = conn.recv()
+                except EOFError:
+                    return ("worker_error", {"error": "eof"})
+                except Exception:
+                    return ("worker_error", {"error": "recv"})
+                if not isinstance(msg, dict):
+                    return ("worker_error", {"error": "bad_msg"})
+                t = msg.get("type")
+                if t == "response":
+                    return ("response", msg.get("response") or {})
+                if t == "provider_error":
+                    return ("provider_error", msg)
+                if t == "worker_error":
+                    return ("worker_error", msg)
+                return ("worker_error", {"error": f"unknown:{t}"})
+
+    def _kill_provider_process(self, proc) -> None:
+        # Mark result as no longer consumable by discarding pipe after kill.
+        try:
+            # Bounded graceful attempt, then kill.
+            try:
+                proc.conn.send({"type": "close"})
+            except Exception:
+                pass
+            # Small grace for child to exit if it was mid-SDK close.
+            proc.proc.join(timeout=0.4)
+            if proc.proc.is_alive():
+                with contextlib.suppress(Exception):
+                    proc.proc.terminate()
+                proc.proc.join(timeout=0.4)
+            if proc.proc.is_alive():
+                with contextlib.suppress(Exception):
+                    proc.proc.kill()
+                proc.proc.join(timeout=0.4)
+            with contextlib.suppress(Exception):
+                proc.conn.close()
+        except Exception:
+            pass
+        finally:
+            # Do not reuse IPC after kill.
+            try:
+                if getattr(self, "_provider_process", None) is proc:
+                    self._provider_process = None
+            except Exception:
+                pass
+            # Ensure closed flag so next turn creates new child (but Run is
+            # terminal after wall_limit, so this is just for hygiene).
+            with contextlib.suppress(Exception):
+                setattr(proc, "_closed", True)
+
+    def _cleanup_provider_process(self) -> None:
+        proc = getattr(self, "_provider_process", None)
+        if proc is None:
+            return
+        try:
+            with contextlib.suppress(Exception):
+                proc.conn.send({"type": "close"})
+            proc.close()
+        except Exception:
+            pass
+        finally:
+            self._provider_process = None
+
     def _cleanup_executor(self) -> None:
         cleanup = getattr(self.executor, "cleanup", None)
         if cleanup is None:
@@ -592,59 +794,91 @@ class AgentLoop:
             remaining = self._remaining()
             if remaining <= 0:
                 return "unsolved", "wall_limit", []
+            # Keep provider SDK timeout based on remaining budget (defense in depth).
             try:
-                set_remaining = getattr(self.model, "set_remaining", None)
-                if set_remaining is not None:
-                    set_remaining(remaining)
+                setter = getattr(self.model, "set_remaining", None)
+                if callable(setter):
+                    setter(float(remaining))
             except Exception:
                 pass
-            # Run generate in an owned joinable worker so the absolute wall
-            # deadline remains authoritative. First terminal condition wins:
-            # if the deadline expires first, we interrupt the request-owned
-            # transport, join within bounded grace, discard any late result,
-            # and return wall_limit.
-            _result: dict[str, Any] = {}
-
-            def _target() -> None:
+            if self._uses_provider_process():
+                outcome = self._call_provider_via_process(remaining)
+                # None means deadline won; status already wall_limit path.
+                if outcome is None:
+                    return "unsolved", "wall_limit", []
+                kind, payload = outcome
+                if kind == "provider_error":
+                    if self._expired():
+                        return "unsolved", "wall_limit", []
+                    return self._error("provider_error", "model")
+                if kind == "worker_error":
+                    if self._expired():
+                        return "unsolved", "wall_limit", []
+                    return self._error("provider_error", "model")
+                # kind == "response": reconstruct ModelResponse
                 try:
-                    _result["response"] = self.model.generate(
-                        self.messages, TOOL_DEFINITIONS
-                    )
-                except BaseException as exc:
-                    _result["exc"] = exc
+                    # payload is ModelResponse dict
+                    from flagagent.model import ToolCall as _ToolCall
 
-            worker = threading.Thread(target=_target, daemon=False)
-            worker.start()
-            deadline = self._deadline
-            wait = deadline - self.monotonic()
-            if wait > 0:
-                worker.join(timeout=wait)
-            if worker.is_alive():
-                # Absolute deadline won first — interrupt request-owned socket.
-                abort = getattr(self.model, "abort_request", None)
-                if abort is None:
-                    abort = getattr(self.model, "abort", None)
-                if callable(abort):
-                    with contextlib.suppress(Exception):
-                        abort()
-                # Bounded cleanup grace. Worker is not daemon, so run does
-                # not return until it is joined or the grace expires.
-                worker.join(timeout=3.0)
-                return "unsolved", "wall_limit", []
-            # Worker finished before the join deadline. Preserve existing
-            # post-response wall contract: even if monotonic now shows wall
-            # expiry (clock advanced inside the worker, e.g. legacy test
-            # doubles that mutate the fake clock), record usage/response
-            # evidence before returning wall_limit and discarding dispatch.
-            if "exc" in _result:
-                if self._expired():
+                    tcs = tuple(
+                        _ToolCall(
+                            call_id=item["call_id"],
+                            name=item["name"],
+                            arguments=item["arguments"],
+                        )
+                        for item in (payload.get("tool_calls") or [])
+                    )
+                    response = ModelResponse(
+                        content=payload.get("content") or "",
+                        tool_calls=tcs,
+                        usage=payload.get("usage"),
+                        truncated=bool(payload.get("truncated")),
+                    )
+                except Exception:
+                    if self._expired():
+                        return "unsolved", "wall_limit", []
+                    return self._error("provider_error", "model")
+            else:
+                # Non-provider path (ScriptedModel / test doubles) — keep
+                # synchronous inline execution without process overhead.
+                # Still bound by thread + abort for deadline tests that use
+                # BlockingModel etc. Reuse previous thread supervision inline.
+                import threading
+
+                _result: dict[str, Any] = {}
+
+                def _target() -> None:
+                    try:
+                        _result["response"] = self.model.generate(
+                            self.messages, TOOL_DEFINITIONS
+                        )
+                    except BaseException as exc:  # noqa: BLE001
+                        _result["exc"] = exc
+
+                worker = threading.Thread(target=_target, daemon=False)
+                worker.start()
+                deadline = self._deadline
+                wait = deadline - self.monotonic()
+                if wait > 0:
+                    worker.join(timeout=wait)
+                if worker.is_alive():
+                    abort = getattr(self.model, "abort_request", None)
+                    if abort is None:
+                        abort = getattr(self.model, "abort", None)
+                    if callable(abort):
+                        with contextlib.suppress(Exception):
+                            abort()
+                    worker.join(timeout=3.0)
                     return "unsolved", "wall_limit", []
-                return self._error("provider_error", "model")
-            response = _result.get("response")
-            if not isinstance(response, ModelResponse):
-                if self._expired():
-                    return "unsolved", "wall_limit", []
-                return self._error("provider_error", "model")
+                if "exc" in _result:
+                    if self._expired():
+                        return "unsolved", "wall_limit", []
+                    return self._error("provider_error", "model")
+                response = _result.get("response")
+                if not isinstance(response, ModelResponse):
+                    if self._expired():
+                        return "unsolved", "wall_limit", []
+                    return self._error("provider_error", "model")
             self._add_usage(response.usage)
             duplicate = self._duplicate_id(response)
             accepted = duplicate is None

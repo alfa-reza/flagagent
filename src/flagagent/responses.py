@@ -21,11 +21,10 @@ Design constraints mirror :class:`ChatCompletionsModel`:
 - official ``openai`` SDK, non-streaming ``client.responses.create``;
 - default SDK retry behavior is left in place for standalone use; when
   ``AgentLoop`` sets a Run wall budget via :meth:`set_remaining`, the
-  request is bounded with ``timeout=remaining`` and ``max_retries=0`` which
-  bounds transport phases via SDK timeout; ``AgentLoop`` enforces the
-  absolute Run wall deadline for supported in-flight phases by shutting
-  down the live socket; platform DNS resolution is not bounded by connect
-  timeout; isolated per-request ``httpx2`` client pools remain separate;
+  request uses ``timeout=remaining`` and ``max_retries=0`` which bounds
+  transport phases via SDK timeout; ``AgentLoop`` enforces the absolute Run
+  wall deadline by terminating a supervised provider child process; platform
+  DNS resolution is not bounded by connect timeout;
 - client injection (``client=``) supports deterministic tests;
 - malformed provider output raises :class:`ProviderError` rather than
   fabricating tool calls or leaking ``AttributeError``/``TypeError``/
@@ -34,11 +33,8 @@ Design constraints mirror :class:`ChatCompletionsModel`:
 - API keys and raw exception text are never persisted or logged here.
 """
 
-import contextlib
 import json
 import math
-import socket
-import threading
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
@@ -47,7 +43,6 @@ from flagagent.model import ModelResponse, ToolCall
 from flagagent.providers import (
     ProviderError,
     _build_client,
-    _build_httpx2_isolated_client,
     _client_for_budget,
     _to_json,
     _usage_field,
@@ -204,47 +199,18 @@ class ResponsesModel:
         default_factory=list, init=False, repr=False
     )
     _processed_count: int = field(default=0, init=False, repr=False)
-    _abort_sockets: list[Any] = field(default_factory=list, init=False, repr=False)
-    _abort_lock: threading.Lock = field(
-        default_factory=threading.Lock, init=False, repr=False
-    )
-    _isolated_http: Any = field(default=None, init=False, repr=False)
-    _abort_requested: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.client is None:
             self.client = _build_client(self.api_key, self.base_url)
 
     def set_remaining(self, remaining: float) -> None:
-        """Receive the Run wall-budget remaining (seconds) from ``AgentLoop``.
-
-        When set to a positive value, the next budget-bounded request uses an
-        isolated ``httpx2`` client with ``timeout=remaining`` and
-        ``max_retries=0`` which bounds transport phases. AgentLoop enforces
-        the absolute Run wall deadline for supported in-flight phases by
-        shutting down the captured socket; DNS resolution is not bounded by
-        connect timeout. ``AgentLoop`` invokes this via an optional
-        ``getattr`` seam, so models without it (including the M0
-        ``ScriptedModel``) are unaffected.
-        """
         if isinstance(remaining, bool) or not isinstance(remaining, (int, float)):
             raise TypeError("remaining budget must be a number")
         value = float(remaining)
         if not math.isfinite(value):
             raise ValueError("remaining budget must be a finite number")
         self._remaining_budget = value
-        with self._abort_lock:
-            self._abort_sockets.clear()
-            self._abort_requested = False
-
-    def abort_request(self) -> None:
-        """Abort in-flight request by shutting down captured socket(s)."""
-        with self._abort_lock:
-            self._abort_requested = True
-            sockets = list(self._abort_sockets)
-        for sock in sockets:
-            with contextlib.suppress(Exception):
-                sock.shutdown(socket.SHUT_RDWR)
 
     def generate(
         self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]
@@ -291,68 +257,14 @@ class ResponsesModel:
         }
         if instructions is not None:
             kwargs["instructions"] = instructions
-        use_isolated = self._remaining_budget is not None and self._remaining_budget > 0
-        isolated_client: Any | None = None
-        if self._remaining_budget is not None and self._remaining_budget <= 0:
-            # already raised at top; kept only to narrow use_isolated above
-            pass
-        if use_isolated:
-            # Abort state already reset in set_remaining(); do not clear it
-            # again here so an abort issued after worker.start() is preserved.
-            if type(self.client).__name__ == "SimpleNamespace":
-                client, extra = _client_for_budget(
-                    self.client,
-                    float(self._remaining_budget),  # type: ignore[arg-type]
-                )
-                kwargs.update(extra)
-            else:
-                isolated_client = None
-                try:
-                    isolated_client = _build_httpx2_isolated_client(
-                        float(self._remaining_budget),  # type: ignore[arg-type]
-                        self._abort_sockets,
-                        self._abort_lock,
-                        lambda: self._abort_requested,
-                    )
-                    self._isolated_http = isolated_client
-                    from openai import OpenAI
-
-                    isolated_sdk = OpenAI(
-                        api_key=self.api_key,
-                        base_url=self.base_url,
-                        http_client=isolated_client,
-                        max_retries=0,
-                    )
-                    kwargs["timeout"] = float(self._remaining_budget)  # type: ignore[arg-type]
-                    client = isolated_sdk  # type: ignore[assignment]
-                except Exception as error:
-                    with contextlib.suppress(Exception):
-                        if isolated_client is not None:
-                            isolated_client.close()
-                    self._isolated_http = None
-                    isolated_client = None
-                    if isinstance(error, ProviderError):
-                        raise
-                    raise ProviderError(
-                        "responses isolated transport unavailable"
-                    ) from error
-        else:
-            client = self.client
-            if self._remaining_budget is not None:
-                client, extra = _client_for_budget(
-                    self.client, float(self._remaining_budget)
-                )  # type: ignore[arg-type]
-                kwargs.update(extra)
-
+        client = self.client
+        if self._remaining_budget is not None:
+            client, extra = _client_for_budget(self.client, self._remaining_budget)
+            kwargs.update(extra)
         try:
             response = client.responses.create(**kwargs)
         except Exception as error:
             raise ProviderError("responses request failed") from error
-        finally:
-            if isolated_client is not None:
-                with contextlib.suppress(Exception):
-                    isolated_client.close()
-                self._isolated_http = None
         try:
             status = getattr(response, "status", None)
             truncated = False

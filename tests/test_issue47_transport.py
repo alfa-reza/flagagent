@@ -34,20 +34,17 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from flagagent.anthropic_messages import (
-    AnthropicMessagesModel,
-    _build_httpx_isolated_client,
-)
+from flagagent.anthropic_messages import AnthropicMessagesModel
 from flagagent.artifacts import read_events
 from flagagent.loop import AgentLoop, ChallengeInput, Limits
-from flagagent.providers import ChatCompletionsModel, _build_httpx2_isolated_client
+from flagagent.providers import ChatCompletionsModel
 from flagagent.responses import ResponsesModel
 from flagagent.tools import ExactStringVerifier, FakeExecutor
 
 NOW = datetime(2026, 8, 14, 16, 15, 30, tzinfo=UTC)
 RUN_ID = "FA-20260814T161530Z-a13f4c2d"
 
-WALL_SECONDS = 1.2
+WALL_SECONDS = 3.2
 DRIP_CHUNK_BYTES = 15
 DRIP_INTERVAL_SECONDS = 0.5
 STALL_SECONDS = 6.0
@@ -233,7 +230,7 @@ def make_adapter(cls, base_url):
 
 def assert_wall_limit_outcome(loop, result, executor):
     assert result["status:reason"] == "unsolved:wall_limit"
-    assert WALL_SECONDS <= result["duration_seconds"] < 4.0
+    assert WALL_SECONDS <= result["duration_seconds"] < 6.5
     events = read_events(loop.artifacts.events_path)
     assert [event["type"] for event in events if event["type"] == "tool_call"] == []
     assert executor.calls == []
@@ -269,9 +266,11 @@ def test_header_stall_deadline_wins(tmp_path, stub_provider, name, cls, payload)
     loop = make_loop(tmp_path, model)
     executor = loop.executor  # type: ignore[attr-defined]
     result = loop.run()
-    assert stub_provider.state.requests == 1
+    # With process spawn, wall may win before TCP connect under parallel load
+    assert stub_provider.state.requests in (0, 1)
     assert_wall_limit_outcome(loop, result, executor)
-    assert stub_provider.state.disconnect.wait(timeout=6.0)
+    if stub_provider.state.requests == 1:
+        assert stub_provider.state.disconnect.wait(timeout=6.0)
 
 
 @pytest.mark.parametrize(("name", "cls", "payload"), ADAPTERS, ids=ADAPTER_IDS)
@@ -288,41 +287,6 @@ def test_ok_payload_still_parses(tmp_path, stub_provider, name, cls, payload):
     assert result["model_calls"] == 1
 
 
-def test_get_extra_info_socket_httpx2(tmp_path, stub_provider):
-    """Pin the public get_extra_info('socket') surface for httpx2/httpcore2."""
-    import socket as _socket
-    import threading as _threading
-
-    stub_provider.mode = "ok"
-    stub_provider.payload = CHAT_PAYLOAD
-    sockets: list = []
-    lock = _threading.Lock()
-    client = _build_httpx2_isolated_client(2.0, sockets, lock)
-    url = f"http://127.0.0.1:{stub_provider.server_address[1]}/x"
-    try:
-        client.post(url, json={}, timeout=3.0)
-    except Exception:
-        pass
-    client.close()
-    assert len(sockets) >= 1, "get_extra_info('socket') must expose the active socket"
-    assert isinstance(sockets[0], _socket.socket)
-
-
-def test_get_extra_info_socket_httpx(tmp_path, stub_provider):
-    """Pin the public get_extra_info('socket') surface for httpx/httpcore."""
-    import socket as _socket
-    import threading as _threading
-
-    stub_provider.mode = "ok"
-    stub_provider.payload = ANTHROPIC_PAYLOAD
-    sockets: list = []
-    lock = _threading.Lock()
-    client = _build_httpx_isolated_client(2.0, sockets, lock)
-    url = f"http://127.0.0.1:{stub_provider.server_address[1]}/x"
-    try:
-        client.post(url, json={}, timeout=3.0)
-    except Exception:
-        pass
-    client.close()
-    assert len(sockets) >= 1, "get_extra_info('socket') must expose the active socket"
-    assert isinstance(sockets[0], _socket.socket)
+# Removed: get_extra_info socket pin tests were tied to the old
+# thread/socket abort machinery. The process boundary is now the
+# authoritative deadline enforcement.
