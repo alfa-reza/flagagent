@@ -233,6 +233,9 @@ class ResponsesModel:
         if not math.isfinite(value):
             raise ValueError("remaining budget must be a finite number")
         self._remaining_budget = value
+        with self._abort_lock:
+            self._abort_sockets.clear()
+            self._abort_requested = False
 
     def abort_request(self) -> None:
         """Abort in-flight request by shutting down captured socket(s)."""
@@ -294,21 +297,17 @@ class ResponsesModel:
             # already raised at top; kept only to narrow use_isolated above
             pass
         if use_isolated:
+            # Abort state already reset in set_remaining(); do not clear it
+            # again here so an abort issued after worker.start() is preserved.
             if type(self.client).__name__ == "SimpleNamespace":
                 client, extra = _client_for_budget(
                     self.client,
                     float(self._remaining_budget),  # type: ignore[arg-type]
                 )
                 kwargs.update(extra)
-                with self._abort_lock:
-                    self._abort_sockets.clear()
-                    self._abort_requested = False
             else:
                 isolated_client = None
                 try:
-                    with self._abort_lock:
-                        self._abort_sockets.clear()
-                        self._abort_requested = False
                     isolated_client = _build_httpx2_isolated_client(
                         float(self._remaining_budget),  # type: ignore[arg-type]
                         self._abort_sockets,

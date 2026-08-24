@@ -232,3 +232,45 @@ def test_anthropic_abort_flag():
         abort_flag=lambda: model._abort_requested,
     )
     assert sock2.shutdown_calls == [socket.SHUT_RDWR]
+
+
+def test_set_remaining_before_worker_abort_not_lost():
+    """Lost-abort race: set_remaining -> worker.start -> abort -> generate
+    must not clear abort. This fails on commit 35740d0."""
+    for ModelCls in (ChatCompletionsModel, ResponsesModel, AnthropicMessagesModel):
+        fake_inner = types.SimpleNamespace(create=lambda **kw: None)
+        if ModelCls is ChatCompletionsModel:
+            client = types.SimpleNamespace(
+                chat=types.SimpleNamespace(completions=fake_inner)
+            )
+        elif ModelCls is ResponsesModel:
+            client = types.SimpleNamespace(responses=fake_inner)
+        else:
+            client = types.SimpleNamespace(messages=fake_inner)
+        model = ModelCls(model="test-model", api_key="sk-test", client=client)
+        # 1. new-request state initialized via set_remaining
+        model.set_remaining(5)
+        # 2. abort requested after worker.start (simulated)
+        model.abort_request()
+        assert model._abort_requested is True
+        # 3. capture happens afterward inside generate
+        sock = _FakeSocket()
+        _capture_to_list(
+            sock,
+            model._abort_sockets,
+            model._abort_lock,
+            abort_flag=lambda: model._abort_requested,
+        )
+        assert sock.shutdown_calls == [socket.SHUT_RDWR]
+        # 4. next request resets state
+        model.set_remaining(5)
+        assert model._abort_requested is False
+        assert model._abort_sockets == []
+        sock2 = _FakeSocket()
+        _capture_to_list(
+            sock2,
+            model._abort_sockets,
+            model._abort_lock,
+            abort_flag=lambda: model._abort_requested,
+        )
+        assert sock2.shutdown_calls == []

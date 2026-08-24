@@ -364,6 +364,9 @@ class ChatCompletionsModel:
         if not math.isfinite(value):
             raise ValueError("remaining budget must be a finite number")
         self._remaining_budget = value
+        with self._abort_lock:
+            self._abort_sockets.clear()
+            self._abort_requested = False
 
     def abort_request(self) -> None:
         """Abort in-flight request by shutting down captured socket(s)."""
@@ -394,21 +397,17 @@ class ChatCompletionsModel:
             raise ProviderError("chat completions request budget exhausted")
         if use_isolated:
             # Explicit test-double detection: allow fallback to _client_for_budget.
+            # Note: per-request abort state was already reset in set_remaining()
+            # before worker.start(), so do not clear it again here.
             if type(self.client).__name__ == "SimpleNamespace":
                 client, extra = _client_for_budget(
                     self.client,
                     float(self._remaining_budget),  # type: ignore[arg-type]
                 )
                 kwargs.update(extra)
-                with self._abort_lock:
-                    self._abort_sockets.clear()
-                    self._abort_requested = False
             else:
                 isolated_client = None
                 try:
-                    with self._abort_lock:
-                        self._abort_sockets.clear()
-                        self._abort_requested = False
                     isolated_client = _build_httpx2_isolated_client(
                         float(self._remaining_budget),  # type: ignore[arg-type]
                         self._abort_sockets,
