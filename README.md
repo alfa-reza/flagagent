@@ -154,6 +154,8 @@ The repository includes two small smoke challenges:
 
 They exercise the harness itself; they are not a benchmark of general CTF capability.
 
+`challenge.json` is bounded to 64 KiB of UTF-8 bytes and is validated before model execution or sandbox preparation; an oversized descriptor is rejected as invalid challenge input.
+
 Challenge source ingestion is bounded before sandbox preparation:
 
 | Limit | Default |

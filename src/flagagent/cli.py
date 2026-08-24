@@ -22,6 +22,8 @@ from flagagent.responses import ResponsesModel
 from flagagent.tools import ExactStringVerifier
 from flagagent.writeup import write_writeup
 
+MAX_CHALLENGE_DESCRIPTOR_BYTES = 64 * 1024
+
 PROTOCOL_NAMES = ("openai-chat", "openai-responses", "anthropic")
 
 
@@ -55,8 +57,17 @@ def load_challenge(root: Path) -> tuple[ChallengeInput, str]:
     if descriptor.is_symlink() or not descriptor.is_file():
         raise ValueError("challenge.json must be a regular file")
     try:
-        payload = json.loads(descriptor.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as error:
+        with descriptor.open("rb") as handle:
+            data = handle.read(MAX_CHALLENGE_DESCRIPTOR_BYTES + 1)
+    except OSError as error:
+        raise ValueError("challenge.json must be valid JSON") from error
+    if len(data) > MAX_CHALLENGE_DESCRIPTOR_BYTES:
+        raise ValueError(
+            f"challenge.json exceeds maximum size of {MAX_CHALLENGE_DESCRIPTOR_BYTES} bytes"
+        )
+    try:
+        payload = json.loads(data.decode("utf-8"))
+    except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ValueError("challenge.json must be valid JSON") from error
     if not isinstance(payload, dict):
         raise TypeError("challenge.json must contain an object")
