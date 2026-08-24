@@ -224,6 +224,15 @@ For `network_mode: local`, FlagAgent creates a run-scoped internal Docker networ
 > [!WARNING]
 > Docker is a containment boundary, not a hardened virtual machine. Containers share the host kernel. Use FlagAgent only with workloads and systems you are authorized to run or test.
 
+## Base images
+
+The project-owned Dockerfiles pin their `FROM` base to an immutable digest:
+
+- `images/sandbox/Dockerfile`: `ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517`
+- `images/target/Dockerfile`: `python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa7036991a2a63c4a`
+
+Digests are multi-architecture image-index digests verified against `docker.io/library/...` via `skopeo inspect` / `docker buildx imagetools inspect`, so the pinned identity preserves the original platform semantics instead of locking to a single architecture. Updating a base image requires changing the digest in version control, rebuilding (`docker build -t flagagent-sandbox:dev images/sandbox` / `docker build -t flagagent-target:dev images/target`), and re-running release tests before committing. Pinning the `FROM` digest removes base-tag drift but does not by itself make the complete final images byte-for-byte reproducible because other build inputs (for example `apt-get update` package repositories) may still be mutable.
+
 ## Development
 
 ```bash
