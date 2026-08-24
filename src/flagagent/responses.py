@@ -209,6 +209,7 @@ class ResponsesModel:
         default_factory=threading.Lock, init=False, repr=False
     )
     _isolated_http: Any = field(default=None, init=False, repr=False)
+    _abort_requested: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.client is None:
@@ -236,6 +237,7 @@ class ResponsesModel:
     def abort_request(self) -> None:
         """Abort in-flight request by shutting down captured socket(s)."""
         with self._abort_lock:
+            self._abort_requested = True
             sockets = list(self._abort_sockets)
         for sock in sockets:
             with contextlib.suppress(Exception):
@@ -292,39 +294,49 @@ class ResponsesModel:
             # already raised at top; kept only to narrow use_isolated above
             pass
         if use_isolated:
-            try:
-                if type(self.client).__name__ == "SimpleNamespace":
-                    raise RuntimeError("test double, skip isolation")
-                with self._abort_lock:
-                    self._abort_sockets.clear()
-                isolated_client = _build_httpx2_isolated_client(
-                    float(self._remaining_budget),  # type: ignore[arg-type]
-                    self._abort_sockets,
-                    self._abort_lock,
-                )
-                self._isolated_http = isolated_client
-                from openai import OpenAI
-
-                isolated_sdk = OpenAI(
-                    api_key=self.api_key,
-                    base_url=self.base_url,
-                    http_client=isolated_client,
-                    max_retries=0,
-                )
-                kwargs["timeout"] = float(self._remaining_budget)  # type: ignore[arg-type]
-                client = isolated_sdk  # type: ignore[assignment]
-            except Exception:
-                with contextlib.suppress(Exception):
-                    if isolated_client is not None:
-                        isolated_client.close()
-                self._isolated_http = None
-                isolated_client = None
+            if type(self.client).__name__ == "SimpleNamespace":
                 client, extra = _client_for_budget(
-                    self.client, float(self._remaining_budget)
-                )  # type: ignore[arg-type]
+                    self.client,
+                    float(self._remaining_budget),  # type: ignore[arg-type]
+                )
                 kwargs.update(extra)
                 with self._abort_lock:
                     self._abort_sockets.clear()
+                    self._abort_requested = False
+            else:
+                isolated_client = None
+                try:
+                    with self._abort_lock:
+                        self._abort_sockets.clear()
+                        self._abort_requested = False
+                    isolated_client = _build_httpx2_isolated_client(
+                        float(self._remaining_budget),  # type: ignore[arg-type]
+                        self._abort_sockets,
+                        self._abort_lock,
+                        lambda: self._abort_requested,
+                    )
+                    self._isolated_http = isolated_client
+                    from openai import OpenAI
+
+                    isolated_sdk = OpenAI(
+                        api_key=self.api_key,
+                        base_url=self.base_url,
+                        http_client=isolated_client,
+                        max_retries=0,
+                    )
+                    kwargs["timeout"] = float(self._remaining_budget)  # type: ignore[arg-type]
+                    client = isolated_sdk  # type: ignore[assignment]
+                except Exception as error:
+                    with contextlib.suppress(Exception):
+                        if isolated_client is not None:
+                            isolated_client.close()
+                    self._isolated_http = None
+                    isolated_client = None
+                    if isinstance(error, ProviderError):
+                        raise
+                    raise ProviderError(
+                        "responses isolated transport unavailable"
+                    ) from error
         else:
             client = self.client
             if self._remaining_budget is not None:

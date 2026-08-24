@@ -45,21 +45,47 @@ from openai import OpenAI
 from flagagent.model import ModelResponse, ToolCall
 
 
-def _capture_to_list(sock: Any, sockets: list[Any], lock: threading.Lock) -> None:
+def _capture_to_list(
+    sock: Any,
+    sockets: list[Any],
+    lock: threading.Lock,
+    abort_flag: Any | None = None,
+) -> None:
     if sock is None:
         return
     # Validate it's a socket-like object with shutdown.
     if not hasattr(sock, "shutdown"):
         return
+    should_shutdown = False
     with lock:
         if sock not in sockets:
             sockets.append(sock)
+        # Check abort already requested under same lock as append.
+        if abort_flag is not None:
+            flag_set = False
+            try:
+                if isinstance(abort_flag, threading.Event):
+                    flag_set = abort_flag.is_set()
+                elif callable(abort_flag):
+                    flag_set = bool(abort_flag())
+                elif isinstance(abort_flag, list):
+                    flag_set = bool(abort_flag[0]) if abort_flag else False
+                else:
+                    flag_set = bool(abort_flag)
+            except Exception:
+                flag_set = False
+            if flag_set:
+                should_shutdown = True
+    if should_shutdown:
+        with contextlib.suppress(Exception):
+            sock.shutdown(socket.SHUT_RDWR)
 
 
 def _build_httpx2_isolated_client(
     budget: float,
     sockets: list[Any],
     lock: threading.Lock,
+    abort_flag: Any | None = None,
 ) -> Any:
     """Build isolated httpx2.Client that captures the live socket.
 
@@ -78,7 +104,7 @@ def _build_httpx2_isolated_client(
         raise RuntimeError("httpx2 unavailable") from error
 
     def _capture(sock: Any) -> None:
-        _capture_to_list(sock, sockets, lock)
+        _capture_to_list(sock, sockets, lock, abort_flag)
 
     # Tracing transport
     base_transport = httpx2.HTTPTransport
@@ -314,6 +340,7 @@ class ChatCompletionsModel:
         default_factory=threading.Lock, init=False, repr=False
     )
     _isolated_http: Any = field(default=None, init=False, repr=False)
+    _abort_requested: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if self.client is None:
@@ -341,6 +368,7 @@ class ChatCompletionsModel:
     def abort_request(self) -> None:
         """Abort in-flight request by shutting down captured socket(s)."""
         with self._abort_lock:
+            self._abort_requested = True
             sockets = list(self._abort_sockets)
         for sock in sockets:
             with contextlib.suppress(Exception):
@@ -365,45 +393,52 @@ class ChatCompletionsModel:
         if self._remaining_budget is not None and self._remaining_budget <= 0:
             raise ProviderError("chat completions request budget exhausted")
         if use_isolated:
-            # Attempt isolated only for real SDK clients; test doubles reuse
-            # SimpleNamespace and won't accept http_client.
-            # fall back to _client_for_budget path.
-            try:
-                if type(self.client).__name__ == "SimpleNamespace":
-                    raise RuntimeError("test double, skip isolation")
-                with self._abort_lock:
-                    self._abort_sockets.clear()
-                isolated_client = _build_httpx2_isolated_client(
-                    float(self._remaining_budget),  # type: ignore[arg-type]
-                    self._abort_sockets,
-                    self._abort_lock,
-                )
-                self._isolated_http = isolated_client
-                # Build SDK client that uses isolated http_client.
-                isolated_sdk = OpenAI(
-                    api_key=self.api_key,
-                    base_url=self.base_url,
-                    http_client=isolated_client,
-                    max_retries=0,
-                )
-                # Per-request timeout bounds transport phases.
-                kwargs["timeout"] = float(self._remaining_budget)  # type: ignore[arg-type]
-                client = isolated_sdk  # type: ignore[assignment]
-            except Exception:
-                # Fallback to previous budget-bounding behavior.
-                with contextlib.suppress(Exception):
-                    if isolated_client is not None:
-                        isolated_client.close()
-                self._isolated_http = None
-                isolated_client = None
-                isolated_sdk = None
+            # Explicit test-double detection: allow fallback to _client_for_budget.
+            if type(self.client).__name__ == "SimpleNamespace":
                 client, extra = _client_for_budget(
-                    self.client, float(self._remaining_budget)
-                )  # type: ignore[arg-type]
+                    self.client,
+                    float(self._remaining_budget),  # type: ignore[arg-type]
+                )
                 kwargs.update(extra)
-                # ensure no stale abort sockets
                 with self._abort_lock:
                     self._abort_sockets.clear()
+                    self._abort_requested = False
+            else:
+                isolated_client = None
+                try:
+                    with self._abort_lock:
+                        self._abort_sockets.clear()
+                        self._abort_requested = False
+                    isolated_client = _build_httpx2_isolated_client(
+                        float(self._remaining_budget),  # type: ignore[arg-type]
+                        self._abort_sockets,
+                        self._abort_lock,
+                        lambda: self._abort_requested,
+                    )
+                    self._isolated_http = isolated_client
+                    # Build SDK client that uses isolated http_client.
+                    isolated_sdk = OpenAI(
+                        api_key=self.api_key,
+                        base_url=self.base_url,
+                        http_client=isolated_client,
+                        max_retries=0,
+                    )
+                    # Per-request timeout bounds transport phases.
+                    kwargs["timeout"] = float(self._remaining_budget)  # type: ignore[arg-type]
+                    client = isolated_sdk  # type: ignore[assignment]
+                except Exception as error:
+                    # Fail-closed for real SDK: do not fall back to _client_for_budget.
+                    with contextlib.suppress(Exception):
+                        if isolated_client is not None:
+                            isolated_client.close()
+                    self._isolated_http = None
+                    isolated_client = None
+                    isolated_sdk = None
+                    if isinstance(error, ProviderError):
+                        raise
+                    raise ProviderError(
+                        "chat completions isolated transport unavailable"
+                    ) from error
         else:
             client = self.client
             if self._remaining_budget is not None:
