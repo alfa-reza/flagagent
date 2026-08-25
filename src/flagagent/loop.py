@@ -738,40 +738,72 @@ class AgentLoop:
             return ("worker_error", {"error": "pipe_send"})
 
         resp_rx = proc.response_rx
+        commit_rx = getattr(proc, "commit_rx", None)
         sentinel = proc.proc.sentinel
+        expected = getattr(proc, "_next_seq", 0) + 1
+        try:
+            proc._next_seq = expected  # type: ignore[attr-defined]
+        except Exception:
+            pass
+
+        def _try_preserve_bounded() -> tuple[str, dict[str, Any]] | None:
+            crx = commit_rx
+            if crx is None:
+                return None
+            try:
+                if not crx.poll(timeout=0):  # type: ignore[union-attr]
+                    return None
+                cmsg = crx.recv()  # type: ignore[union-attr]
+            except Exception:
+                return None
+            if not isinstance(cmsg, dict) or cmsg.get("seq") != expected:
+                return None
+            try:
+                if not resp_rx.poll(timeout=0.5):  # type: ignore[union-attr]
+                    return None
+                msg = resp_rx.recv()
+            except Exception:
+                return None
+            if isinstance(msg, dict) and msg.get("type") == "response":
+                if msg.get("seq") is not None and msg.get("seq") != expected:
+                    return None
+                return ("response", msg.get("response") or {})
+            return None
+
         while True:
             now = self.monotonic()
             wait = deadline - now
             if wait <= 0:
+                preserved = _try_preserve_bounded()
+                if preserved is not None:
+                    return preserved
                 self._terminate_for_deadline(proc)
                 return None
             try:
-                ready = multiprocessing.connection.wait(
-                    [resp_rx, sentinel], timeout=wait
-                )
+                watch = [commit_rx, sentinel] if commit_rx is not None else [sentinel]
+                ready = multiprocessing.connection.wait(watch, timeout=wait)
             except Exception:
                 ready = []
             if self.monotonic() >= deadline:
+                preserved = _try_preserve_bounded()
+                if preserved is not None:
+                    return preserved
                 self._terminate_for_deadline(proc)
                 return None
             if not ready:
                 continue
             if sentinel in ready:
-                try:
-                    if resp_rx in ready:
-                        msg = resp_rx.recv()
-                        if (
-                            isinstance(msg, dict)
-                            and msg.get("type") == "provider_error"
-                        ):
-                            return ("provider_error", msg)
-                        if isinstance(msg, dict) and msg.get("type") == "worker_error":
-                            return ("worker_error", msg)
-                except Exception:
-                    pass
                 return ("worker_error", {"error": "child_exit"})
-            if resp_rx in ready:
+            if commit_rx is not None and commit_rx in ready:
                 try:
+                    cmsg = commit_rx.recv()
+                except Exception:
+                    continue
+                if not isinstance(cmsg, dict) or cmsg.get("seq") != expected:
+                    continue
+                try:
+                    if not resp_rx.poll(timeout=0.5):
+                        continue
                     msg = resp_rx.recv()
                 except EOFError:
                     return ("worker_error", {"error": "eof"})
@@ -779,16 +811,11 @@ class AgentLoop:
                     return ("worker_error", {"error": "recv"})
                 if not isinstance(msg, dict):
                     return ("worker_error", {"error": "bad_msg"})
-                t = msg.get("type")
-                if t == "response":
+                if msg.get("type") == "response":
+                    if msg.get("seq") is not None and msg.get("seq") != expected:
+                        continue
                     return ("response", msg.get("response") or {})
-                if t == "provider_error":
-                    return ("provider_error", msg)
-                if t == "worker_error":
-                    return ("worker_error", msg)
-                if t == "ready":
-                    continue
-                return ("worker_error", {"error": f"unknown:{t}"})
+                continue
 
     def _cleanup_provider_process(self) -> None:
         proc = getattr(self, "_provider_process", None)
@@ -887,7 +914,7 @@ class AgentLoop:
                         _result["response"] = self.model.generate(
                             self.messages, TOOL_DEFINITIONS
                         )
-                    except BaseException as exc:  # noqa: BLE001
+                    except BaseException as exc:
                         _result["exc"] = exc
 
                 worker = threading.Thread(target=_target, daemon=False)
