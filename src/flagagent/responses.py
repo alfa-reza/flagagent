@@ -21,7 +21,10 @@ Design constraints mirror :class:`ChatCompletionsModel`:
 - official ``openai`` SDK, non-streaming ``client.responses.create``;
 - default SDK retry behavior is left in place for standalone use; when
   ``AgentLoop`` sets a Run wall budget via :meth:`set_remaining`, the
-  request is bounded to that timeout with ``max_retries=0``;
+  request uses ``timeout=remaining`` and ``max_retries=0`` which bounds
+  transport phases via SDK timeout; ``AgentLoop`` enforces the absolute Run
+  wall deadline by terminating a supervised provider child process; platform
+  DNS resolution is not bounded by connect timeout;
 - client injection (``client=``) supports deterministic tests;
 - malformed provider output raises :class:`ProviderError` rather than
   fabricating tool calls or leaking ``AttributeError``/``TypeError``/
@@ -192,24 +195,18 @@ class ResponsesModel:
     base_url: str | None = None
     client: Any = field(default=None)
     _remaining_budget: float | None = field(default=None, init=False, repr=False)
+    _client_injected: bool = field(default=False, init=False, repr=False)
     _built_input: list[dict[str, Any]] = field(
         default_factory=list, init=False, repr=False
     )
     _processed_count: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self._client_injected = self.client is not None
         if self.client is None:
             self.client = _build_client(self.api_key, self.base_url)
 
     def set_remaining(self, remaining: float) -> None:
-        """Receive the Run wall-budget remaining (seconds) from ``AgentLoop``.
-
-        When set to a positive value, the next request is bounded to that
-        timeout with ``max_retries=0`` so one SDK call cannot exceed the Run
-        wall budget and the loop deadline stays authoritative.  ``AgentLoop``
-        invokes this via an optional ``getattr`` seam, so models without it
-        (including the M0 ``ScriptedModel``) are unaffected.
-        """
         if isinstance(remaining, bool) or not isinstance(remaining, (int, float)):
             raise TypeError("remaining budget must be a number")
         value = float(remaining)
@@ -298,5 +295,8 @@ class ResponsesModel:
             raise ProviderError("malformed responses output") from error
         self._built_input.extend(replay_items)
         return ModelResponse(
-            content=content, tool_calls=tuple(tool_calls), usage=usage, truncated=truncated
+            content=content,
+            tool_calls=tuple(tool_calls),
+            usage=usage,
+            truncated=truncated,
         )

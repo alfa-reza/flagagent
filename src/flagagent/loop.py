@@ -1,10 +1,13 @@
 import contextlib
 import hashlib
 import math
+import multiprocessing
+import multiprocessing.connection
 import os
 import shutil
 import stat
 import tempfile
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -361,6 +364,24 @@ class AgentLoop:
         self._output_tokens: int | None = None
         self._source_files: list[tuple[Path, Path]] = []
         self._source_temporary: Any | None = None
+        self._provider_process: Any | None = None
+
+    def _uses_provider_process(self) -> bool:
+        try:
+            kind = type(self.model).__name__
+            if kind not in (
+                "ChatCompletionsModel",
+                "ResponsesModel",
+                "AnthropicMessagesModel",
+            ):
+                return False
+            if bool(getattr(self.model, "_client_injected", False)):
+                return False
+        except Exception:
+            return False
+        if self.protocol in ("openai-chat", "openai-responses", "anthropic"):
+            return True
+        return True
 
     def _remaining(self) -> float:
         return max(0.0, self._deadline - self.monotonic())
@@ -509,6 +530,12 @@ class AgentLoop:
         )
         self._started = self.monotonic()
         self._deadline = self._started + self.limits.wall_timeout_seconds
+        # One persistent provider child per Run. Child spawn occurs inside Run
+        # wall accounting (after _started/_deadline) and is supervised by the
+        # absolute deadline via process termination if the Run expires.
+        if self._uses_provider_process():
+            with contextlib.suppress(Exception):
+                self._ensure_provider_process()
         terminal_written = False
         try:
             if source_error is not None:
@@ -540,6 +567,7 @@ class AgentLoop:
             result = self._result("error", "serialization_error")
             self.artifacts.commit_result(result)
         finally:
+            self._cleanup_provider_process()
             self._cleanup_executor()
             self.artifacts.close()
             if self._source_temporary is not None:
@@ -568,6 +596,216 @@ class AgentLoop:
                 return "unsolved", "wall_limit", []
         return self._run_active()
 
+    def _ensure_provider_process(self) -> None:
+        proc = getattr(self, "_provider_process", None)
+        if proc is not None and not getattr(proc, "_closed", False) and proc.is_alive():
+            return
+        from flagagent.provider_process import ProviderConfig, ProviderProcess
+
+        protocol = self.protocol
+        if protocol not in ("openai-chat", "openai-responses", "anthropic"):
+            name = type(self.model).__name__
+            protocol = {
+                "ChatCompletionsModel": "openai-chat",
+                "ResponsesModel": "openai-responses",
+                "AnthropicMessagesModel": "anthropic",
+            }.get(name, "openai-chat")
+        api_key = getattr(self.model, "api_key", "")
+        base_url = getattr(self.model, "base_url", None)
+        model_name = getattr(self.model, "model", "")
+        cfg = ProviderConfig(
+            protocol=protocol, model=model_name, api_key=api_key, base_url=base_url
+        )
+        self._provider_process = ProviderProcess(cfg)
+
+    def _wait_for_ready(self, proc) -> bool:
+        deadline = self._deadline
+        if self.monotonic() >= deadline:
+            self._terminate_for_deadline(proc)
+            return False
+        if getattr(proc, "_ready", False):
+            return True
+        resp = proc.response_rx
+        sentinel = proc.proc.sentinel
+        while True:
+            now = self.monotonic()
+            wait = deadline - now
+            if wait <= 0:
+                self._terminate_for_deadline(proc)
+                return False
+            try:
+                ready = multiprocessing.connection.wait([resp, sentinel], timeout=wait)
+            except Exception:
+                ready = []
+            if self.monotonic() >= deadline:
+                self._terminate_for_deadline(proc)
+                return False
+            if not ready:
+                continue
+            if sentinel in ready:
+                return False
+            if resp in ready:
+                try:
+                    msg = resp.recv()
+                except Exception:
+                    return False
+                if isinstance(msg, dict) and msg.get("type") == "ready":
+                    proc._ready = True  # type: ignore[attr-defined]
+                    return True
+                if isinstance(msg, dict) and msg.get("type") == "worker_error":
+                    return False
+                return False
+
+    def _terminate_for_deadline(self, proc) -> None:
+        proc.terminate_for_deadline()
+        if getattr(self, "_provider_process", None) is proc:
+            self._provider_process = None
+
+    def _join_sender_or_raise(self, sender: threading.Thread, proc) -> None:
+        from flagagent.provider_process import (
+            SENDER_JOIN_GRACE,
+            ProviderSenderTerminationError,
+        )
+
+        sender.join(timeout=SENDER_JOIN_GRACE)
+        if sender.is_alive():
+            raise ProviderSenderTerminationError(
+                f"sender thread still alive after deadline pid={getattr(getattr(proc, 'proc', None), 'pid', None)}"
+            )
+
+    def _call_provider_via_process(
+        self, remaining: float
+    ) -> tuple[str, dict[str, Any]] | None:
+        """Send generate to persistent child under absolute deadline supervision."""
+        self._ensure_provider_process()
+        proc = self._provider_process
+        if not self._wait_for_ready(proc):
+            if self.monotonic() >= self._deadline:
+                return None
+            return ("worker_error", {"error": "child_init_failed"})
+
+        deadline = self._deadline
+        payload = {
+            "type": "generate",
+            "messages": list(self.messages),
+            "tools": list(TOOL_DEFINITIONS),
+            "remaining": float(remaining),
+        }
+        send_done = threading.Event()
+        send_error: dict[str, Exception] = {}
+
+        def _do_send() -> None:
+            try:
+                proc.request_tx.send(payload)
+            except Exception as exc:
+                send_error["exc"] = exc
+            finally:
+                send_done.set()
+
+        sender = threading.Thread(target=_do_send, daemon=False)
+        sender.start()
+
+        while not send_done.is_set():
+            now = self.monotonic()
+            if now >= deadline:
+                self._terminate_for_deadline(proc)
+                self._join_sender_or_raise(sender, proc)
+                return None
+            if not proc.is_alive():
+                sender.join(timeout=0.5)
+                if send_done.is_set():
+                    break
+                sender.join(timeout=0.5)
+                if "exc" in send_error:
+                    sender.join(timeout=0.5)
+                    if self.monotonic() >= deadline:
+                        self._terminate_for_deadline(proc)
+                        self._join_sender_or_raise(sender, proc)
+                        return None
+                    self._join_sender_or_raise(sender, proc)
+                    return ("worker_error", {"error": "pipe_send"})
+                continue
+            send_done.wait(timeout=0.02)
+
+        self._join_sender_or_raise(sender, proc)
+        if self.monotonic() >= deadline:
+            self._terminate_for_deadline(proc)
+            return None
+        if "exc" in send_error:
+            if self.monotonic() >= deadline:
+                self._terminate_for_deadline(proc)
+                return None
+            return ("worker_error", {"error": "pipe_send"})
+
+        resp_rx = proc.response_rx
+        sentinel = proc.proc.sentinel
+        while True:
+            now = self.monotonic()
+            wait = deadline - now
+            if wait <= 0:
+                self._terminate_for_deadline(proc)
+                return None
+            try:
+                ready = multiprocessing.connection.wait(
+                    [resp_rx, sentinel], timeout=wait
+                )
+            except Exception:
+                ready = []
+            if self.monotonic() >= deadline:
+                self._terminate_for_deadline(proc)
+                return None
+            if not ready:
+                continue
+            if sentinel in ready:
+                try:
+                    if resp_rx in ready:
+                        msg = resp_rx.recv()
+                        if (
+                            isinstance(msg, dict)
+                            and msg.get("type") == "provider_error"
+                        ):
+                            return ("provider_error", msg)
+                        if isinstance(msg, dict) and msg.get("type") == "worker_error":
+                            return ("worker_error", msg)
+                except Exception:
+                    pass
+                return ("worker_error", {"error": "child_exit"})
+            if resp_rx in ready:
+                try:
+                    msg = resp_rx.recv()
+                except EOFError:
+                    return ("worker_error", {"error": "eof"})
+                except Exception:
+                    return ("worker_error", {"error": "recv"})
+                if not isinstance(msg, dict):
+                    return ("worker_error", {"error": "bad_msg"})
+                t = msg.get("type")
+                if t == "response":
+                    return ("response", msg.get("response") or {})
+                if t == "provider_error":
+                    return ("provider_error", msg)
+                if t == "worker_error":
+                    return ("worker_error", msg)
+                if t == "ready":
+                    continue
+                return ("worker_error", {"error": f"unknown:{t}"})
+
+    def _cleanup_provider_process(self) -> None:
+        proc = getattr(self, "_provider_process", None)
+        if proc is None:
+            return
+        still_alive = False
+        try:
+            proc.close()
+        except Exception:
+            pass
+        try:
+            still_alive = bool(proc.is_alive() or proc.exitcode is None)
+        except Exception:
+            still_alive = True
+        if not still_alive:
+            self._provider_process = None
+
     def _cleanup_executor(self) -> None:
         cleanup = getattr(self.executor, "cleanup", None)
         if cleanup is None:
@@ -588,19 +826,94 @@ class AgentLoop:
             if self._model_calls >= self.limits.max_model_turns:
                 return "unsolved", "model_turn_limit", []
             self._model_calls += 1
+            remaining = self._remaining()
+            if remaining <= 0:
+                return "unsolved", "wall_limit", []
+            # Keep provider SDK timeout based on remaining budget (defense in depth).
             try:
-                set_remaining = getattr(self.model, "set_remaining", None)
-                if set_remaining is not None:
-                    set_remaining(self._remaining())
-                response = self.model.generate(self.messages, TOOL_DEFINITIONS)
+                setter = getattr(self.model, "set_remaining", None)
+                if callable(setter):
+                    setter(float(remaining))
             except Exception:
-                if self._expired():
+                pass
+            if self._uses_provider_process():
+                outcome = self._call_provider_via_process(remaining)
+                # None means deadline won; status already wall_limit path.
+                if outcome is None:
                     return "unsolved", "wall_limit", []
-                return self._error("provider_error", "model")
-            if not isinstance(response, ModelResponse):
-                if self._expired():
+                kind, payload = outcome
+                if kind == "provider_error":
+                    if self._expired():
+                        return "unsolved", "wall_limit", []
+                    return self._error("provider_error", "model")
+                if kind == "worker_error":
+                    if self._expired():
+                        return "unsolved", "wall_limit", []
+                    return self._error("provider_error", "model")
+                # kind == "response": reconstruct ModelResponse
+                try:
+                    # payload is ModelResponse dict
+                    from flagagent.model import ToolCall as _ToolCall
+
+                    tcs = tuple(
+                        _ToolCall(
+                            call_id=item["call_id"],
+                            name=item["name"],
+                            arguments=item["arguments"],
+                        )
+                        for item in (payload.get("tool_calls") or [])
+                    )
+                    response = ModelResponse(
+                        content=payload.get("content") or "",
+                        tool_calls=tcs,
+                        usage=payload.get("usage"),
+                        truncated=bool(payload.get("truncated")),
+                    )
+                except Exception:
+                    if self._expired():
+                        return "unsolved", "wall_limit", []
+                    return self._error("provider_error", "model")
+            else:
+                # Non-provider path (ScriptedModel / test doubles) — keep
+                # synchronous inline execution without process overhead.
+                # Still bound by thread + abort for deadline tests that use
+                # BlockingModel etc. Reuse previous thread supervision inline.
+                import threading
+
+                _result: dict[str, Any] = {}
+
+                def _target() -> None:
+                    try:
+                        _result["response"] = self.model.generate(
+                            self.messages, TOOL_DEFINITIONS
+                        )
+                    except BaseException as exc:  # noqa: BLE001
+                        _result["exc"] = exc
+
+                worker = threading.Thread(target=_target, daemon=False)
+                worker.start()
+                deadline = self._deadline
+                wait = deadline - self.monotonic()
+                if wait > 0:
+                    worker.join(timeout=wait)
+                if worker.is_alive():
+                    abort = getattr(self.model, "abort_request", None)
+                    if abort is None:
+                        abort = getattr(self.model, "abort", None)
+                    if callable(abort):
+                        with contextlib.suppress(Exception):
+                            abort()
+                    worker.join(timeout=3.0)
                     return "unsolved", "wall_limit", []
-                return self._error("provider_error", "model")
+                if "exc" in _result:
+                    if self._expired():
+                        return "unsolved", "wall_limit", []
+                    return self._error("provider_error", "model")
+                response = _result.get("response")
+                if not isinstance(response, ModelResponse):
+                    if self._expired():
+                        return "unsolved", "wall_limit", []
+                    return self._error("provider_error", "model")
             self._add_usage(response.usage)
             duplicate = self._duplicate_id(response)
             accepted = duplicate is None

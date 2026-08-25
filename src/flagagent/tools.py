@@ -162,9 +162,7 @@ class FakeExecutor:
     def set_remaining(self, remaining: float) -> None:
         self.remaining_budgets.append(remaining)
 
-    def set_execution_deadline(
-        self, deadline: float, monotonic=None
-    ) -> None:  # type: ignore[no-untyped-def]
+    def set_execution_deadline(self, deadline: float, monotonic=None) -> None:  # type: ignore[no-untyped-def]
         self.execution_deadlines.append(deadline)
 
     def execute(self, command: str, timeout_seconds: float) -> ShellResult:
