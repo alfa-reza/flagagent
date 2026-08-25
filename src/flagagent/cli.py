@@ -71,7 +71,13 @@ def load_challenge(root: Path) -> tuple[ChallengeInput, str]:
         raise ValueError("challenge.json must be valid JSON") from error
     if not isinstance(payload, dict):
         raise TypeError("challenge.json must contain an object")
-    allowed = {"identity", "description", "expected_flag", "network_mode", "target_context"}
+    allowed = {
+        "identity",
+        "description",
+        "expected_flag",
+        "network_mode",
+        "target_context",
+    }
     if set(payload) - allowed:
         raise ValueError("challenge.json contains unsupported fields")
     identity = _require_string(payload, "identity")
