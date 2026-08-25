@@ -10,19 +10,21 @@ base url, protocol variant). The supervised provider request uses a
 child-owned adapter/client; the child does not receive the parent's SDK
 client/socket/lock objects; only primitive configuration crosses the boundary.
 
-IPC uses two unidirectional pipes:
+IPC uses three unidirectional pipes:
 
     parent request_tx  ---> child request_rx   (generate / close)
     parent response_rx <--- child response_tx  (ready / response / provider_error / worker_error)
+    parent commit_rx   <--- child commit_tx    (commit marker, sent only after response_tx.send returns)
 
 Protocol (dicts):
 
     -> {"type":"generate","messages":..., "tools":..., "remaining": float|None}
     <- {"type":"ready"}
-    <- {"type":"response","response": dict(ModelResponse.to_dict())}
-    <- {"type":"provider_error","error": str}
-    <- {"type":"worker_error","error": str}
+    <- {"type":"response","response": dict(ModelResponse.to_dict()), "seq": int}
+    <- {"type":"provider_error","error": str, "seq": int}
+    <- {"type":"worker_error","error": str, "seq": int}
     -> {"type":"close"}
+    commit: {"seq": int, "committed_at": float}  # monotonic time sampled after response send returns
 
 A worker/IPC session terminated by the wall deadline is disposable and is
 never reused.
@@ -32,6 +34,7 @@ from __future__ import annotations
 
 import multiprocessing
 import multiprocessing.connection
+import time
 from dataclasses import dataclass
 
 TERM_GRACE = 0.3
@@ -143,8 +146,9 @@ def _child_main(
                         "seq": _seq,
                     }
                 )
+                committed_at = time.monotonic()
                 try:
-                    commit_tx.send({"seq": _seq})
+                    commit_tx.send({"seq": _seq, "committed_at": committed_at})
                 except Exception:
                     pass
             except Exception:
@@ -170,8 +174,9 @@ def _child_main(
             )
             _seq += 1
             response_tx.send({"type": "response", "response": payload, "seq": _seq})
+            committed_at = time.monotonic()
             try:
-                commit_tx.send({"seq": _seq})
+                commit_tx.send({"seq": _seq, "committed_at": committed_at})
             except Exception:
                 pass
         except Exception:

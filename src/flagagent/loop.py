@@ -758,16 +758,24 @@ class AgentLoop:
                 return None
             if not isinstance(cmsg, dict) or cmsg.get("seq") != expected:
                 return None
+            committed_at = cmsg.get("committed_at")
+            if not isinstance(committed_at, (int, float)) or not float(committed_at) < float(deadline):
+                return None
             try:
                 if not resp_rx.poll(timeout=0.5):  # type: ignore[union-attr]
                     return None
                 msg = resp_rx.recv()
             except Exception:
                 return None
-            if isinstance(msg, dict) and msg.get("type") == "response":
-                if msg.get("seq") is not None and msg.get("seq") != expected:
-                    return None
+            if not isinstance(msg, dict):
+                return None
+            if msg.get("seq") is not None and msg.get("seq") != expected:
+                return None
+            msg_type = msg.get("type")
+            if msg_type == "response":
                 return ("response", msg.get("response") or {})
+            if msg_type == "provider_error":
+                return ("provider_error", msg)
             return None
 
         while True:
@@ -801,6 +809,12 @@ class AgentLoop:
                     continue
                 if not isinstance(cmsg, dict) or cmsg.get("seq") != expected:
                     continue
+                committed_at = cmsg.get("committed_at")
+                if isinstance(committed_at, (int, float)):
+                    if not float(committed_at) < float(deadline):
+                        continue
+                else:
+                    continue
                 try:
                     if not resp_rx.poll(timeout=0.5):
                         continue
@@ -811,10 +825,13 @@ class AgentLoop:
                     return ("worker_error", {"error": "recv"})
                 if not isinstance(msg, dict):
                     return ("worker_error", {"error": "bad_msg"})
-                if msg.get("type") == "response":
-                    if msg.get("seq") is not None and msg.get("seq") != expected:
-                        continue
+                if msg.get("seq") is not None and msg.get("seq") != expected:
+                    continue
+                msg_type = msg.get("type")
+                if msg_type == "response":
                     return ("response", msg.get("response") or {})
+                if msg_type == "provider_error":
+                    return ("provider_error", msg)
                 continue
 
     def _cleanup_provider_process(self) -> None:
