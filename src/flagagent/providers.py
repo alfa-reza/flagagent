@@ -202,8 +202,10 @@ class ChatCompletionsModel:
     base_url: str | None = None
     client: Any = field(default=None)
     _remaining_budget: float | None = field(default=None, init=False, repr=False)
+    _client_injected: bool = field(default=False, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self._client_injected = self.client is not None
         if self.client is None:
             self.client = _build_client(self.api_key, self.base_url)
 

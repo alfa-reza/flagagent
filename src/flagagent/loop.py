@@ -367,11 +367,6 @@ class AgentLoop:
         self._provider_process: Any | None = None
 
     def _uses_provider_process(self) -> bool:
-        # Only real provider adapters (real SDK client) need a supervised
-        # child so the wall can kill uncooperative work (DNS etc.).
-        # ScriptedModel / injected test doubles (SimpleNamespace client or
-        # _WithOptionsClient wrapper) run inline so tests remain fast and
-        # spawn re-import is not triggered from a __main__ script.
         try:
             kind = type(self.model).__name__
             if kind not in (
@@ -380,23 +375,12 @@ class AgentLoop:
                 "AnthropicMessagesModel",
             ):
                 return False
-            # Injected test doubles use a SimpleNamespace client (or
-            # _WithOptionsClient wrapper around it) — keep them inline.
-            cli = getattr(self.model, "client", None)
-            if cli is not None and type(cli).__name__ in (
-                "SimpleNamespace",
-                "_WithOptionsClient",
-            ):
+            if bool(getattr(self.model, "_client_injected", False)):
                 return False
         except Exception:
             return False
-        # Real CLI path sets protocol explicitly; otherwise fall back to
-        # adapter class name (direct provider tests with real http).
         if self.protocol in ("openai-chat", "openai-responses", "anthropic"):
             return True
-        # Direct adapter construction without protocol (e.g.
-        # test_issue47_transport make_adapter) still uses process for
-        # wall-deadline correctness on real HTTP.
         return True
 
     def _remaining(self) -> float:
@@ -637,8 +621,7 @@ class AgentLoop:
     def _wait_for_ready(self, proc) -> bool:
         deadline = self._deadline
         if self.monotonic() >= deadline:
-            with contextlib.suppress(Exception):
-                self._terminate_for_deadline(proc)
+            self._terminate_for_deadline(proc)
             return False
         if getattr(proc, "_ready", False):
             return True
@@ -648,16 +631,14 @@ class AgentLoop:
             now = self.monotonic()
             wait = deadline - now
             if wait <= 0:
-                with contextlib.suppress(Exception):
-                    self._terminate_for_deadline(proc)
+                self._terminate_for_deadline(proc)
                 return False
             try:
                 ready = multiprocessing.connection.wait([resp, sentinel], timeout=wait)
             except Exception:
                 ready = []
             if self.monotonic() >= deadline:
-                with contextlib.suppress(Exception):
-                    self._terminate_for_deadline(proc)
+                self._terminate_for_deadline(proc)
                 return False
             if not ready:
                 continue
@@ -676,16 +657,21 @@ class AgentLoop:
                 return False
 
     def _terminate_for_deadline(self, proc) -> None:
-        alive_before = False
-        try:
-            proc.terminate_for_deadline()
-        finally:
-            try:
-                alive_before = bool(proc.is_alive() or proc.exitcode is None)
-            except Exception:
-                alive_before = True
-            if getattr(self, "_provider_process", None) is proc and not alive_before:
-                self._provider_process = None
+        proc.terminate_for_deadline()
+        if getattr(self, "_provider_process", None) is proc:
+            self._provider_process = None
+
+    def _join_sender_or_raise(self, sender: threading.Thread, proc) -> None:
+        from flagagent.provider_process import (
+            SENDER_JOIN_GRACE,
+            ProviderSenderTerminationError,
+        )
+
+        sender.join(timeout=SENDER_JOIN_GRACE)
+        if sender.is_alive():
+            raise ProviderSenderTerminationError(
+                f"sender thread still alive after deadline pid={getattr(getattr(proc, 'proc', None), 'pid', None)}"
+            )
 
     def _call_provider_via_process(
         self, remaining: float
@@ -716,47 +702,38 @@ class AgentLoop:
             finally:
                 send_done.set()
 
-        sender = threading.Thread(target=_do_send, daemon=True)
+        sender = threading.Thread(target=_do_send, daemon=False)
         sender.start()
 
         while not send_done.is_set():
             now = self.monotonic()
             if now >= deadline:
-                with contextlib.suppress(Exception):
-                    self._terminate_for_deadline(proc)
-                sender.join(timeout=2.0)
-                if sender.is_alive():
-                    sender.join(timeout=1.0)
+                self._terminate_for_deadline(proc)
+                self._join_sender_or_raise(sender, proc)
                 return None
             if not proc.is_alive():
                 sender.join(timeout=0.5)
                 if send_done.is_set():
                     break
-                sender.join(timeout=1.0)
+                sender.join(timeout=0.5)
                 if "exc" in send_error:
                     sender.join(timeout=0.5)
                     if self.monotonic() >= deadline:
-                        with contextlib.suppress(Exception):
-                            self._terminate_for_deadline(proc)
+                        self._terminate_for_deadline(proc)
+                        self._join_sender_or_raise(sender, proc)
                         return None
+                    self._join_sender_or_raise(sender, proc)
                     return ("worker_error", {"error": "pipe_send"})
                 continue
             send_done.wait(timeout=0.02)
 
-        sender.join(timeout=1.0)
-        if sender.is_alive():
-            with contextlib.suppress(Exception):
-                self._terminate_for_deadline(proc)
-            sender.join(timeout=2.0)
-            return None
+        self._join_sender_or_raise(sender, proc)
         if self.monotonic() >= deadline:
-            with contextlib.suppress(Exception):
-                self._terminate_for_deadline(proc)
+            self._terminate_for_deadline(proc)
             return None
         if "exc" in send_error:
             if self.monotonic() >= deadline:
-                with contextlib.suppress(Exception):
-                    self._terminate_for_deadline(proc)
+                self._terminate_for_deadline(proc)
                 return None
             return ("worker_error", {"error": "pipe_send"})
 
@@ -766,8 +743,7 @@ class AgentLoop:
             now = self.monotonic()
             wait = deadline - now
             if wait <= 0:
-                with contextlib.suppress(Exception):
-                    self._terminate_for_deadline(proc)
+                self._terminate_for_deadline(proc)
                 return None
             try:
                 ready = multiprocessing.connection.wait(
@@ -776,8 +752,7 @@ class AgentLoop:
             except Exception:
                 ready = []
             if self.monotonic() >= deadline:
-                with contextlib.suppress(Exception):
-                    self._terminate_for_deadline(proc)
+                self._terminate_for_deadline(proc)
                 return None
             if not ready:
                 continue

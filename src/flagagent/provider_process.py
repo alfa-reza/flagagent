@@ -37,9 +37,14 @@ from dataclasses import dataclass
 TERM_GRACE = 0.3
 KILL_GRACE = 0.3
 CLOSE_GRACE = 0.4
+SENDER_JOIN_GRACE = 1.5
 
 
 class ProviderProcessTerminationError(RuntimeError):
+    pass
+
+
+class ProviderSenderTerminationError(RuntimeError):
     pass
 
 
@@ -231,28 +236,31 @@ class ProviderProcess:
     def proc(self):
         return self._proc
 
+    @property
+    def exitcode(self):
+        return self._proc.exitcode
+
     def is_alive(self) -> bool:
         return self._proc.is_alive()
 
     def terminate_for_deadline(self) -> None:
         if self._closed:
             return
+        self._force_terminate()
+        still_alive = self._proc.is_alive() or self._proc.exitcode is None
         try:
-            self._force_terminate()
-        finally:
-            try:
-                self._request_tx.close()
-            except Exception:
-                pass
-            try:
-                self._response_rx.close()
-            except Exception:
-                pass
-            self._closed = True
-            if self._proc.is_alive() or self._proc.exitcode is None:
-                raise ProviderProcessTerminationError(
-                    f"provider child still alive after SIGKILL pid={self._proc.pid} alive={self._proc.is_alive()} exitcode={self._proc.exitcode}"
-                )
+            self._request_tx.close()
+        except Exception:
+            pass
+        try:
+            self._response_rx.close()
+        except Exception:
+            pass
+        if still_alive:
+            raise ProviderProcessTerminationError(
+                f"provider child still alive after SIGKILL pid={self._proc.pid} alive={self._proc.is_alive()} exitcode={self._proc.exitcode}"
+            )
+        self._closed = True
 
     def _force_terminate(self) -> None:
         if not self._proc.is_alive():
@@ -276,27 +284,28 @@ class ProviderProcess:
     def close(self) -> None:
         if self._closed:
             return
-        self._closed = True
+        is_alive_before = self._proc.is_alive()
+        if is_alive_before:
+            try:
+                self._request_tx.send({"type": "close"})
+            except Exception:
+                pass
+            self._proc.join(timeout=CLOSE_GRACE)
+        if self._proc.is_alive():
+            self._force_terminate()
+        still_alive = self._proc.is_alive() or self._proc.exitcode is None
         try:
-            if self._proc.is_alive():
-                try:
-                    self._request_tx.send({"type": "close"})
-                except Exception:
-                    pass
-                self._proc.join(timeout=CLOSE_GRACE)
-            if self._proc.is_alive():
-                self._force_terminate()
-        finally:
-            try:
-                self._request_tx.close()
-            except Exception:
-                pass
-            try:
-                self._response_rx.close()
-            except Exception:
-                pass
-        if self._proc.is_alive() or self._proc.exitcode is None:
+            self._request_tx.close()
+        except Exception:
+            pass
+        try:
+            self._response_rx.close()
+        except Exception:
+            pass
+        if still_alive:
             if self._proc.is_alive():
                 raise ProviderProcessTerminationError(
                     f"provider child still alive after close pid={self._proc.pid}"
                 )
+            return
+        self._closed = True

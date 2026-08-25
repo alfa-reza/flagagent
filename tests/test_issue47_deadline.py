@@ -504,7 +504,12 @@ def test_blocked_ipc_submission_does_not_steal_deadline(tmp_path):
     assert resp_recv.recv().get("type") == "ready"
 
     big = "x" * (1 * 1024 * 1024)
-    payload = {"type": "generate", "messages": [{"role": "user", "content": big}], "tools": [], "remaining": 10}
+    payload = {
+        "type": "generate",
+        "messages": [{"role": "user", "content": big}],
+        "tools": [],
+        "remaining": 10,
+    }
     done = threading.Event()
     err: dict = {}
 
@@ -651,7 +656,8 @@ def test_responses_persistent_state(tmp_path):
     assert any(item.get("type") == "function_call_output" for item in second)
     raw = captured.get("proc")
     assert raw is not None
-    assert not raw.is_alive() or raw.exitcode is not None or True
+    assert not raw.is_alive()
+    assert raw.exitcode is not None
 
 
 def test_anthropic_thinking_state_persists(tmp_path):
@@ -680,8 +686,17 @@ def test_anthropic_thinking_state_persists(tmp_path):
                     "role": "assistant",
                     "model": "m",
                     "content": [
-                        {"type": "thinking", "thinking": "plan foo", "signature": "sig-123"},
-                        {"type": "tool_use", "id": "c1", "name": "shell", "input": {"command": "echo hi"}},
+                        {
+                            "type": "thinking",
+                            "thinking": "plan foo",
+                            "signature": "sig-123",
+                        },
+                        {
+                            "type": "tool_use",
+                            "id": "c1",
+                            "name": "shell",
+                            "input": {"command": "echo hi"},
+                        },
                     ],
                     "stop_reason": "tool_use",
                     "stop_sequence": None,
@@ -757,11 +772,8 @@ def test_anthropic_thinking_state_persists(tmp_path):
     assert found, f"second request missing prior thinking block, second={second}"
     raw = captured.get("proc")
     if raw is not None:
-        assert not raw.is_alive() or raw.exitcode is not None or True
-    pp_after = getattr(loop, "_provider_process", None)
-    if pp_after is not None:
-        first = captured.get("proc")
-        assert first is pp_after.proc or True
+        assert not raw.is_alive()
+        assert raw.exitcode is not None
 
 
 def test_provider_process_termination_verified(tmp_path):
@@ -770,7 +782,9 @@ def test_provider_process_termination_verified(tmp_path):
 
     from flagagent.provider_process import ProviderConfig, ProviderProcess
 
-    cfg = ProviderConfig(protocol="openai-chat", model="m", api_key="sk-test", base_url=None)
+    cfg = ProviderConfig(
+        protocol="openai-chat", model="m", api_key="sk-test", base_url=None
+    )
     pp = ProviderProcess(cfg)
     raw = pp.proc
     assert raw.is_alive()
@@ -816,3 +830,250 @@ def test_provider_process_termination_verified(tmp_path):
         resp_recv.close()
     except Exception:
         pass
+
+
+def test_termination_failure_not_suppressed(tmp_path):
+    """ProviderProcessTerminationError must not be suppressed into wall_limit."""
+    from flagagent.loop import AgentLoop, ChallengeInput, Limits
+    from flagagent.model import ModelResponse
+    from flagagent.provider_process import ProviderProcessTerminationError
+    from flagagent.tools import ExactStringVerifier, FakeExecutor
+
+    class FakeProc:
+        def terminate_for_deadline(self):
+            raise ProviderProcessTerminationError("stay alive")
+
+        def is_alive(self):
+            return True
+
+        @property
+        def exitcode(self):
+            return None
+
+        @property
+        def proc(self):
+            class P:
+                sentinel = -1
+
+            return P()
+
+        @property
+        def response_rx(self):
+            class C:
+                def poll(self, *a, **kw):
+                    return False
+
+            return C()
+
+    fake = FakeProc()
+    loop = AgentLoop(
+        model=__import__("flagagent.model", fromlist=["ScriptedModel"]).ScriptedModel(
+            [ModelResponse(content="x")]
+        ),
+        executor=FakeExecutor([]),
+        verifier=ExactStringVerifier("Flag{ok}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(
+            max_model_turns=2, wall_timeout_seconds=0.5, command_timeout_seconds=1
+        ),
+        runs_root=tmp_path,
+        monotonic=lambda: 10.0,
+        utc_now=lambda: __import__("datetime", fromlist=["datetime"]).datetime(
+            2026,
+            8,
+            14,
+            16,
+            15,
+            30,
+            tzinfo=__import__("datetime", fromlist=["timezone"]).timezone.utc,
+        ),
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    loop._started = 0.0
+    loop._deadline = 0.5
+    loop._provider_process = fake  # type: ignore[attr-defined]
+    loop.artifacts = __import__(
+        "flagagent.artifacts", fromlist=["RunArtifacts"]
+    ).RunArtifacts.create(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "run_id": "FA-20260814T161530Z-a13f4c2d",
+            "flagagent_version": "0.1.0",
+            "concept_version": "0.1.0",
+            "challenge": {"identity": "fixture", "description": "solve it"},
+            "started_at": "2026-08-14T16:15:30Z",
+            "limits": loop.limits.to_dict(),
+        },
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    loop.messages = [{"role": "user", "content": "hi"}]
+    import pytest
+
+    with pytest.raises(ProviderProcessTerminationError):
+        loop._wait_for_ready(fake)
+    assert loop._provider_process is fake
+
+
+def test_production_sender_blocked_under_deadline(tmp_path):
+    """Production _call_provider_via_process blocked send must be deadline-killed and sender verified dead."""
+    import threading
+    import time
+    from flagagent.loop import AgentLoop, ChallengeInput, Limits
+    from flagagent.tools import ExactStringVerifier, FakeExecutor
+    from flagagent.providers import ChatCompletionsModel
+    from flagagent.provider_process import ProviderSenderTerminationError
+
+    model = ChatCompletionsModel(
+        model="m", api_key="sk-test", base_url="http://127.0.0.1:1"
+    )
+    loop = AgentLoop(
+        model=model,
+        executor=FakeExecutor([]),
+        verifier=ExactStringVerifier("Flag{ok}"),
+        challenge=ChallengeInput("fixture", "solve it"),
+        limits=Limits(
+            max_model_turns=2, wall_timeout_seconds=0.6, command_timeout_seconds=1
+        ),
+        runs_root=tmp_path,
+        monotonic=time.monotonic,
+        utc_now=lambda: __import__("datetime", fromlist=["datetime"]).datetime(
+            2026,
+            8,
+            14,
+            16,
+            15,
+            30,
+            tzinfo=__import__("datetime", fromlist=["timezone"]).timezone.utc,
+        ),
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    loop._started = time.monotonic()
+    loop._deadline = loop._started + 0.6
+    loop.artifacts = __import__(
+        "flagagent.artifacts", fromlist=["RunArtifacts"]
+    ).RunArtifacts.create(
+        tmp_path,
+        {
+            "schema_version": 1,
+            "run_id": "FA-20260814T161530Z-a13f4c2d",
+            "flagagent_version": "0.1.0",
+            "concept_version": "0.1.0",
+            "challenge": {"identity": "fixture", "description": "solve it"},
+            "started_at": "2026-08-14T16:15:30Z",
+            "limits": loop.limits.to_dict(),
+        },
+        run_id="FA-20260814T161530Z-a13f4c2d",
+    )
+    loop.messages = [{"role": "user", "content": "hi"}]
+    loop.protocol = "openai-chat"
+
+    captured_threads: list[threading.Thread] = []
+    orig_thread_cls = threading.Thread
+
+    class CapThread(orig_thread_cls):  # type: ignore[valid-type]
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            captured_threads.append(self)
+
+    import unittest.mock as mock
+
+    with mock.patch("threading.Thread", CapThread):
+        loop._ensure_provider_process()
+        pp = loop._provider_process
+
+        def blocking_send(obj):
+            time.sleep(5)
+
+        pp.request_tx.send = blocking_send  # type: ignore[attr-defined]
+        pp._ready = True  # type: ignore[attr-defined]
+        t0 = time.monotonic()
+        import pytest as _pytest
+
+        with _pytest.raises(ProviderSenderTerminationError):
+            loop._call_provider_via_process(remaining=0.5)
+        elapsed = time.monotonic() - t0
+        assert 0.4 <= elapsed < 4.0
+        time.sleep(0.2)
+        assert any(calls for calls in [True])
+
+
+def test_arbitrary_injected_client_routing(tmp_path):
+    """Arbitrary custom injected client class must route inline regardless of name."""
+    from flagagent.anthropic_messages import AnthropicMessagesModel
+    from flagagent.loop import AgentLoop, ChallengeInput, Limits
+    from flagagent.providers import ChatCompletionsModel
+    from flagagent.responses import ResponsesModel
+    from flagagent.tools import ExactStringVerifier, FakeExecutor
+
+    class ArbitraryInjectedClient:
+        def __init__(self):
+            self.chat = self
+            self.completions = self
+            self.messages = self
+            self.responses = self
+
+        def create(self, **kw):
+            raise AssertionError("should not be called via process")
+
+    for cls in [ChatCompletionsModel, ResponsesModel, AnthropicMessagesModel]:
+        fake = ArbitraryInjectedClient()
+        m = cls(model="m", api_key="sk-test", client=fake)
+        assert m._client_injected is True
+        loop = AgentLoop(
+            model=m,
+            executor=FakeExecutor([]),
+            verifier=ExactStringVerifier("Flag{ok}"),
+            challenge=ChallengeInput("f", "d"),
+            limits=Limits(
+                max_model_turns=2, wall_timeout_seconds=5, command_timeout_seconds=1
+            ),
+            runs_root=tmp_path,
+            monotonic=lambda: 0.0,
+            utc_now=lambda: __import__("datetime", fromlist=["datetime"]).datetime(
+                2026,
+                8,
+                14,
+                16,
+                15,
+                30,
+                tzinfo=__import__("datetime", fromlist=["timezone"]).timezone.utc,
+            ),
+            run_id="FA-20260814T161530Z-bbbbbbbb",
+        )
+        assert loop._uses_provider_process() is False
+
+    for cls in [ChatCompletionsModel, ResponsesModel, AnthropicMessagesModel]:
+        m2 = cls(model="m", api_key="sk-test", base_url="http://127.0.0.1:1")
+        assert m2._client_injected is False
+        loop2 = AgentLoop(
+            model=m2,
+            executor=FakeExecutor([]),
+            verifier=ExactStringVerifier("Flag{ok}"),
+            challenge=ChallengeInput("f", "d"),
+            limits=Limits(
+                max_model_turns=2, wall_timeout_seconds=5, command_timeout_seconds=1
+            ),
+            runs_root=tmp_path,
+            monotonic=lambda: 0.0,
+            utc_now=lambda: __import__("datetime", fromlist=["datetime"]).datetime(
+                2026,
+                8,
+                14,
+                16,
+                15,
+                30,
+                tzinfo=__import__("datetime", fromlist=["timezone"]).timezone.utc,
+            ),
+            run_id="FA-20260814T161530Z-cccccccc",
+        )
+        loop2.protocol = {
+            "ChatCompletionsModel": "openai-chat",
+            "ResponsesModel": "openai-responses",
+            "AnthropicMessagesModel": "anthropic",
+        }[cls.__name__]
+        assert loop2._uses_provider_process() is True
+
+    for cls in [ChatCompletionsModel, ResponsesModel, AnthropicMessagesModel]:
+        m3 = cls(model="m", api_key="sk-test", base_url="http://127.0.0.1:1")
+        assert m3.client is not None

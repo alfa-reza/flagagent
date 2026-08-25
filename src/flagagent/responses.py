@@ -195,12 +195,14 @@ class ResponsesModel:
     base_url: str | None = None
     client: Any = field(default=None)
     _remaining_budget: float | None = field(default=None, init=False, repr=False)
+    _client_injected: bool = field(default=False, init=False, repr=False)
     _built_input: list[dict[str, Any]] = field(
         default_factory=list, init=False, repr=False
     )
     _processed_count: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        self._client_injected = self.client is not None
         if self.client is None:
             self.client = _build_client(self.api_key, self.base_url)
 
