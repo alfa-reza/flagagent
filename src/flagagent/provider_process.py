@@ -10,19 +10,21 @@ base url, protocol variant). The supervised provider request uses a
 child-owned adapter/client; the child does not receive the parent's SDK
 client/socket/lock objects; only primitive configuration crosses the boundary.
 
-IPC uses two unidirectional pipes:
+IPC uses three unidirectional pipes:
 
     parent request_tx  ---> child request_rx   (generate / close)
     parent response_rx <--- child response_tx  (ready / response / provider_error / worker_error)
+    parent commit_rx   <--- child commit_tx    (commit marker, sent only after response_tx.send returns)
 
 Protocol (dicts):
 
     -> {"type":"generate","messages":..., "tools":..., "remaining": float|None}
     <- {"type":"ready"}
-    <- {"type":"response","response": dict(ModelResponse.to_dict())}
-    <- {"type":"provider_error","error": str}
-    <- {"type":"worker_error","error": str}
+    <- {"type":"response","response": dict(ModelResponse.to_dict()), "seq": int}
+    <- {"type":"provider_error","error": str, "seq": int}
+    <- {"type":"worker_error","error": str, "seq": int}
     -> {"type":"close"}
+    commit: {"seq": int, "committed_at": float}  # monotonic time sampled after response send returns
 
 A worker/IPC session terminated by the wall deadline is disposable and is
 never reused.
@@ -32,6 +34,7 @@ from __future__ import annotations
 
 import multiprocessing
 import multiprocessing.connection
+import time
 from dataclasses import dataclass
 
 TERM_GRACE = 0.3
@@ -57,8 +60,9 @@ class ProviderConfig:
 
 
 def _child_main(
-    config: ProviderConfig, request_rx, response_tx
+    config: ProviderConfig, request_rx, response_tx, commit_tx
 ) -> None:  # pragma: no cover - exercised via integration tests
+    _seq = 0
     try:
         adapter = _build_adapter(config)
     except Exception as error:
@@ -79,6 +83,10 @@ def _child_main(
             response_tx.close()
         except Exception:
             pass
+        try:
+            commit_tx.close()
+        except Exception:
+            pass
         return
 
     try:
@@ -90,6 +98,10 @@ def _child_main(
             pass
         try:
             response_tx.close()
+        except Exception:
+            pass
+        try:
+            commit_tx.close()
         except Exception:
             pass
         return
@@ -126,9 +138,19 @@ def _child_main(
             response = adapter.generate(messages, tools)
         except Exception as error:
             try:
+                _seq += 1
                 response_tx.send(
-                    {"type": "provider_error", "error": f"{type(error).__name__}"}
+                    {
+                        "type": "provider_error",
+                        "error": f"{type(error).__name__}",
+                        "seq": _seq,
+                    }
                 )
+                committed_at = time.monotonic()
+                try:
+                    commit_tx.send({"seq": _seq, "committed_at": committed_at})
+                except Exception:
+                    pass
             except Exception:
                 break
             continue
@@ -150,7 +172,13 @@ def _child_main(
                     "truncated": bool(getattr(response, "truncated", False)),
                 }
             )
-            response_tx.send({"type": "response", "response": payload})
+            _seq += 1
+            response_tx.send({"type": "response", "response": payload, "seq": _seq})
+            committed_at = time.monotonic()
+            try:
+                commit_tx.send({"seq": _seq, "committed_at": committed_at})
+            except Exception:
+                pass
         except Exception:
             try:
                 response_tx.send(
@@ -166,6 +194,10 @@ def _child_main(
         pass
     try:
         response_tx.close()
+    except Exception:
+        pass
+    try:
+        commit_tx.close()
     except Exception:
         pass
 
@@ -204,10 +236,15 @@ class ProviderProcess:
         self._ctx = multiprocessing.get_context("spawn")
         request_recv, request_send = self._ctx.Pipe(duplex=False)
         response_recv, response_send = self._ctx.Pipe(duplex=False)
+        commit_recv, commit_send = self._ctx.Pipe(duplex=False)
         self._request_tx = request_send
         self._response_rx = response_recv
+        self._commit_rx = commit_recv
+        self._next_seq = 0
         self._proc = self._ctx.Process(
-            target=_child_main, args=(config, request_recv, response_send), daemon=False
+            target=_child_main,
+            args=(config, request_recv, response_send, commit_send),
+            daemon=False,
         )
         self._closed = False
         self._proc.start()
@@ -219,6 +256,10 @@ class ProviderProcess:
             response_send.close()
         except Exception:
             pass
+        try:
+            commit_send.close()
+        except Exception:
+            pass
 
     @property
     def request_tx(self):
@@ -227,6 +268,10 @@ class ProviderProcess:
     @property
     def response_rx(self):
         return self._response_rx
+
+    @property
+    def commit_rx(self):
+        return self._commit_rx
 
     @property
     def conn(self):
@@ -254,6 +299,10 @@ class ProviderProcess:
             pass
         try:
             self._response_rx.close()
+        except Exception:
+            pass
+        try:
+            self._commit_rx.close()
         except Exception:
             pass
         if still_alive:
@@ -300,6 +349,10 @@ class ProviderProcess:
             pass
         try:
             self._response_rx.close()
+        except Exception:
+            pass
+        try:
+            self._commit_rx.close()
         except Exception:
             pass
         if still_alive:
