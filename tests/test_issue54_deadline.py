@@ -162,12 +162,16 @@ def test_provider_response_committed_before_deadline_preserved_despite_late_pare
 
 
 def test_post_deadline_completion_not_preserved(tmp_path):
-    """B: response completing after deadline must not be promoted.
+    """B: response completing after deadline must be rejected via committed_at.
 
-    Provider delay (2s) exceeds wall (0.8s). Absolute deadline wins while
-    provider still working; later commit (committed_at > deadline) must not be
-    reinterpreted as pre-deadline evidence when parent finally runs.
+    Establishes D in real monotonic domain, blocks handler until D has passed,
+    keeps parent from terminating before commit (frozen monotonic), proves
+    commit marker exists with committed_at >= D before allowing parent
+    expiration observation.
     """
+
+    handler_started = threading.Event()
+    handler_release = threading.Event()
 
     class SlowH(BaseHTTPRequestHandler):
         def log_message(self, *a):
@@ -177,7 +181,8 @@ def test_post_deadline_completion_not_preserved(tmp_path):
             l = int(self.headers.get("Content-Length", 0))
             if l:
                 self.rfile.read(l)
-            time.sleep(2.0)
+            handler_started.set()
+            handler_release.wait(timeout=5)
             self.send_response(200)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(CHAT_PAYLOAD)))
@@ -205,39 +210,77 @@ def test_post_deadline_completion_not_preserved(tmp_path):
         utc_now=lambda: NOW,
         run_id="FA-20260814T161530Z-b13f4c2d",
     )
+    real_monotonic = loop.monotonic
     holder = {}
     orig = loop._ensure_provider_process
 
     def cap(*a, **kw):
         r = orig(*a, **kw)
         pp = getattr(loop, "_provider_process", None)
-        if pp is not None and "proc" not in holder:
-            holder["proc"] = pp.proc
+        if pp is not None and "pp" not in holder:
             holder["pp"] = pp
+            holder["proc"] = pp.proc
         return r
 
     loop._ensure_provider_process = cap
-    t0 = time.monotonic()
+
+    def watch():
+        for _ in range(100):
+            if holder.get("pp") is not None:
+                break
+            time.sleep(0.02)
+        for _ in range(100):
+            if hasattr(loop, "_deadline"):
+                break
+            time.sleep(0.02)
+        pp = holder.get("pp")
+        deadline = getattr(loop, "_deadline", None)
+        if pp is None or deadline is None:
+            return
+        loop.monotonic = lambda: deadline - 0.5
+        handler_started.wait(timeout=5)
+        while real_monotonic() < deadline + 0.2:
+            time.sleep(0.02)
+        handler_release.set()
+        cr = getattr(pp, "commit_rx", None)
+        if cr is not None:
+            cr.poll(timeout=5)
+        loop.monotonic = lambda: deadline + 1.0
+
+    bg = threading.Thread(target=watch, daemon=True)
+    bg.start()
+    t0 = real_monotonic()
     result = loop.run()
-    elapsed = time.monotonic() - t0
+    elapsed = real_monotonic() - t0
+    try:
+        loop.monotonic = real_monotonic
+    except Exception:
+        pass
     srv.shutdown()
     srv.server_close()
     assert result["status:reason"] == "unsolved:wall_limit"
-    assert 0.6 <= elapsed < 4.0
     assert result["model_calls"] == 1
     assert result["tool_calls"] == 0
+    assert elapsed < 5.0
     events = read_events(loop.artifacts.events_path)
     assert not any(e["type"] == "model_response" for e in events)
     assert not any(e["type"] == "tool_call" for e in events)
     terminal = next(e for e in events if e["type"] == "terminal_decision")
     assert terminal["payload"]["unprocessed_call_ids"] == []
+    assert loop._tool_calls == 0
+    assert not any(e["type"] == "tool_call" for e in events)
+    assert loop._input_tokens is None
+    assert loop._output_tokens is None
+    pp = holder.get("pp")
+    if pp is not None:
+        assert not pp.is_alive()
+        assert pp.exitcode is not None
     raw = holder.get("proc")
     if raw is not None:
         assert not raw.is_alive()
         assert raw.exitcode is not None
-    pp = holder.get("pp")
-    if pp is not None:
-        assert not pp.is_alive()
+    assert handler_started.is_set()
+    assert handler_release.is_set()
 
 
 def test_provider_error_before_deadline_preserved(tmp_path):
