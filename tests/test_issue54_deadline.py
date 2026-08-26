@@ -166,8 +166,8 @@ def test_post_deadline_completion_not_preserved(tmp_path):
 
     Establishes D in real monotonic domain, blocks handler until D has passed,
     keeps parent from terminating before commit (frozen monotonic), proves
-    commit marker exists with committed_at >= D before allowing parent
-    expiration observation.
+    production parent actually receives commit with committed_at >= D before
+    allowing parent expiration observation.
     """
 
     handler_started = threading.Event()
@@ -211,15 +211,44 @@ def test_post_deadline_completion_not_preserved(tmp_path):
         run_id="FA-20260814T161530Z-b13f4c2d",
     )
     real_monotonic = loop.monotonic
-    holder = {}
+    holder: dict[str, object] = {}
     orig = loop._ensure_provider_process
+
+    class _CommitRxWrapper:
+        def __init__(self, real):
+            self._real = real
+            self.observed_commit = None
+            self.received = threading.Event()
+
+        def fileno(self):
+            return self._real.fileno()
+
+        def poll(self, timeout=0):
+            return self._real.poll(timeout)
+
+        def recv(self):
+            msg = self._real.recv()
+            if isinstance(msg, dict) and "committed_at" in msg:
+                self.observed_commit = msg
+                self.received.set()
+            return msg
+
+        def close(self):
+            return self._real.close()
 
     def cap(*a, **kw):
         r = orig(*a, **kw)
         pp = getattr(loop, "_provider_process", None)
         if pp is not None and "pp" not in holder:
-            holder["pp"] = pp
-            holder["proc"] = pp.proc
+            try:
+                real_cr = pp._commit_rx  # type: ignore[attr-defined]
+                wrapper = _CommitRxWrapper(real_cr)
+                pp._commit_rx = wrapper  # type: ignore[attr-defined]
+                holder["wrapper"] = wrapper  # type: ignore[assignment]
+            except Exception:
+                pass
+            holder["pp"] = pp  # type: ignore[assignment]
+            holder["proc"] = pp.proc  # type: ignore[assignment]
         return r
 
     loop._ensure_provider_process = cap
@@ -235,17 +264,22 @@ def test_post_deadline_completion_not_preserved(tmp_path):
             time.sleep(0.02)
         pp = holder.get("pp")
         deadline = getattr(loop, "_deadline", None)
+        wrapper = holder.get("wrapper")
         if pp is None or deadline is None:
             return
-        loop.monotonic = lambda: deadline - 0.5
+        holder["deadline"] = deadline  # type: ignore[assignment]
+        loop.monotonic = lambda: deadline - 0.5  # type: ignore[assignment]
         handler_started.wait(timeout=5)
-        while real_monotonic() < deadline + 0.2:
+        while real_monotonic() < deadline + 0.2:  # type: ignore[operator]
             time.sleep(0.02)
         handler_release.set()
-        cr = getattr(pp, "commit_rx", None)
-        if cr is not None:
-            cr.poll(timeout=5)
-        loop.monotonic = lambda: deadline + 1.0
+        if wrapper is not None:
+            wrapper.received.wait(timeout=5)  # type: ignore[union-attr]
+        else:
+            cr = getattr(pp, "commit_rx", None)
+            if cr is not None:
+                cr.poll(timeout=5)
+        loop.monotonic = lambda: deadline + 1.0  # type: ignore[assignment]
 
     bg = threading.Thread(target=watch, daemon=True)
     bg.start()
@@ -258,6 +292,14 @@ def test_post_deadline_completion_not_preserved(tmp_path):
         pass
     srv.shutdown()
     srv.server_close()
+    wrapper = holder.get("wrapper")  # type: ignore[assignment]
+    observed = (
+        getattr(wrapper, "observed_commit", None) if wrapper is not None else None
+    )
+    deadline = holder.get("deadline")
+    assert observed is not None
+    assert deadline is not None
+    assert float(observed["committed_at"]) >= float(deadline)  # type: ignore[index,arg-type]
     assert result["status:reason"] == "unsolved:wall_limit"
     assert result["model_calls"] == 1
     assert result["tool_calls"] == 0
@@ -271,14 +313,14 @@ def test_post_deadline_completion_not_preserved(tmp_path):
     assert not any(e["type"] == "tool_call" for e in events)
     assert loop._input_tokens is None
     assert loop._output_tokens is None
-    pp = holder.get("pp")
+    pp = holder.get("pp")  # type: ignore[assignment]
     if pp is not None:
-        assert not pp.is_alive()
-        assert pp.exitcode is not None
-    raw = holder.get("proc")
+        assert not pp.is_alive()  # type: ignore[union-attr]
+        assert pp.exitcode is not None  # type: ignore[union-attr]
+    raw = holder.get("proc")  # type: ignore[assignment]
     if raw is not None:
-        assert not raw.is_alive()
-        assert raw.exitcode is not None
+        assert not raw.is_alive()  # type: ignore[union-attr]
+        assert raw.exitcode is not None  # type: ignore[union-attr]
     assert handler_started.is_set()
     assert handler_release.is_set()
 
