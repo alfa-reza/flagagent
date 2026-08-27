@@ -87,7 +87,7 @@ WORKSPACE_TARGET = "/workspace"
 # Runtime containers use the invoking process's numeric UID/GID instead.
 AGENT_USER = "agent"
 KEEPALIVE_COMMAND = "sleep infinity"
-_VERSION = "0.1.0"
+_VERSION = "0.1.1"
 
 
 def _runtime_user() -> str:
