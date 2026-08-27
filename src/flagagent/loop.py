@@ -746,26 +746,57 @@ class AgentLoop:
         except Exception:
             pass
 
+        response_state: dict[str, Any] = {}
+        response_done = threading.Event()
+
+        def _response_receiver() -> None:
+            try:
+                m = resp_rx.recv()  # type: ignore[union-attr]
+                response_state["msg"] = m
+            except Exception as exc:
+                response_state["exc"] = exc
+            finally:
+                response_done.set()
+
+        receiver = threading.Thread(target=_response_receiver, daemon=True)
+        receiver.start()
+
+        def _join_receiver(timeout: float) -> None:
+            try:
+                receiver.join(timeout=timeout)
+            except Exception:
+                pass
+
+        def _response_msg() -> tuple[dict[str, Any] | None, Exception | None]:
+            if "exc" in response_state:
+                return None, response_state["exc"]  # type: ignore[return-value]
+            m = response_state.get("msg")
+            if isinstance(m, dict):
+                return m, None
+            return None, None
+
         def _try_preserve_bounded() -> tuple[str, dict[str, Any]] | None:
             crx = commit_rx
             if crx is None:
                 return None
             try:
                 if not crx.poll(timeout=0):  # type: ignore[union-attr]
-                    return None
+                    if not crx.poll(timeout=0.2):  # type: ignore[union-attr]
+                        return None
                 cmsg = crx.recv()  # type: ignore[union-attr]
             except Exception:
                 return None
             if not isinstance(cmsg, dict) or cmsg.get("seq") != expected:
                 return None
             committed_at = cmsg.get("committed_at")
-            if not isinstance(committed_at, (int, float)) or not float(committed_at) < float(deadline):
+            if not isinstance(committed_at, (int, float)) or not float(
+                committed_at
+            ) < float(deadline):
                 return None
-            try:
-                if not resp_rx.poll(timeout=0.5):  # type: ignore[union-attr]
-                    return None
-                msg = resp_rx.recv()
-            except Exception:
+            if not response_done.wait(timeout=1.0):
+                return None
+            msg, exc = _response_msg()
+            if exc is not None:
                 return None
             if not isinstance(msg, dict):
                 return None
@@ -784,8 +815,10 @@ class AgentLoop:
             if wait <= 0:
                 preserved = _try_preserve_bounded()
                 if preserved is not None:
+                    _join_receiver(0.2)
                     return preserved
                 self._terminate_for_deadline(proc)
+                _join_receiver(1.0)
                 return None
             try:
                 watch = [commit_rx, sentinel] if commit_rx is not None else [sentinel]
@@ -795,12 +828,15 @@ class AgentLoop:
             if self.monotonic() >= deadline:
                 preserved = _try_preserve_bounded()
                 if preserved is not None:
+                    _join_receiver(0.2)
                     return preserved
                 self._terminate_for_deadline(proc)
+                _join_receiver(1.0)
                 return None
             if not ready:
                 continue
             if sentinel in ready:
+                _join_receiver(0.5)
                 return ("worker_error", {"error": "child_exit"})
             if commit_rx is not None and commit_rx in ready:
                 try:
@@ -815,13 +851,10 @@ class AgentLoop:
                         continue
                 else:
                     continue
-                try:
-                    if not resp_rx.poll(timeout=0.5):
-                        continue
-                    msg = resp_rx.recv()
-                except EOFError:
-                    return ("worker_error", {"error": "eof"})
-                except Exception:
+                if not response_done.wait(timeout=1.5):
+                    continue
+                msg, exc = _response_msg()
+                if exc is not None:
                     return ("worker_error", {"error": "recv"})
                 if not isinstance(msg, dict):
                     return ("worker_error", {"error": "bad_msg"})
@@ -829,8 +862,10 @@ class AgentLoop:
                     continue
                 msg_type = msg.get("type")
                 if msg_type == "response":
+                    _join_receiver(0.1)
                     return ("response", msg.get("response") or {})
                 if msg_type == "provider_error":
+                    _join_receiver(0.1)
                     return ("provider_error", msg)
                 continue
 
