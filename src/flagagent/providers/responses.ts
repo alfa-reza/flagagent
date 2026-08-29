@@ -233,7 +233,8 @@ export class ResponsesModel {
     let client: unknown = this.client;
     let requestOptions: Record<string, unknown> | undefined;
     if (this.remainingBudget != null) {
-      const res = clientForBudget(this.client, this.remainingBudget);
+      const signal = (this as unknown as { _signal?: AbortSignal })._signal;
+      const res = clientForBudget(this.client, this.remainingBudget, signal);
       client = res.client;
       requestOptions = res.options;
     }

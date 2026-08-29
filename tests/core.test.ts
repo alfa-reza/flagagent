@@ -56,7 +56,9 @@ describe("model snapshot and contracts", () => {
     const model = new ScriptedModel([new ModelResponse("first"), err]);
     const messages: Record<string, unknown>[] = [{ role: "user", content: "task" }];
     const tools: Record<string, unknown>[] = [{ name: "shell" }];
-    expect((await model.generate(messages as never[], tools as never[])).content).toBe("first");
+    expect((await model.generate(messages as never[], tools as never[])).content).toBe(
+      "first",
+    );
     messages[0]!.content = "changed";
     tools[0]!.name = "changed";
     await expect(model.generate(messages as never[], tools as never[])).rejects.toThrow(

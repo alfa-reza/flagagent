@@ -245,7 +245,13 @@ export class SandboxError extends Error {
 }
 
 export interface Executor {
-  execute(command: string, timeoutSeconds: number): ShellResult;
+  execute(command: string, timeoutSeconds: number): ShellResult | Promise<ShellResult>;
+  prepare?: (workspace: string, runId: string) => void | Promise<void>;
+  cleanup?: (runId: string) => void | Promise<void>;
+  setRemaining?: (remaining: number) => void;
+  setExecutionDeadline?: (deadline: number, monotonic: () => number) => void;
+  sandboxProvenance?: () => Record<string, unknown>;
+  sandboxLifecycle?: () => Record<string, unknown>;
 }
 
 export type VerifierOutcome = "correct" | "incorrect";

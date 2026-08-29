@@ -232,7 +232,8 @@ export class AnthropicMessagesModel {
     if (this.remainingBudget != null) {
       if (this.remainingBudget <= 0)
         throw new ProviderError("messages request budget exhausted");
-      const res = clientForBudget(this.client, this.remainingBudget);
+      const signal = (this as unknown as { _signal?: AbortSignal })._signal;
+      const res = clientForBudget(this.client, this.remainingBudget, signal);
       client = res.client;
       requestOptions = res.options;
     }

@@ -149,13 +149,19 @@ function parseChatResponse(response: unknown): ModelResponse {
 function clientForBudget(
   client: unknown,
   budgetSeconds: number,
+  signal?: AbortSignal,
 ): { client: unknown; options?: Record<string, unknown> } {
   const ms = Math.ceil(budgetSeconds * 1000);
+  // timeout/maxRetries are client options (via withOptions), signal is per-request
+  const clientOpts: Record<string, unknown> = { timeout: ms, maxRetries: 0 };
   const withOptions = (client as Record<string, unknown>).withOptions as
     ((opts: Record<string, unknown>) => unknown) | undefined;
   if (typeof withOptions === "function") {
-    return { client: withOptions.call(client, { timeout: ms, maxRetries: 0 }) };
+    const newClient = withOptions.call(client, clientOpts);
+    if (signal) return { client: newClient, options: { signal } };
+    return { client: newClient };
   }
+  if (signal) return { client, options: { timeout: ms, maxRetries: 0, signal } };
   return { client, options: { timeout: ms, maxRetries: 0 } };
 }
 
@@ -220,7 +226,8 @@ export class ChatCompletionsModel {
     if (this.remainingBudget != null) {
       if (this.remainingBudget <= 0)
         throw new ProviderError("chat completions request budget exhausted");
-      const res = clientForBudget(this.client, this.remainingBudget);
+      const signal = (this as unknown as { _signal?: AbortSignal })._signal;
+      const res = clientForBudget(this.client, this.remainingBudget, signal);
       client = res.client;
       requestOptions = res.options;
     }
