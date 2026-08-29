@@ -240,7 +240,15 @@ export class RunArtifacts {
   }
 
   close(): void {
-    closeSync(this.eventDescriptor);
+    if ((this.eventDescriptor as unknown as number) === -1) return;
+    try {
+      closeSync(this.eventDescriptor);
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException)?.code;
+      if (code !== "EBADF") throw error;
+    } finally {
+      (this as unknown as { eventDescriptor: number }).eventDescriptor = -1;
+    }
   }
 }
 

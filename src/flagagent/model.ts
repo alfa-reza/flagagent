@@ -163,7 +163,7 @@ export type ModelMessage = Record<string, unknown>;
 export type ModelTool = Record<string, unknown>;
 
 export interface Model {
-  generate(messages: ModelMessage[], tools: ModelTool[]): ModelResponse;
+  generate(messages: ModelMessage[], tools: ModelTool[]): Promise<ModelResponse>;
 }
 
 export type ScriptItem = ModelResponse | Error;
@@ -185,7 +185,7 @@ export class ScriptedModel implements Model {
     this.script = [...script];
   }
 
-  generate(messages: ModelMessage[], tools: ModelTool[]): ModelResponse {
+  async generate(messages: ModelMessage[], tools: ModelTool[]): Promise<ModelResponse> {
     const messageSnapshot = snapshotJson(messages);
     const toolSnapshot = snapshotJson(tools);
     if (!Array.isArray(messageSnapshot) || !Array.isArray(toolSnapshot)) {

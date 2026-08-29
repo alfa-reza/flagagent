@@ -51,15 +51,15 @@ describe("model snapshot and contracts", () => {
     expect(() => new ToolCall("call-1", "", { command: "true" })).toThrow();
     expect(() => new ToolCall("call-1", "shell", [])).toThrow();
   });
-  it("scripted model snapshots and replays error", () => {
+  it("scripted model snapshots and replays error", async () => {
     const err = new Error("provider failed");
     const model = new ScriptedModel([new ModelResponse("first"), err]);
     const messages: Record<string, unknown>[] = [{ role: "user", content: "task" }];
     const tools: Record<string, unknown>[] = [{ name: "shell" }];
-    expect(model.generate(messages as never[], tools as never[]).content).toBe("first");
+    expect((await model.generate(messages as never[], tools as never[])).content).toBe("first");
     messages[0]!.content = "changed";
     tools[0]!.name = "changed";
-    expect(() => model.generate(messages as never[], tools as never[])).toThrow(
+    await expect(model.generate(messages as never[], tools as never[])).rejects.toThrow(
       "provider failed",
     );
     expect(model.calls[0]).toEqual([
@@ -274,6 +274,7 @@ describe("artifacts", () => {
         EventStreamPoisoned,
       );
       a.close();
+      expect(() => a.close()).not.toThrow();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -300,6 +301,8 @@ describe("artifacts", () => {
         }),
       ).toThrow();
       a.close();
+      // idempotent: second close does not throw
+      expect(() => a.close()).not.toThrow();
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
