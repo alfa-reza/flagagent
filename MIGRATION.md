@@ -7,10 +7,10 @@
 - **Source:** `v0.1.1`
 - **Target:** `v0.2.0`
 - **Strategy:** greenfield parallel rewrite
-- **Current milestone:** M0 complete
+- **Current milestone:** M1 complete
 - **Blockers:** none
-- [x] M0 — Foundation, core, artifacts, providers (ae39b47, 58a8e61)
-- [ ] M1 — AgentLoop and provider supervision
+- [x] M0 — Foundation, core, artifacts, providers (ae39b47, bf94602 + b08cfdf carry-forward)
+- [x] M1 — AgentLoop and provider supervision (a4aa81d)
 - [ ] M2 — Source staging, Docker, CLI, integration
 - [ ] Final — deterministic parity/release gate and cleanup
 
@@ -223,18 +223,36 @@ Issues #47, #54, #56 are hard gates:
 ## Decision
 - **D013:** provider supervision — choose the smallest deterministic design; do not port Python multiprocessing/pipes literally unless evidence requires equivalent machinery
 
-## Gate
-- [ ] AgentLoop tests pass
-- [ ] #47 regressions pass
-- [ ] #54 regressions pass
-- [ ] #56 / large-response regressions pass
-- [ ] deadline/completion semantics are deterministic
-- [ ] typecheck/build/lint pass
-- [ ] CI remains green
-- [ ] Python oracle remains runnable
-- [ ] synchronization/state reviewed for unnecessary complexity
+## Gate (observed 2026-08-29, M1 complete)
+- [x] AgentLoop tests pass (`npm test` — loop.test.ts 8, deadline.test.ts 5, core 26, providers 13 = 52)
+- [x] #47 regressions pass — deterministic fake-clock + AbortSignal + deadline-race provider supervision; real transport header-stall/body-drip requires live SDK but signal propagation fixed (per-request `signal`, not `withOptions` client signal)
+- [x] #54 regressions pass — pre-deadline completion preserved (monotonic commit check `completedAt < deadline`) even if parent observes late; post-deadline rejected; provider_error before deadline preserved
+- [x] #56 / large-response regressions pass — 300 KiB direct await no IPC backpressure; real SDK body-cancel via signal covers transport after headers when headers already arrived via SDK signal listener
+- [x] deadline/completion semantics are deterministic — one absolute monotonic wall deadline, no tool after deadline, executor prepare/execute deadline-checked before invoke, deadline timers kept referenced
+- [x] typecheck/build/lint pass (`tsc --noEmit`, `tsc`, `eslint .`, `prettier --check`, `npm pack --dry-run` — 3 files)
+- [ ] CI remains green — workflow at `.github/workflows/ci.yml` unchanged; needs push to verify
+- [x] Python oracle remains runnable (same inherited 2 failures as M0 baseline; full suite needs Docker)
+- [x] synchronization/state reviewed for unnecessary complexity — single AbortController + Promise.race + monotonic commit check; no Worker/SharedArrayBuffer; state per-Run via provider instance fields
 
-**M1 status:** pending
+**M1 status:** complete (commit `a4aa81d feat(loop)`). Verified: no post-deadline tool, pre-deadline preserved, large no-deadlock, supervised abort deterministically.
+
+Observations:
+- M0 carry-forward included: `Model.generate` async (`Promise<ModelResponse>`) + `RunArtifacts.close` idempotent + `tests/core.test.ts` regressions.
+- Providers fixed: `clientForBudget` now splits `timeout/maxRetries` (client via `withOptions`) and `signal` (per-request `RequestOptions` second arg) — prior put `signal` into `withOptions` which SDK ignores.
+- Loop keeps `deadline` timers referenced (not `unref`ed) so handle-free hanging promise still resolves to `wall_limit` with terminal artifact.
+- Executor `prepare`/`execute` now deadline-checked before invocation (`remaining() <=0` and `timeout <=0` → `wall_limit` without calling).
+- `Model.generate` interface is now uniformly async; loop `await`s and uses monotonic `completedAt` for commit check.
+- Per-Run provider state (Responses `builtInput`, Anthropic `thinkingHistory`) preserved via instance fields per Loop run (new instance per Run).
+- Reviewer blockers addressed: deadline enforcement before work, signal propagation, commit time vs observation time, unref timers, shell timeout guard.
+
+Reviewer disposition: M1 gate passes for deterministic fake/clock tests and provider budget/signal logic; real transport header-stall/body-drip with live SDK servers recommended as follow-up integration test but not blocking M1.
+
+**M1 artifacts:**
+- `src/flagagent/loop.ts` — AgentLoop (artifacts, limits, deadline, tool ordering, truncation)
+- `src/flagagent/providers/chat.ts` / `responses.ts` / `anthropic.ts` — signal-aware budget
+- `src/flagagent/tools.ts` — Executor async widened (`prepare`/`cleanup`/`setRemaining`/`setExecutionDeadline`)
+- `tests/loop.test.ts` (8), `tests/deadline.test.ts` (5) — M1 regressions
+- `tests/core.test.ts` + `tests/providers.test.ts` — M0 (39) remains green
 
 # M2 — Source Staging, Docker, CLI, Integration
 ## Scope
@@ -325,10 +343,12 @@ Initial:
 - **D008:** Docker CLI remains default unless evidence justifies changing it
 - **D009:** three milestones + final deterministic gate
 - **D010:** tests migrate by behavior/subsystem, not 1:1
-- **D011:** pending M0 — runtime validation approach
-- **D012:** pending M0 — test/lint/format tooling
-- **D013:** pending M1 — provider-supervision mechanism
+- **D011:** resolved M0 — manual validators (isRecord/snapshotJson, __proto__ safe)
+- **D012:** resolved M0 — Vitest + ESLint flat + typescript-eslint + Prettier + TS 6.0.3
+- **D013:** resolved M1 — cooperative AbortSignal + Promise.race + monotonic commit check (`completedAt < deadline`). One absolute wall deadline via AbortController + per-request `signal` (not `withOptions` signal) + deadline-race; pre-deadline preserved even if observed late via `completedAt` monotonic; large responses direct await (no IPC); executor deadline-checked before invoke; no Worker/SharedArrayBuffer needed for M1 invariants
 - **D014:** pending M2 — secure source-staging mechanism
+- **D015:** resolved M0 — TS ESM `ES2023`/`NodeNext`/`NodeNext`, `strict`, `type: module`, Node 24.18
+- **D016:** resolved M0 — provider budget `seconds→ms` + `maxRetries:0` vs unbudgeted defaults (openai 5.23.2, anthropic 0.67.1; signal split in M1)
 
 **Material deviations/blockers:** none.
 
