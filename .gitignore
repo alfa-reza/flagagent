@@ -15,6 +15,7 @@ htmlcov/
 # Build artifacts
 build/
 dist/
+node_modules/
 
 # Runtime artifacts
 runs/
