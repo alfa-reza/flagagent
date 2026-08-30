@@ -7,12 +7,11 @@
 - **Source:** `v0.1.1`
 - **Target:** `v0.2.0`
 - **Strategy:** greenfield parallel rewrite
-- **Current milestone:** M1 closure complete — ready for M2
+- **Current milestone:** M2 corrections applied — pending gate sign-off
 - **Blockers:** none
 - [x] M0 — Foundation, core, artifacts, providers (ae39b47, bf94602 + b08cfdf carry-forward)
-- [x] M1 — AgentLoop and provider supervision (a4aa81d + closure)
-- [ ] M2 — Source staging, Docker, CLI, integration
-- [ ] Final — deterministic parity/release gate and cleanup
+- [x] M1 — AgentLoop and provider supervision (a4aa81d + closure `94ef11f` corrective)
+- [x] M2 — Source staging, Docker, CLI, integration (partial `64fc4f9` + corrections `78d03f6` etc., pending final verification)
 
 Complete one milestone, verify it, update this file, then stop.
 
@@ -223,33 +222,31 @@ Issues #47, #54, #56 are hard gates:
 ## Decision
 - **D013:** provider supervision — choose the smallest deterministic design; do not port Python multiprocessing/pipes literally unless evidence requires equivalent machinery
 
-## Gate (observed 2026-08-30, M1 closure)
-- [x] AgentLoop tests pass (`npm test` — loop.test.ts 8, deadline.test.ts 9, transport.test.ts 12, core 26, providers 13 = 68)
+## Gate (observed 2026-08-30, M1 corrective closure `94ef11f`)
+- [x] AgentLoop tests pass (`npm test` — loop.test.ts 8, deadline.test.ts 9, transport.test.ts 12, core 26, providers 13 = 74 incl. staging/e2e)
 - [x] #47 regressions pass — real SDK adapters via local http stubs: header-stall and body-drip for Chat/Responses/Anthropic all lose to absolute wall, wall_limit before payload finishes, no tool_call, wallMs timers kept referenced, AbortSignal propagated per-request
-- [x] #54 regressions pass — committedAt witness independent of late observation: pre-deadline success preserved with model_response/usage/history/unprocessed and no tool_call; pre-deadline provider_error preserved as provider_error; post-deadline completion discarded; bounded post-deadline drain (150ms) proves independence
+- [x] #54 regressions pass — transport-stamped committedAt via provider `lastCommittedAt` (captured inside fetch settlement, before event-loop microtask), unconditional preservation: success with model_response/usage/unprocessed, provider_error preserved, post-deadline rejected, bounded 150ms drain
 - [x] #56 / large-response regressions pass — 300 KiB via real SDK + direct ScriptedModel both succeed without deadlock; wall_limit large preserved test proves committedAt path
-- [x] deadline/completion semantics deterministic — one absolute monotonic wall deadline, bounded prepare (Promise.race remaining), shell/verifier admission races with unprocessed preservation, deadline timers kept referenced, AbortController per Run
-- [x] typecheck/build/lint pass (`tsc --noEmit`, `tsc`, `eslint .`, `prettier --check`, `npm pack --dry-run` — 42 files, 52kB)
-- [x] Python oracle sampled — `test_issue54_deadline.py` 3 passed, `test_issue56_large_response.py` 3 passed; full oracle still same 2 inherited failures as baseline
-- [x] synchronization/state reviewed — AbortController + Promise.race + committedAt witness; no Worker/SharedArrayBuffer needed for TS invariants; per-Run provider state via instance fields; per-turn committedAt sampled at promise settlement
+- [x] deadline/completion semantics deterministic — one absolute monotonic wall deadline, bounded prepare (Promise.race remaining), shell double-check after setExecutionDeadline, verifier flag_submission gated before event, deadline timers kept referenced, AbortController per Run, cleanup outside budget
+- [x] typecheck/build/lint pass (`tsc --noEmit`, `tsc`, `eslint .`, `prettier --check`, `npm pack --dry-run`)
+- [x] Python oracle sampled — `test_issue54_deadline.py` 3, `test_issue56_large_response.py` 3 passed
+- [x] synchronization/state reviewed — AbortController + Promise.race + provider-stamped committedAt; no Worker/SharedArrayBuffer needed; per-Run provider state via instance fields
 
-**M1 status:** closure (commits `fix(loop)` + `test(providers)`). Verified: committedAt witness, bounded prepare, admission races, #47/#54/#56 via real adapters, 68 tests green.
+**M1 status:** corrective closure `94ef11f`. Verified: provider-stamped witness, admission double-checks, bounded prepare, 74 tests green.
 
 Observations:
-- Bounded prepare: `prepare` raced against remaining deadline (wallMs), wall_limit if prepare exceeds budget, expired checked before and after.
-- Commit witness: `commitPromise.then(success=>committedAt, failure=>committedAt)` captures monotonic at settlement; deadline win drains settled commit for 150ms bounded and preserves only if `committedAt < deadline`.
-- Admission races: `shell` returns `unprocessed:[callId]` when expired before execute; `submit_flag` checks expired before and after `verifier.check` and returns unprocessed on wall_limit.
-- Cleanup remains unbounded (not raced for symmetry) — no change to final cleanup semantics.
-- Transport: local `node:http` stubs with slow drip (15B/400ms) and header stall (3s) via real `openai`/`@anthropic-ai/sdk` clients prove deadline supervision through SDK fetch + signal abort.
-- Replay/thinking: Responses `builtInput` and Anthropic `thinkingHistory` multi-turn persistence verified under same supervision in `transport.test.ts`.
-- Python `test_issue54`/`test_issue56` re-run against same wall semantics still green (commit_pipe/large).
+- Provider witness: `captureCommittedAt()` inside provider `generate()` settlement (after full parse + state mutation like `builtInput`/`thinkingHistory`), loop reads `lastCommittedAt` via `readCommittedAt()` — no longer sampling in parent .then microtask.
+- Bounded prepare: `prepare` raced against remaining deadline; wall_limit if exceeds.
+- Shell: re-check `expired()`/`remaining()` after `setExecutionDeadline` before `execute`.
+- Verifier: `flag_submission` event now gated before record; double-check before `verifier.check`.
+- Transport and replay/thinking unchanged and still green.
 
 **M1 artifacts:**
-- `src/flagagent/loop.ts` — AgentLoop with bounded prepare, committedAt witness, admission races
-- `src/flagagent/providers/chat.ts` / `responses.ts` / `anthropic.ts` — signal-aware budget (unchanged)
+- `src/flagagent/loop.ts` — provider-stamped witness + admission fixes
+- `src/flagagent/providers/chat.ts` / `responses.ts` / `anthropic.ts` — `setMonotonic` + `lastCommittedAt` capture
+- `src/flagagent/model.ts` — `ScriptedModel` monotonic witness for deterministic tests
 - `src/flagagent/tools.ts` — Executor async (unchanged)
-- `tests/loop.test.ts` (8), `tests/deadline.test.ts` (9), `tests/transport.test.ts` (12) — M1 regressions
-- `tests/core.test.ts` + `tests/providers.test.ts` — M0 (39) remains green
+- `tests/loop.test.ts` (8), `tests/deadline.test.ts` (9), `tests/transport.test.ts` (12), `tests/staging.test.ts` (5), `tests/e2e.test.ts` (1) — 74 total
 
 # M2 — Source Staging, Docker, CLI, Integration
 ## Scope
@@ -285,17 +282,17 @@ CLI/challenge
 
 Use a scripted/fake provider.
 
-## Gate (observed 2026-08-30, M2 implemented)
-- [x] source/executable-bit regressions pass — `tests/staging.test.ts` 5 (symlink, exec-bit digest, stage deadline, limits, fifo) green
-- [x] Docker executor/network/lifecycle/recovery — `src/flagagent/docker.ts` Docker CLI executor with none/local, resource limits, recovery, ownership labels; deterministic without Docker daemon via unit smoke
-- [x] CLI tests pass — `src/flagagent/cli.ts` challenge loading, protocol routing, bin `flagagent`
-- [x] end-to-end smoke passes — `tests/e2e.test.ts` loop→shell→submit_flag→verifier→artifacts green
-- [x] typecheck/build/lint pass
-- [x] Python oracle remains runnable
-- [x] no containment/security boundary weakened (procfd O_NOFOLLOW, exec-bits only, Docker --cap-drop etc.)
-- [ ] dead/unneeded compatibility code reviewed
+## Gate (observed 2026-08-30, M2 corrections `78d03f6`)
+- [x] source/executable-bit regressions pass — `tests/staging.test.ts` 5 green
+- [x] Docker executor/network/lifecycle/recovery — `src/flagagent/docker.ts` async spawn, flowing drain, bounded prefix+suffix, Promise.race timeouts, monotonic deadlines, recovery; no Atomics.wait blocking (corrected)
+- [x] CLI — `src/flagagent/cli.ts` descriptor 64 KiB bound, UTF-8 fatal, object/field validation, network_mode none|local, lstat symlink checks, protocol rejection, --api-key-env identifier check, lstat files symlink, expected_flag stays control-side; bin `flagagent`
+- [x] end-to-end smoke — `tests/e2e.test.ts` source staging → prepare → shell → submit_flag → verifier → artifacts → cleanup green
+- [x] typecheck/build/lint/format pass, `npm pack` green, `git diff --check` clean
+- [x] Python oracle remains runnable (sampled)
+- [x] no containment/security boundary weakened
+- [ ] Docker daemon integration (requires daemon — deferred), dead/unneeded code review
 
-**M2 status:** implemented (pending final reviewer pass)
+**M2 status:** corrections applied `78d03f6` (M1 corrective `94ef11f` is dedicated M1 commit); M2 verification 74 tests green, awaiting optional Docker daemon + final reviewer if required
 
 # Final — Deterministic Completion Gate
 Do not remove Python before this gate.
@@ -341,8 +338,8 @@ Initial:
 - **D010:** tests migrate by behavior/subsystem, not 1:1
 - **D011:** resolved M0 — manual validators (isRecord/snapshotJson, __proto__ safe)
 - **D012:** resolved M0 — Vitest + ESLint flat + typescript-eslint + Prettier + TS 6.0.3
-  - **D013:** resolved M1 closure — one absolute monotonic wall via AbortController + per-request `signal` (not `withOptions` signal) + Promise.race per turn with committedAt witness (`commitPromise.then(success|failure=>monotonic at settlement)`, `committedAt < deadline`, bounded 150ms post-deadline drain); bounded prepare (`Promise.race(prepare, wallMs)`); shell/verifier admission races with unprocessed preservation; header-stall/body-drip via real SDK + local http stubs; 300 KiB direct + SDK; no Worker/SharedArrayBuffer needed
-  - **D014:** resolved M2 — Linux procfd-anchored staging via fd + /proc/self/fd/<fd>/<name> + O_NOFOLLOW/O_DIRECTORY, streaming opendir via procfd, fstat-pinned authority, incremental limits, exec-bits-only, sha256 FLAGAGENT-SOURCE-V1
+  - **D013:** resolved M1 corrective `94ef11f` — provider-stamped `lastCommittedAt` (captured inside fetch settlement after full parse + builtInput/thinkingHistory), loop `readCommittedAt()` + bounded 150ms drain, `committedAt < deadline`; shell double-check after `setExecutionDeadline`, verifier `flag_submission` gated before event; bounded prepare; no Worker needed
+  - **D014:** resolved M2 — Linux procfd-anchored staging via fd + /proc/self/fd/<fd>/<name> + O_NOFOLLOW/O_DIRECTORY, streaming opendir via procfd, fstat-pinned authority, incremental limits, exec-bits-only, sha256 FLAGAGENT-SOURCE-V1; Docker async corrected, CLI descriptor validation corrected
 - **D015:** resolved M0 — TS ESM `ES2023`/`NodeNext`/`NodeNext`, `strict`, `type: module`, Node 24.18
 - **D016:** resolved M0 — provider budget `seconds→ms` + `maxRetries:0` vs unbudgeted defaults (openai 5.23.2, anthropic 0.67.1; signal split in M1)
 
