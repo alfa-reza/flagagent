@@ -84,6 +84,7 @@ class BoundedOutput {
 async function runDocker(args: string[], timeoutMs = 30000): Promise<DockerResult> {
   const child = spawn("docker", args, {
     stdio: ["ignore", "pipe", "pipe"],
+    detached: true,
   });
 
   const stdout = new BoundedOutput();
@@ -130,7 +131,19 @@ async function runDocker(args: string[], timeoutMs = 30000): Promise<DockerResul
     timeoutHandle = setTimeout(
       () => {
         try {
-          child.kill("SIGKILL");
+          if (child.pid != null) {
+            try {
+              process.kill(-child.pid, "SIGKILL");
+            } catch {
+              try {
+                child.kill("SIGKILL");
+              } catch {
+                // ignore
+              }
+            }
+          } else {
+            child.kill("SIGKILL");
+          }
         } catch {
           // The close/error handlers still own the normal completion path.
         }
@@ -162,10 +175,31 @@ async function runDocker(args: string[], timeoutMs = 30000): Promise<DockerResul
       timedOut: true,
     };
   }
-  // The client did not close within the bounded reap window.  The Docker
-  // operation itself has still timed out; later close events cannot block the
-  // caller or reset its deadline.
   return first;
+}
+
+function classifyCandidates(
+  candidates: Array<{ id: string; name: string; labels: Record<string, string> }>,
+  runId: string,
+  role: string,
+): { outcome: "absent" | "adopt" | "fail"; payload: string | null } {
+  if (candidates.length === 0) return { outcome: "absent", payload: null };
+  if (candidates.length > 1)
+    return {
+      outcome: "fail",
+      payload: `${candidates.length} resources carry the expected name`,
+    };
+  const labels = candidates[0]!.labels ?? {};
+  if (
+    labels["flagagent.managed"] !== "true" ||
+    labels["flagagent.run_id"] !== runId ||
+    labels["flagagent.role"] !== role
+  )
+    return {
+      outcome: "fail",
+      payload: "candidate lacks the required ownership labels",
+    };
+  return { outcome: "adopt", payload: candidates[0]!.id };
 }
 
 export class DockerExecutor {
@@ -178,6 +212,10 @@ export class DockerExecutor {
   private executionDeadline: number | null = null;
   private preparationDeadline: number | null = null;
   private preparationRemaining: number | null = null;
+  private pendingAgent = false;
+  private pendingTarget = false;
+  private pendingNetwork = false;
+  private pendingCleanupErrors: string[] = [];
   private clock: () => number = monotonicNow;
 
   constructor(private opts: { image?: string; networkMode?: string } = {}) {
@@ -395,15 +433,26 @@ export class DockerExecutor {
       "infinity",
     ];
     const result = await runDocker(args, this.preparationTimeout(60) * 1000);
-    if (result.timedOut) throw new SandboxError("docker run timed out");
-    if (result.error)
+    if (result.timedOut) {
+      this.pendingAgent = true;
+      throw new SandboxError("docker run timed out");
+    }
+    if (result.error) {
+      if (!result.stdout.trim() && result.stderr.trim() === "") {
+        this.pendingAgent = true;
+      }
       throw new SandboxError(`docker run failed: ${resultDetail(result)}`);
+    }
     if (result.status !== 0) {
       throw new SandboxError(`docker run failed: ${resultDetail(result)}`);
     }
     const id = result.stdout.trim();
-    if (!id) throw new SandboxError("docker run returned no id");
+    if (!id) {
+      this.pendingAgent = true;
+      throw new SandboxError("docker run returned no id");
+    }
     this.containerId = id;
+    this.pendingAgent = false;
     if (!(await this.isContainerRunning(this.containerId))) {
       await this.forceRemove(this.containerId);
       this.containerId = null;
@@ -430,17 +479,25 @@ export class DockerExecutor {
     ];
     const result = await runDocker(args, this.preparationTimeout(30) * 1000);
     if (result.timedOut) {
+      this.pendingNetwork = true;
       throw new SandboxError("docker network create timed out");
     }
     if (result.error) {
+      if (!result.stdout.trim() && result.stderr.trim() === "") {
+        this.pendingNetwork = true;
+      }
       throw new SandboxError(`docker network create failed: ${resultDetail(result)}`);
     }
     if (result.status !== 0) {
       throw new SandboxError(`docker network create failed: ${resultDetail(result)}`);
     }
     const id = result.stdout.trim();
-    if (!id) throw new SandboxError("docker network no id");
+    if (!id) {
+      this.pendingNetwork = true;
+      throw new SandboxError("docker network no id");
+    }
     this.networkId = id;
+    this.pendingNetwork = false;
   }
 
   private async createTarget(runId: string): Promise<void> {
@@ -477,16 +534,26 @@ export class DockerExecutor {
       TARGET_IMAGE,
     ];
     const result = await runDocker(args, this.preparationTimeout(60) * 1000);
-    if (result.timedOut) throw new SandboxError("docker target run timed out");
+    if (result.timedOut) {
+      this.pendingTarget = true;
+      throw new SandboxError("docker target run timed out");
+    }
     if (result.error) {
+      if (!result.stdout.trim() && result.stderr.trim() === "") {
+        this.pendingTarget = true;
+      }
       throw new SandboxError(`docker target run failed: ${resultDetail(result)}`);
     }
     if (result.status !== 0) {
       throw new SandboxError(`docker target run failed: ${resultDetail(result)}`);
     }
     const id = result.stdout.trim();
-    if (!id) throw new SandboxError("target no id");
+    if (!id) {
+      this.pendingTarget = true;
+      throw new SandboxError("target no id");
+    }
     this.targetId = id;
+    this.pendingTarget = false;
   }
 
   private async waitTargetReady(): Promise<void> {
@@ -570,6 +637,47 @@ export class DockerExecutor {
         );
       }
       if (result.error) {
+        const msg = resultDetail(result);
+        const isControlError =
+          msg.includes("No such container") ||
+          msg.includes("is not running") ||
+          msg.includes("Error response from daemon") ||
+          msg.includes("Cannot connect to the Docker daemon") ||
+          msg.includes("rpc error");
+        if (isControlError) {
+          const probe = await runDocker(
+            ["inspect", "--format", "{{.State.Running}}", this.containerId],
+            this.executionTimeout(5) * 1000,
+          );
+          const stillRunning =
+            !probe.error &&
+            !probe.timedOut &&
+            probe.status === 0 &&
+            probe.stdout.trim() === "true";
+          const healthProbe = stillRunning
+            ? await runDocker(
+                ["exec", this.containerId, "/bin/true"],
+                this.executionTimeout(5) * 1000,
+              )
+            : null;
+          const healthy =
+            healthProbe != null &&
+            !healthProbe.error &&
+            !healthProbe.timedOut &&
+            healthProbe.status === 0;
+          if (!stillRunning || !healthy) {
+            throw new SandboxError(`docker exec failed: ${msg}`);
+          }
+        }
+        return new ShellResult(
+          result.stdout,
+          result.stderr,
+          result.status ?? 1,
+          false,
+          result.truncated,
+        );
+      }
+      if (result.status !== 0 && result.stderr.includes("No such container")) {
         throw new SandboxError(`docker exec failed: ${resultDetail(result)}`);
       }
       return new ShellResult(
@@ -731,8 +839,163 @@ export class DockerExecutor {
 
   async cleanup(runId: string): Promise<void> {
     validateRunId(runId);
+    const pending = [...this.pendingCleanupErrors];
+    this.pendingCleanupErrors = [];
+    const reconcileErrors = await this.reconcilePending(runId);
     const errors = await this.removeOwned();
-    if (errors.length) throw new SandboxError(`cleanup failed: ${errors.join("; ")}`);
+    const combined = [...pending, ...reconcileErrors, ...errors];
+    if (combined.length)
+      throw new SandboxError(`cleanup failed: ${combined.join("; ")}`);
+  }
+
+  private async reconcilePending(runId: string): Promise<string[]> {
+    const errors: string[] = [];
+    if (this.pendingAgent && this.containerName) {
+      const err = await this.reconcilePendingContainer(
+        "agent",
+        "agent",
+        runId,
+        this.containerName,
+      );
+      if (err) errors.push(err);
+    }
+    if (this.pendingTarget && this.targetName) {
+      const err = await this.reconcilePendingContainer(
+        "target",
+        "target",
+        runId,
+        this.targetName,
+      );
+      if (err) errors.push(err);
+    }
+    if (this.pendingNetwork && this.networkName) {
+      const err = await this.reconcilePendingNetwork(runId, this.networkName);
+      if (err) errors.push(err);
+    }
+    return errors;
+  }
+
+  private async reconcilePendingContainer(
+    kind: string,
+    role: string,
+    runId: string,
+    expectedName: string,
+  ): Promise<string | null> {
+    let ids: string[];
+    try {
+      ids = await this.listIds(["ps", "-a", "--filter", `name=${expectedName}`, "-q"]);
+      const candidates = ids.length
+        ? (await this.inspectLabeled(ids, false)).filter((r) => r.name === expectedName)
+        : [];
+      const { outcome, payload } = classifyCandidates(candidates, runId, role);
+      if (outcome === "absent") {
+        if (kind === "agent") {
+          this.pendingAgent = false;
+          this.containerName = null;
+        } else {
+          this.pendingTarget = false;
+          this.targetName = null;
+        }
+        return null;
+      }
+      if (outcome === "fail") {
+        return `${kind}(${expectedName}): ambiguous ownership: ${payload}`;
+      }
+      if (kind === "agent") {
+        this.containerId = payload;
+        this.pendingAgent = false;
+      } else {
+        this.targetId = payload;
+        this.pendingTarget = false;
+      }
+      return null;
+    } catch (e) {
+      return `${kind}(${expectedName}): reconciliation failed: ${asError(e).message}`;
+    }
+  }
+
+  private async reconcilePendingNetwork(
+    runId: string,
+    expectedName: string,
+  ): Promise<string | null> {
+    try {
+      const ids = await this.listIds([
+        "network",
+        "ls",
+        "--filter",
+        `name=${expectedName}`,
+        "-q",
+      ]);
+      const candidates = ids.length
+        ? (await this.inspectLabeled(ids, true)).filter((r) => r.name === expectedName)
+        : [];
+      const { outcome, payload } = classifyCandidates(candidates, runId, "network");
+      if (outcome === "absent") {
+        this.pendingNetwork = false;
+        this.networkName = null;
+        return null;
+      }
+      if (outcome === "fail") {
+        return `network(${expectedName}): ambiguous ownership: ${payload}`;
+      }
+      this.networkId = payload;
+      this.pendingNetwork = false;
+      return null;
+    } catch (e) {
+      return `network(${expectedName}): reconciliation failed: ${asError(e).message}`;
+    }
+  }
+
+  private async listIds(args: string[]): Promise<string[]> {
+    const result = await runDocker(args, this.preparationTimeout(10) * 1000);
+    if (result.timedOut) throw new SandboxError(`docker ${args[0]} list timed out`);
+    if (result.error)
+      throw new SandboxError(`docker ${args[0]} list failed: ${resultDetail(result)}`);
+    if (result.status !== 0)
+      throw new SandboxError(`docker ${args[0]} list failed: ${resultDetail(result)}`);
+    return result.stdout
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+  }
+
+  private async inspectLabeled(
+    ids: string[],
+    network: boolean,
+  ): Promise<Array<{ id: string; name: string; labels: Record<string, string> }>> {
+    if (ids.length === 0) return [];
+    const format = network
+      ? "{{.Id}} {{.Name}} {{json .Labels}}"
+      : "{{.Id}} {{.Names}} {{json .Config.Labels}}";
+    const kind = network ? "network" : "container";
+    const result = await runDocker(
+      ["inspect", "--format", format, ...ids],
+      this.preparationTimeout(10) * 1000,
+    );
+    if (result.timedOut) throw new SandboxError(`docker ${kind} inspect timed out`);
+    if (result.error)
+      throw new SandboxError(`docker ${kind} inspect failed: ${resultDetail(result)}`);
+    if (result.status !== 0)
+      throw new SandboxError(`docker ${kind} inspect failed: ${resultDetail(result)}`);
+    const out: Array<{ id: string; name: string; labels: Record<string, string> }> = [];
+    for (const line of result.stdout.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      const firstSpace = trimmed.indexOf(" ");
+      const secondSpace = trimmed.indexOf(" ", firstSpace + 1);
+      if (firstSpace === -1 || secondSpace === -1) continue;
+      const id = trimmed.slice(0, firstSpace);
+      const name = trimmed.slice(firstSpace + 1, secondSpace).replace(/^\//, "");
+      const labelsJson = trimmed.slice(secondSpace + 1);
+      let labels: Record<string, string> = {};
+      try {
+        labels = JSON.parse(labelsJson) ?? {};
+      } catch {
+        labels = {};
+      }
+      out.push({ id, name, labels });
+    }
+    return out;
   }
 
   sandboxProvenance(): Record<string, unknown> {

@@ -229,12 +229,27 @@ export class AgentLoop {
   async run(): Promise<Record<string, unknown>> {
     const apiBase = sanitizeApiBase(this.apiBase ?? null);
     const selectedId = this.runIdOpt ?? RunArtifacts.generateRunId(() => this.utcNow());
+
+    let preSnapshot: {
+      files: Array<[string, string]>;
+      digest: string | null;
+      tmpDir: string | null;
+      cleanup: () => void;
+    } | null = null;
+    let preSnapshotError: unknown = null;
+    try {
+      preSnapshot = snapshotSourceFiles(this.challenge.sourceDir ?? null, this.limits);
+    } catch (e) {
+      preSnapshotError = e;
+    }
+
     const challengeMeta: Record<string, unknown> = {
       identity: this.challenge.identity,
       description: this.challenge.description,
     };
     if (this.challenge.targetContext != null)
       challengeMeta.target_context = this.challenge.targetContext;
+    if (preSnapshot?.digest != null) challengeMeta.source_sha256 = preSnapshot.digest;
     const metadata: Record<string, unknown> = {
       schema_version: 1,
       run_id: selectedId,
@@ -295,17 +310,9 @@ export class AgentLoop {
       this.abortController?.abort(new Error("wall_limit"));
     }, wallMs);
 
-    let snapshot: {
-      files: Array<[string, string]>;
-      digest: string | null;
-      tmpDir: string | null;
-      cleanup: () => void;
-    } | null = null;
-    let snapshotError: unknown = null;
-    try {
-      snapshot = snapshotSourceFiles(this.challenge.sourceDir ?? null, this.limits);
-      if (snapshot.digest != null) challengeMeta.source_sha256 = snapshot.digest;
-      (metadata as Record<string, unknown>).challenge = challengeMeta;
+    const snapshot: typeof preSnapshot = preSnapshot;
+    const snapshotError: unknown = preSnapshotError;
+    if (snapshot && !snapshotError) {
       try {
         this.artifacts.appendEvent("source_snapshot", {
           sha256: snapshot.digest,
@@ -314,8 +321,6 @@ export class AgentLoop {
       } catch {
         /* ignore */
       }
-    } catch (e) {
-      snapshotError = e;
     }
     if (snapshotError != null) {
       if (snapshotError instanceof InvalidChallengeSourceError) {

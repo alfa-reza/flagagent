@@ -246,6 +246,28 @@ export async function runCli(argv: string[]): Promise<void> {
   if (exitCode !== 0) process.exit(exitCode);
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  await runCli(process.argv.slice(2));
+{
+  const doRun = async (): Promise<void> => {
+    try {
+      const { realpathSync, existsSync } = await import("node:fs");
+      const { fileURLToPath } = await import("node:url");
+      const selfPath = fileURLToPath(import.meta.url);
+      const entry = process.argv[1];
+      if (!entry) return;
+      let shouldRun = false;
+      if (existsSync(entry)) {
+        try {
+          shouldRun = realpathSync(entry) === realpathSync(selfPath);
+        } catch {
+          shouldRun = entry === selfPath;
+        }
+      } else {
+        shouldRun = selfPath.endsWith(entry.slice(-32));
+      }
+      if (shouldRun) await runCli(process.argv.slice(2));
+    } catch {
+      // ignore
+    }
+  };
+  await doRun();
 }
