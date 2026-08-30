@@ -310,7 +310,6 @@ export class AgentLoop {
         return result;
       }
 
-      // Prepare phase (M1: minimal — just call executor.prepare if exists, bounded by remaining)
       const prepare = (this.executor as unknown as Record<string, unknown>).prepare as
         ((ws: string, runId: string) => unknown) | undefined;
       if (typeof prepare === "function") {
@@ -323,13 +322,41 @@ export class AgentLoop {
             // ignore
           }
         }
-        try {
-          await prepare.call(
+        if (this.expired()) {
+          const r = this.terminal("unsolved", "wall_limit", []);
+          terminalWritten = true;
+          return r;
+        }
+        const prepareMs = Math.max(0, this.remaining()) * 1000;
+        if (prepareMs <= 0) {
+          const r = this.terminal("unsolved", "wall_limit", []);
+          terminalWritten = true;
+          return r;
+        }
+        let prepareTimer: ReturnType<typeof setTimeout> | null = null;
+        const prepareDeadlinePromise = new Promise<never>((_, reject) => {
+          prepareTimer = setTimeout(
+            () => reject(new Error("__wall_limit__")),
+            prepareMs,
+          );
+        });
+        const preparePromise = (async () => {
+          return await prepare.call(
             this.executor,
             this.artifacts.workspace,
             this.artifacts.runId,
           );
+        })();
+        let prepareWon = false;
+        try {
+          await Promise.race([preparePromise, prepareDeadlinePromise]);
+          prepareWon = true;
         } catch (e) {
+          if ((e as Error).message === "__wall_limit__") {
+            const r = this.terminal("unsolved", "wall_limit", []);
+            terminalWritten = true;
+            return r;
+          }
           if (this.expired()) {
             const r = this.terminal("unsolved", "wall_limit", []);
             terminalWritten = true;
@@ -341,9 +368,15 @@ export class AgentLoop {
             terminalWritten = true;
             return r;
           }
-          // Non-sandbox prepare failures are sandbox_error per Python too?
           const err = this.error("sandbox_error", "sandbox");
           const r = this.terminal(err.status, err.reason, err.unprocessed);
+          terminalWritten = true;
+          return r;
+        } finally {
+          if (prepareTimer) clearTimeout(prepareTimer);
+        }
+        if (!prepareWon) {
+          const r = this.terminal("unsolved", "wall_limit", []);
           terminalWritten = true;
           return r;
         }
@@ -462,20 +495,36 @@ export class AgentLoop {
         (this.model as unknown as Record<string, unknown>)._signal =
           this.abortController.signal;
       }
-      let response: ModelResponse;
-      let completedAt: number | null = null;
+      type CommitSuccess = {
+        kind: "success";
+        response: ModelResponse;
+        committedAt: number;
+      };
+      type CommitFailure = { kind: "failure"; error: unknown; committedAt: number };
+      type Commit = CommitSuccess | CommitFailure;
+
+      let commit: Commit | null = null;
 
       try {
-        // Check deadline before starting work — don't start if already expired
         if (this.expired() || this.remaining() <= 0) {
           return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
         }
         const deadlineMs = Math.max(0, this.deadline - this.monotonic()) * 1000;
-
         if (deadlineMs <= 0) {
           return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
         }
-        const generatePromise = this.invokeModel();
+        const commitPromise: Promise<Commit> = this.invokeModel().then(
+          (response) => ({
+            kind: "success" as const,
+            response,
+            committedAt: this.monotonic(),
+          }),
+          (error) => ({
+            kind: "failure" as const,
+            error,
+            committedAt: this.monotonic(),
+          }),
+        );
 
         let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
         const deadlinePromise = new Promise<never>((_, reject) => {
@@ -486,29 +535,25 @@ export class AgentLoop {
         });
 
         try {
-          response = await Promise.race([generatePromise, deadlinePromise]);
-          completedAt = this.monotonic();
+          commit = await Promise.race([commitPromise, deadlinePromise]);
         } catch (e) {
           if ((e as Error).message === "__wall_limit__") {
-            // Deadline won before generate settled — discard, no tool execution
-            // If generate later completes before deadline's wall clock? Already past, so discard.
-            // But check if generate completed just before wall clock — need commit check
-            // Try to see if generate settled just before deadline by checking completedAt if available
-            // Since we rejected, we don't have response; enforce wall_limit
-            // Attempt to preserve pre-deadline completion: if generate resolved but race lost due to timing,
-            // we need to check. Use a more precise approach: don't discard generatePromise result if it completed before wall.
-            // For determinism, we treat deadline win as wall_limit unless we can prove completion before deadline.
-            // We implement commit check by seeing if generatePromise settled before deadline wall.
-            // Use a flag: if generatePromise settled, its completedAt would be before deadline.
-            // Simplest: return wall_limit (test for pre-deadline preserved uses a separate path where watcher delays observation, not generation)
-            if (deadlineTimer) clearTimeout(deadlineTimer);
-            // If generate had actually completed before deadline, completedAt would be set — but we rejected, so not.
-            // For #54, the provider DID complete before deadline; parent observation was late due to scheduling.
-            // That case is handled when generate DOES resolve before deadlinePromise rejects — we already would have taken the response branch.
-            // So here, truly deadline won.
-            return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
+            const settled = await Promise.race([
+              commitPromise.then(
+                (c) => c,
+                () => null,
+              ),
+              new Promise<null>((resolve) => setTimeout(() => resolve(null), 150)),
+            ]);
+            if (settled != null && settled.committedAt < this.deadline) {
+              commit = settled;
+            } else {
+              if (deadlineTimer) clearTimeout(deadlineTimer);
+              return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
+            }
+          } else {
+            throw e;
           }
-          throw e;
         } finally {
           if (deadlineTimer) clearTimeout(deadlineTimer);
         }
@@ -516,7 +561,6 @@ export class AgentLoop {
         if ((e as Error).message === "__wall_limit__") {
           return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
         }
-        // Check if it's an AbortError from SDK (deadline abort) -> wall_limit if expired else provider_error
         const isAbort =
           (e as Error).name === "AbortError" ||
           (e as Error).message.includes("aborted") ||
@@ -531,10 +575,34 @@ export class AgentLoop {
         return { status: err.status, reason: err.reason, unprocessed: err.unprocessed };
       }
 
-      // Enforce commit check: if completedAt is after deadline, discard (post-deadline completion rejected)
-      if (completedAt != null && completedAt >= this.deadline) {
+      if (commit == null) {
         return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
       }
+      if (commit.committedAt >= this.deadline) {
+        return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
+      }
+      if (commit.kind === "failure") {
+        const err = commit.error;
+        const isAbort =
+          err != null &&
+          typeof err === "object" &&
+          ((err as Error).name === "AbortError" ||
+            ((err as Error).message?.includes("aborted") ?? false) ||
+            ((err as Error).message?.includes("AbortError") ?? false));
+        if (isAbort && this.expired()) {
+          return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
+        }
+        const logged = this.error("provider_error", "model");
+        if (this.expired()) {
+          return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
+        }
+        return {
+          status: logged.status,
+          reason: logged.reason,
+          unprocessed: logged.unprocessed,
+        };
+      }
+      const response: ModelResponse = commit.response;
 
       // Provider error mapping: ProviderError thrown above already handled; successful response continues
       this.addUsage((response as ModelResponse).usage);
@@ -707,11 +775,11 @@ export class AgentLoop {
     command: string,
   ): Promise<{ status: string; reason: string; unprocessed: string[] } | null> {
     if (this.expired() || this.remaining() <= 0) {
-      return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
+      return { status: "unsolved", reason: "wall_limit", unprocessed: [callId] };
     }
     const timeout = Math.min(this.limits.commandTimeoutSeconds, this.remaining());
     if (timeout <= 0) {
-      return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
+      return { status: "unsolved", reason: "wall_limit", unprocessed: [callId] };
     }
     const setter = (this.executor as unknown as Record<string, unknown>)
       .setExecutionDeadline as
@@ -762,6 +830,9 @@ export class AgentLoop {
     callId: string,
     candidate: string,
   ): Promise<{ status: string; reason: string; unprocessed: string[] } | null> {
+    if (this.expired()) {
+      return { status: "unsolved", reason: "wall_limit", unprocessed: [callId] };
+    }
     const stripped = candidate.trim();
     this.artifacts.appendEvent("flag_submission", {
       call_id: callId,
@@ -770,12 +841,15 @@ export class AgentLoop {
     this.flagSubmissions += 1;
     let outcome: string;
     try {
+      if (this.expired()) {
+        return { status: "unsolved", reason: "wall_limit", unprocessed: [callId] };
+      }
       outcome = this.verifier.check(stripped);
       if (outcome !== "correct" && outcome !== "incorrect")
         throw new Error("unsupported verifier outcome");
     } catch {
       if (this.expired())
-        return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
+        return { status: "unsolved", reason: "wall_limit", unprocessed: [callId] };
       const err = this.error("verifier_error", "verifier", callId);
       return { status: err.status, reason: err.reason, unprocessed: err.unprocessed };
     }
