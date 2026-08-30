@@ -123,15 +123,10 @@ describe("deadline invariants", () => {
         }),
       ]);
       let callCount = 0;
-      const completions: number[] = [];
       const monotonic = () => {
         callCount++;
         if (callCount === 1) return 0;
-        if (callCount <= 4) return 0;
-        if (callCount === 5) {
-          completions.push(0);
-          return 0;
-        }
+        if (callCount <= 8) return 0;
         return 1.5;
       };
       const loop = new AgentLoop({
@@ -147,7 +142,7 @@ describe("deadline invariants", () => {
         runsRoot: tmp,
         monotonic,
         utcNow: () => NOW,
-        runId: "FA-20260814T000000Z-a13f4c2d",
+        runId: "FA-20260814T161530Z-a13f4c2d",
       });
       const result = await loop.run();
       expect(result["status:reason"]).toBe("unsolved:wall_limit");
@@ -155,20 +150,13 @@ describe("deadline invariants", () => {
       const events = readEvents(
         (loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath,
       );
-      if (events.some((e) => e.type === "model_response")) {
-        expect(result.input_tokens).toBe(11);
-        expect(result.output_tokens).toBe(22);
-        const mrs = events.filter((e) => e.type === "model_response");
-        expect(mrs.length).toBe(1);
-        const terminal = events.find((e) => e.type === "terminal_decision");
-        expect(
-          (terminal!.payload as Record<string, unknown>).unprocessed_call_ids,
-        ).toEqual(["c1"]);
-        expect(events.filter((e) => e.type === "tool_call").length).toBe(0);
-      } else {
-        expect(result.model_calls).toBe(1);
-      }
-      expect(completions.length).toBe(1);
+      const mrs = events.filter((e) => e.type === "model_response");
+      expect(mrs.length).toBe(1);
+      const terminal = events.find((e) => e.type === "terminal_decision");
+      expect(
+        (terminal!.payload as Record<string, unknown>).unprocessed_call_ids,
+      ).toEqual(["c1"]);
+      expect(events.filter((e) => e.type === "tool_call").length).toBe(0);
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }

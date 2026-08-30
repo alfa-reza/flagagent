@@ -164,6 +164,7 @@ export type ModelTool = Record<string, unknown>;
 
 export interface Model {
   generate(messages: ModelMessage[], tools: ModelTool[]): Promise<ModelResponse>;
+  setMonotonic?: (monotonic: () => number) => void;
 }
 
 export type ScriptItem = ModelResponse | Error;
@@ -172,6 +173,20 @@ export class ScriptedModel implements Model {
   readonly script: readonly ScriptItem[];
   readonly calls: Array<[JsonValue[], JsonValue[]]> = [];
   private index = 0;
+  private _monotonic: (() => number) | undefined;
+  private _lastCommittedAt: number | undefined;
+
+  get lastCommittedAt(): number | undefined {
+    return this._lastCommittedAt;
+  }
+
+  setMonotonic(monotonic: () => number): void {
+    this._monotonic = monotonic;
+  }
+
+  private captureCommittedAt(): void {
+    this._lastCommittedAt = this._monotonic?.() ?? Date.now() / 1000;
+  }
 
   constructor(script: readonly ScriptItem[]) {
     if (!Array.isArray(script)) {
@@ -186,24 +201,36 @@ export class ScriptedModel implements Model {
   }
 
   async generate(messages: ModelMessage[], tools: ModelTool[]): Promise<ModelResponse> {
-    const messageSnapshot = snapshotJson(messages);
-    const toolSnapshot = snapshotJson(tools);
-    if (!Array.isArray(messageSnapshot) || !Array.isArray(toolSnapshot)) {
-      throw new TypeError("messages and tools must be arrays");
-    }
-    this.calls.push([messageSnapshot, toolSnapshot]);
+    try {
+      const messageSnapshot = snapshotJson(messages);
+      const toolSnapshot = snapshotJson(tools);
+      if (!Array.isArray(messageSnapshot) || !Array.isArray(toolSnapshot)) {
+        throw new TypeError("messages and tools must be arrays");
+      }
+      this.calls.push([messageSnapshot, toolSnapshot]);
 
-    if (this.index >= this.script.length) {
-      throw new Error("scripted model exhausted");
-    }
+      if (this.index >= this.script.length) {
+        throw new Error("scripted model exhausted");
+      }
 
-    const item = this.script[this.index];
-    this.index += 1;
-    if (item instanceof Error) {
-      throw item;
-    }
+      const item = this.script[this.index];
+      this.index += 1;
+      if (item instanceof Error) {
+        throw item;
+      }
 
-    return new ModelResponse(item.content, item.toolCalls, item.usage, item.truncated);
+      const response = new ModelResponse(
+        item.content,
+        item.toolCalls,
+        item.usage,
+        item.truncated,
+      );
+      this.captureCommittedAt();
+      return response;
+    } catch (error) {
+      this.captureCommittedAt();
+      throw error;
+    }
   }
 }
 

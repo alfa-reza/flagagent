@@ -178,7 +178,21 @@ export class ChatCompletionsModel {
   readonly baseURL: string | null | undefined;
   readonly client: unknown;
   private remainingBudget: number | undefined;
+  private monotonic: (() => number) | undefined;
+  private _lastCommittedAt: number | undefined;
   readonly _clientInjected: boolean;
+
+  get lastCommittedAt(): number | undefined {
+    return this._lastCommittedAt;
+  }
+
+  setMonotonic(monotonic: () => number): void {
+    this.monotonic = monotonic;
+  }
+
+  private captureCommittedAt(): void {
+    this._lastCommittedAt = this.monotonic?.() ?? Date.now() / 1000;
+  }
 
   constructor(options: ChatCompletionsOptions) {
     this.model = options.model;
@@ -212,27 +226,27 @@ export class ChatCompletionsModel {
     messages: Record<string, unknown>[],
     tools: Record<string, unknown>[],
   ): Promise<ModelResponse> {
-    const requestMessages = messages.map((m) => toChatMessage(m));
-    const requestTools = tools.map((t) => toChatTool(t));
-    const params: Record<string, unknown> = {
-      model: this.model,
-      messages: requestMessages,
-      tools: requestTools,
-    };
-
-    let client: unknown = this.client;
-    let requestOptions: Record<string, unknown> | undefined;
-
-    if (this.remainingBudget != null) {
-      if (this.remainingBudget <= 0)
-        throw new ProviderError("chat completions request budget exhausted");
-      const signal = (this as unknown as { _signal?: AbortSignal })._signal;
-      const res = clientForBudget(this.client, this.remainingBudget, signal);
-      client = res.client;
-      requestOptions = res.options;
-    }
-
     try {
+      const requestMessages = messages.map((m) => toChatMessage(m));
+      const requestTools = tools.map((t) => toChatTool(t));
+      const params: Record<string, unknown> = {
+        model: this.model,
+        messages: requestMessages,
+        tools: requestTools,
+      };
+
+      let client: unknown = this.client;
+      let requestOptions: Record<string, unknown> | undefined;
+
+      if (this.remainingBudget != null) {
+        if (this.remainingBudget <= 0)
+          throw new ProviderError("chat completions request budget exhausted");
+        const signal = (this as unknown as { _signal?: AbortSignal })._signal;
+        const res = clientForBudget(this.client, this.remainingBudget, signal);
+        client = res.client;
+        requestOptions = res.options;
+      }
+
       const c = client as Record<string, unknown>;
       const chat = c.chat as Record<string, unknown>;
       const completions = chat.completions as Record<string, unknown>;
@@ -241,15 +255,19 @@ export class ChatCompletionsModel {
         opts?: unknown,
       ) => Promise<unknown>;
       const response = await create.call(completions, params, requestOptions);
+      let parsed: ModelResponse;
       try {
-        return parseChatResponse(response);
+        parsed = parseChatResponse(response);
       } catch (e) {
         if (e instanceof ProviderError) throw e;
         throw new ProviderError("malformed chat completions response", {
           cause: e as Error,
         });
       }
+      this.captureCommittedAt();
+      return parsed;
     } catch (e) {
+      this.captureCommittedAt();
       if (e instanceof ProviderError) throw e;
       throw new ProviderError("chat completions request failed", { cause: e as Error });
     }

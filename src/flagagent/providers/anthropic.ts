@@ -178,8 +178,22 @@ export class AnthropicMessagesModel {
   readonly baseURL: string | null | undefined;
   readonly client: unknown;
   private remainingBudget: number | undefined;
+  private monotonic: (() => number) | undefined;
+  private _lastCommittedAt: number | undefined;
   readonly _clientInjected: boolean;
   private thinkingHistory: Record<string, unknown>[][] = [];
+
+  get lastCommittedAt(): number | undefined {
+    return this._lastCommittedAt;
+  }
+
+  setMonotonic(monotonic: () => number): void {
+    this.monotonic = monotonic;
+  }
+
+  private captureCommittedAt(): void {
+    this._lastCommittedAt = this.monotonic?.() ?? Date.now() / 1000;
+  }
 
   constructor(options: AnthropicOptions) {
     this.model = options.model;
@@ -243,15 +257,19 @@ export class AnthropicMessagesModel {
       const msgs = c.messages as Record<string, unknown>;
       const create = msgs.create as (p: unknown, o?: unknown) => Promise<unknown>;
       const response = await create.call(msgs, params, requestOptions);
+      let modelResponse: ModelResponse;
       try {
-        const { modelResponse, thinkingBlocks } = parseAnthropicResponse(response);
-        this.thinkingHistory.push(thinkingBlocks);
-        return modelResponse;
+        const parsed = parseAnthropicResponse(response);
+        this.thinkingHistory.push(parsed.thinkingBlocks);
+        modelResponse = parsed.modelResponse;
       } catch (e) {
         if (e instanceof ProviderError) throw e;
         throw new ProviderError("malformed messages response", { cause: e as Error });
       }
+      this.captureCommittedAt();
+      return modelResponse;
     } catch (e) {
+      this.captureCommittedAt();
       if (e instanceof ProviderError) throw e;
       throw new ProviderError("messages request failed", { cause: e as Error });
     }

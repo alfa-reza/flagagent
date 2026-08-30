@@ -580,6 +580,16 @@ export class AgentLoop {
         (this.model as unknown as Record<string, unknown>)._signal =
           this.abortController.signal;
       }
+      const setMono = (
+        this.model as unknown as { setMonotonic?: (m: () => number) => void }
+      ).setMonotonic;
+      if (typeof setMono === "function") {
+        try {
+          setMono.call(this.model, this.monotonic);
+        } catch {
+          /* ignore */
+        }
+      }
       type CommitSuccess = {
         kind: "success";
         response: ModelResponse;
@@ -589,6 +599,12 @@ export class AgentLoop {
       type Commit = CommitSuccess | CommitFailure;
 
       let commit: Commit | null = null;
+
+      const readCommittedAt = (): number => {
+        const v = (this.model as unknown as { lastCommittedAt?: number })
+          .lastCommittedAt;
+        return typeof v === "number" && Number.isFinite(v) ? v : this.monotonic();
+      };
 
       try {
         if (this.expired() || this.remaining() <= 0) {
@@ -602,12 +618,12 @@ export class AgentLoop {
           (response) => ({
             kind: "success" as const,
             response,
-            committedAt: this.monotonic(),
+            committedAt: readCommittedAt(),
           }),
           (error) => ({
             kind: "failure" as const,
             error,
-            committedAt: this.monotonic(),
+            committedAt: readCommittedAt(),
           }),
         );
 
@@ -870,11 +886,10 @@ export class AgentLoop {
       .setExecutionDeadline as
       ((deadline: number, monotonic: () => number) => void) | undefined;
     if (typeof setter === "function") {
-      try {
-        setter.call(this.executor, this.deadline, this.monotonic);
-      } catch {
-        // ignore
-      }
+      setter.call(this.executor, this.deadline, this.monotonic);
+    }
+    if (this.expired() || this.remaining() <= 0) {
+      return { status: "unsolved", reason: "wall_limit", unprocessed: [callId] };
     }
     try {
       const raw = await (
@@ -919,6 +934,9 @@ export class AgentLoop {
       return { status: "unsolved", reason: "wall_limit", unprocessed: [callId] };
     }
     const stripped = candidate.trim();
+    if (this.expired()) {
+      return { status: "unsolved", reason: "wall_limit", unprocessed: [callId] };
+    }
     this.artifacts.appendEvent("flag_submission", {
       call_id: callId,
       candidate: stripped,

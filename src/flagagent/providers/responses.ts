@@ -156,9 +156,23 @@ export class ResponsesModel {
   readonly baseURL: string | null | undefined;
   readonly client: unknown;
   private remainingBudget: number | undefined;
+  private monotonic: (() => number) | undefined;
+  private _lastCommittedAt: number | undefined;
   readonly _clientInjected: boolean;
   private builtInput: Record<string, unknown>[] = [];
   private processedCount = 0;
+
+  get lastCommittedAt(): number | undefined {
+    return this._lastCommittedAt;
+  }
+
+  setMonotonic(monotonic: () => number): void {
+    this.monotonic = monotonic;
+  }
+
+  private captureCommittedAt(): void {
+    this._lastCommittedAt = this.monotonic?.() ?? Date.now() / 1000;
+  }
 
   constructor(options: ResponsesOptions) {
     this.model = options.model;
@@ -191,60 +205,61 @@ export class ResponsesModel {
     messages: Record<string, unknown>[],
     tools: Record<string, unknown>[],
   ): Promise<ModelResponse> {
-    if (this.remainingBudget != null && this.remainingBudget <= 0) {
-      throw new ProviderError("responses request budget exhausted");
-    }
-
-    const instructions = messages.find((m) => m.role === "system")?.content as
-      string | undefined;
-
-    const newMessages = messages.slice(this.processedCount);
-    for (const message of newMessages) {
-      const role = message.role as string;
-      if (role === "system") continue;
-      if (role === "user") {
-        this.builtInput.push({
-          role: "user",
-          content: (message.content as string) ?? "",
-        });
-      } else if (role === "assistant") {
-        // assistant content is replayed via output items, not input
-      } else if (role === "tool") {
-        this.builtInput.push({
-          type: "function_call_output",
-          call_id: message.call_id,
-          output: toJson(message.result),
-        });
-      } else {
-        throw new ProviderError("unsupported message role");
-      }
-    }
-    this.processedCount = messages.length;
-
-    const params: Record<string, unknown> = {
-      model: this.model,
-      input: [...this.builtInput],
-      tools: tools.map((t) => toResponsesTool(t)),
-      store: false,
-      include: ["reasoning.encrypted_content"],
-    };
-    if (instructions != null) params.instructions = instructions;
-
-    let client: unknown = this.client;
-    let requestOptions: Record<string, unknown> | undefined;
-    if (this.remainingBudget != null) {
-      const signal = (this as unknown as { _signal?: AbortSignal })._signal;
-      const res = clientForBudget(this.client, this.remainingBudget, signal);
-      client = res.client;
-      requestOptions = res.options;
-    }
-
     try {
+      if (this.remainingBudget != null && this.remainingBudget <= 0) {
+        throw new ProviderError("responses request budget exhausted");
+      }
+
+      const instructions = messages.find((m) => m.role === "system")?.content as
+        string | undefined;
+
+      const newMessages = messages.slice(this.processedCount);
+      for (const message of newMessages) {
+        const role = message.role as string;
+        if (role === "system") continue;
+        if (role === "user") {
+          this.builtInput.push({
+            role: "user",
+            content: (message.content as string) ?? "",
+          });
+        } else if (role === "assistant") {
+          // assistant content is replayed via output items, not input
+        } else if (role === "tool") {
+          this.builtInput.push({
+            type: "function_call_output",
+            call_id: message.call_id,
+            output: toJson(message.result),
+          });
+        } else {
+          throw new ProviderError("unsupported message role");
+        }
+      }
+      this.processedCount = messages.length;
+
+      const params: Record<string, unknown> = {
+        model: this.model,
+        input: [...this.builtInput],
+        tools: tools.map((t) => toResponsesTool(t)),
+        store: false,
+        include: ["reasoning.encrypted_content"],
+      };
+      if (instructions != null) params.instructions = instructions;
+
+      let client: unknown = this.client;
+      let requestOptions: Record<string, unknown> | undefined;
+      if (this.remainingBudget != null) {
+        const signal = (this as unknown as { _signal?: AbortSignal })._signal;
+        const res = clientForBudget(this.client, this.remainingBudget, signal);
+        client = res.client;
+        requestOptions = res.options;
+      }
+
       const c = client as Record<string, unknown>;
       const responses = c.responses as Record<string, unknown>;
       const create = responses.create as (p: unknown, o?: unknown) => Promise<unknown>;
       const response = await create.call(responses, params, requestOptions);
 
+      let parsed: ModelResponse;
       try {
         const r = response as Record<string, unknown>;
         const status = r.status as string | null;
@@ -267,12 +282,15 @@ export class ResponsesModel {
         });
         const usage = normalizeResponsesUsage((r as Record<string, unknown>).usage);
         this.builtInput.push(...replayItems);
-        return new ModelResponse(content, toolCalls, usage, truncated);
+        parsed = new ModelResponse(content, toolCalls, usage, truncated);
       } catch (e) {
         if (e instanceof ProviderError) throw e;
         throw new ProviderError("malformed responses output", { cause: e as Error });
       }
+      this.captureCommittedAt();
+      return parsed;
     } catch (e) {
+      this.captureCommittedAt();
       if (e instanceof ProviderError) throw e;
       throw new ProviderError("responses request failed", { cause: e as Error });
     }
