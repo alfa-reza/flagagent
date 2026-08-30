@@ -542,6 +542,35 @@ export class DockerExecutor {
         `timeout recovery failed: docker start failed: ${resultDetail(started)}`,
       );
     }
+    if (this.executionDeadline != null && this.clock() >= this.executionDeadline) {
+      throw new SandboxError("execution budget exhausted");
+    }
+    const running = await runDocker(
+      ["inspect", "--format", "{{.State.Running}}", this.containerId],
+      this.executionTimeout(10) * 1000,
+    );
+    if (
+      running.error ||
+      running.timedOut ||
+      running.status !== 0 ||
+      running.stdout.trim() !== "true"
+    ) {
+      throw new SandboxError(
+        "timeout recovery failed: agent container not running after restart",
+      );
+    }
+    if (this.executionDeadline != null && this.clock() >= this.executionDeadline) {
+      throw new SandboxError("execution budget exhausted");
+    }
+    const probe = await runDocker(
+      ["exec", this.containerId, "/bin/true"],
+      this.executionTimeout(10) * 1000,
+    );
+    if (probe.error || probe.timedOut || probe.status !== 0) {
+      throw new SandboxError(
+        "timeout recovery failed: agent container not usable after restart",
+      );
+    }
   }
 
   private async isContainerRunning(id: string): Promise<boolean> {

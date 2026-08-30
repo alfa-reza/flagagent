@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { AgentLoop } from "./loop.js";
@@ -12,6 +13,7 @@ import {
   SOLVER_PROMPT_SHA256,
   SOLVER_PROMPT_VERSION,
 } from "./prompt.js";
+import { writeWriteup } from "./writeup.js";
 
 export const MAX_CHALLENGE_DESCRIPTOR_BYTES = 64 * 1024;
 const PROTOCOL_NAMES = ["openai-chat", "openai-responses", "anthropic"] as const;
@@ -190,7 +192,7 @@ export async function runCli(argv: string[]): Promise<void> {
     },
     limits: new Limits(),
     runsRoot,
-    monotonic: () => Date.now() / 1000,
+    monotonic: () => Number(process.hrtime.bigint()) / 1_000_000_000,
     utcNow: () => new Date(),
     systemPrompt: SOLVER_PROMPT,
     promptVersion: SOLVER_PROMPT_VERSION,
@@ -200,7 +202,19 @@ export async function runCli(argv: string[]): Promise<void> {
     apiBase: apiBase ?? null,
   });
   const result = await loop.run();
-  console.log(JSON.stringify(result, null, 2));
+  const dir = (loop as unknown as { artifacts: { directory: string } }).artifacts
+    .directory;
+  console.log(`run=${dir}`);
+  console.log(String(result["status:reason"]));
+  let exitCode = 0;
+  if (result.status === "error") exitCode = 1;
+  try {
+    writeWriteup(dir);
+  } catch (e) {
+    console.error(`writeup failed: ${(e as Error).message}`);
+    if (exitCode === 0) exitCode = 1;
+  }
+  if (exitCode !== 0) process.exit(exitCode);
 }
 
 if (import.meta.url === `file://${process.argv[1]}`) {
