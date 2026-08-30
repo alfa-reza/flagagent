@@ -12,13 +12,11 @@ import {
   UnknownToolError,
 } from "./tools.js";
 import { FLAGAGENT_VERSION, CONCEPT_VERSION } from "./version.js";
-
-export class InvalidChallengeSourceError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "InvalidChallengeSourceError";
-  }
-}
+import {
+  InvalidChallengeSourceError,
+  snapshotSourceFiles,
+  stageSourceFiles,
+} from "./staging.js";
 
 export interface ChallengeInput {
   identity: string;
@@ -297,6 +295,67 @@ export class AgentLoop {
       this.abortController?.abort(new Error("wall_limit"));
     }, wallMs);
 
+    let snapshot: {
+      files: Array<[string, string]>;
+      digest: string | null;
+      tmpDir: string | null;
+      cleanup: () => void;
+    } | null = null;
+    let snapshotError: unknown = null;
+    try {
+      snapshot = snapshotSourceFiles(this.challenge.sourceDir ?? null, this.limits);
+      if (snapshot.digest != null) challengeMeta.source_sha256 = snapshot.digest;
+      (metadata as Record<string, unknown>).challenge = challengeMeta;
+      try {
+        this.artifacts.appendEvent("source_snapshot", {
+          sha256: snapshot.digest,
+          files: snapshot.files.length,
+        } as unknown as Record<string, unknown>);
+      } catch {
+        /* ignore */
+      }
+    } catch (e) {
+      snapshotError = e;
+    }
+    if (snapshotError != null) {
+      if (snapshotError instanceof InvalidChallengeSourceError) {
+        const result = this.buildResult("error", "invalid_challenge_source");
+        try {
+          this.artifacts.commitResult(result as Record<string, unknown>);
+        } catch {
+          /* ignore */
+        }
+        try {
+          snapshot?.cleanup();
+        } catch {
+          /* ignore */
+        }
+        try {
+          this.artifacts.close();
+        } catch {
+          /* ignore */
+        }
+        return result;
+      }
+      const result = this.buildResult("error", "serialization_error");
+      try {
+        this.artifacts.commitResult(result as Record<string, unknown>);
+      } catch {
+        /* ignore */
+      }
+      try {
+        snapshot?.cleanup();
+      } catch {
+        /* ignore */
+      }
+      try {
+        this.artifacts.close();
+      } catch {
+        /* ignore */
+      }
+      return result;
+    }
+
     let terminalWritten = false;
     try {
       if (this.expired()) {
@@ -308,6 +367,27 @@ export class AgentLoop {
         const result = this.terminal(active.status, active.reason, active.unprocessed);
         terminalWritten = true;
         return result;
+      }
+
+      if (snapshot && snapshot.files.length > 0) {
+        try {
+          stageSourceFiles(this.artifacts.workspace, snapshot.files, () =>
+            this.expired(),
+          );
+        } catch (e) {
+          if (e instanceof InvalidChallengeSourceError) {
+            const err = this.error("sandbox_error", "sandbox");
+            const r = this.terminal(err.status, err.reason, err.unprocessed);
+            terminalWritten = true;
+            return r;
+          }
+          throw e;
+        }
+        if (this.expired()) {
+          const r = this.terminal("unsolved", "wall_limit", []);
+          terminalWritten = true;
+          return r;
+        }
       }
 
       const prepare = (this.executor as unknown as Record<string, unknown>).prepare as
@@ -438,6 +518,11 @@ export class AgentLoop {
     } finally {
       clearTimeout(deadlineTimer);
       this.abortController?.abort(new Error("run finished"));
+      try {
+        snapshot?.cleanup();
+      } catch {
+        /* ignore */
+      }
       const cleanup = (this.executor as unknown as Record<string, unknown>).cleanup as
         ((runId: string) => unknown) | undefined;
       if (typeof cleanup === "function") {

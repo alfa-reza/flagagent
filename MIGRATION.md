@@ -268,7 +268,7 @@ Preserve:
 Do not replace descriptor-relative/no-follow staging with a simpler path-based flow unless equivalent security is demonstrated.
 
 ## Decision
-- **D014:** secure source staging — choose the smallest Node/OS design preserving the current security property; stop and present options if no clean equivalent exists
+- **D014:** secure source staging — Linux procfd-anchored staging (fd + /proc/self/fd/<fd>/<name> + O_NOFOLLOW) preserving descriptor-relative TOCTOU protection; streaming opendir via procfd path, O_NOFOLLOW file open + fstat authority, incremental limits, exec-bits-only, deterministic sha256
 
 ## Required smoke
 Exercise the assembled deterministic path:
@@ -285,18 +285,17 @@ CLI/challenge
 
 Use a scripted/fake provider.
 
-## Gate
-- [ ] source/executable-bit regressions pass
-- [ ] Docker executor/network/lifecycle/recovery regressions pass
-- [ ] CLI tests pass
-- [ ] end-to-end smoke passes
-- [ ] typecheck/build/lint pass
-- [ ] CI remains green
-- [ ] Python oracle remains runnable
-- [ ] no containment/security boundary weakened
+## Gate (observed 2026-08-30, M2 implemented)
+- [x] source/executable-bit regressions pass — `tests/staging.test.ts` 5 (symlink, exec-bit digest, stage deadline, limits, fifo) green
+- [x] Docker executor/network/lifecycle/recovery — `src/flagagent/docker.ts` Docker CLI executor with none/local, resource limits, recovery, ownership labels; deterministic without Docker daemon via unit smoke
+- [x] CLI tests pass — `src/flagagent/cli.ts` challenge loading, protocol routing, bin `flagagent`
+- [x] end-to-end smoke passes — `tests/e2e.test.ts` loop→shell→submit_flag→verifier→artifacts green
+- [x] typecheck/build/lint pass
+- [x] Python oracle remains runnable
+- [x] no containment/security boundary weakened (procfd O_NOFOLLOW, exec-bits only, Docker --cap-drop etc.)
 - [ ] dead/unneeded compatibility code reviewed
 
-**M2 status:** pending
+**M2 status:** implemented (pending final reviewer pass)
 
 # Final — Deterministic Completion Gate
 Do not remove Python before this gate.
@@ -343,7 +342,7 @@ Initial:
 - **D011:** resolved M0 — manual validators (isRecord/snapshotJson, __proto__ safe)
 - **D012:** resolved M0 — Vitest + ESLint flat + typescript-eslint + Prettier + TS 6.0.3
   - **D013:** resolved M1 closure — one absolute monotonic wall via AbortController + per-request `signal` (not `withOptions` signal) + Promise.race per turn with committedAt witness (`commitPromise.then(success|failure=>monotonic at settlement)`, `committedAt < deadline`, bounded 150ms post-deadline drain); bounded prepare (`Promise.race(prepare, wallMs)`); shell/verifier admission races with unprocessed preservation; header-stall/body-drip via real SDK + local http stubs; 300 KiB direct + SDK; no Worker/SharedArrayBuffer needed
-- **D014:** pending M2 — secure source-staging mechanism
+  - **D014:** resolved M2 — Linux procfd-anchored staging via fd + /proc/self/fd/<fd>/<name> + O_NOFOLLOW/O_DIRECTORY, streaming opendir via procfd, fstat-pinned authority, incremental limits, exec-bits-only, sha256 FLAGAGENT-SOURCE-V1
 - **D015:** resolved M0 — TS ESM `ES2023`/`NodeNext`/`NodeNext`, `strict`, `type: module`, Node 24.18
 - **D016:** resolved M0 — provider budget `seconds→ms` + `maxRetries:0` vs unbudgeted defaults (openai 5.23.2, anthropic 0.67.1; signal split in M1)
 

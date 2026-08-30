@@ -15,6 +15,9 @@
     "format": "prettier --write \"package.json\" \"tsconfig.json\" \"vitest.config.ts\" \"eslint.config.js\" \"src/**/*.ts\" \"tests/**/*.ts\" \".github/workflows/ci.yml\"",
     "format:check": "prettier --check \"package.json\" \"tsconfig.json\" \"vitest.config.ts\" \"eslint.config.js\" \"src/**/*.ts\" \"tests/**/*.ts\" \".github/workflows/ci.yml\""
   },
+  "bin": {
+    "flagagent": "./dist/flagagent/cli.js"
+  },
   "exports": {
     ".": {
       "types": "./dist/flagagent/index.d.ts",
