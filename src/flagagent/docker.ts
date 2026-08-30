@@ -1,25 +1,171 @@
-import { spawnSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import { SandboxError, ShellResult } from "./tools.js";
 import { validateRunId } from "./artifacts.js";
 
 const SANDBOX_IMAGE = "flagagent-sandbox:dev";
 const TARGET_IMAGE = "flagagent-target:dev";
 const WORKSPACE_TARGET = "/workspace";
+const OUTPUT_LIMIT_BYTES = 64 * 1024;
+const OUTPUT_SUFFIX_LIMIT_BYTES = OUTPUT_LIMIT_BYTES * 2;
+const EXEC_REAP_TIMEOUT_MS = 1000;
+
+interface DockerResult {
+  stdout: string;
+  stderr: string;
+  status: number | null;
+  timedOut: boolean;
+  truncated: boolean;
+  error: Error | null;
+}
+
+function monotonicNow(): number {
+  return Number(process.hrtime.bigint()) / 1_000_000_000;
+}
 
 function runtimeUser(): string {
   return `${process.getuid?.() ?? 1000}:${process.getgid?.() ?? 1000}`;
 }
 
-function runDocker(
-  args: string[],
-  timeoutMs = 30000,
-): { stdout: string; stderr: string; status: number | null } {
-  const r = spawnSync("docker", args, { encoding: "utf8", timeout: timeoutMs });
-  return {
-    stdout: (r.stdout as string) ?? "",
-    stderr: (r.stderr as string) ?? "",
-    status: r.status,
-  };
+function asError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function resultDetail(result: DockerResult): string {
+  return result.stderr.trim() || result.error?.message || "unknown error";
+}
+
+class BoundedOutput {
+  private prefix = Buffer.alloc(0);
+  private suffix = Buffer.alloc(0);
+  private observed = 0;
+
+  truncated = false;
+
+  append(chunk: Buffer | string): void {
+    const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    this.observed += data.length;
+
+    if (this.prefix.length < OUTPUT_LIMIT_BYTES) {
+      const prefixBytes = Math.min(
+        OUTPUT_LIMIT_BYTES - this.prefix.length,
+        data.length,
+      );
+      if (prefixBytes > 0) {
+        this.prefix = Buffer.concat([this.prefix, data.subarray(0, prefixBytes)]);
+      }
+    }
+
+    if (this.observed > OUTPUT_LIMIT_BYTES) this.truncated = true;
+
+    this.suffix = Buffer.concat([this.suffix, data]);
+    if (this.suffix.length > OUTPUT_SUFFIX_LIMIT_BYTES) {
+      this.suffix = this.suffix.subarray(
+        this.suffix.length - OUTPUT_SUFFIX_LIMIT_BYTES,
+      );
+    }
+  }
+
+  view(): string {
+    const data = this.truncated
+      ? Buffer.concat([this.prefix, this.suffix])
+      : this.prefix;
+    return data.toString("utf8");
+  }
+}
+
+/**
+ * Run one Docker CLI operation without blocking the event loop.
+ *
+ * stdout and stderr are always put into flowing mode and retain only a
+ * bounded prefix plus a rolling suffix.  A timeout kills the CLI client and
+ * waits briefly for its close event so any already-delivered output is still
+ * included in the returned view.
+ */
+async function runDocker(args: string[], timeoutMs = 30000): Promise<DockerResult> {
+  const child = spawn("docker", args, {
+    stdio: ["ignore", "pipe", "pipe"],
+  });
+
+  const stdout = new BoundedOutput();
+  const stderr = new BoundedOutput();
+  let exitCode: number | null = null;
+  let childError: Error | null = null;
+  let completed = false;
+
+  const snapshot = (status: number | null, timedOut: boolean): DockerResult => ({
+    stdout: stdout.view(),
+    stderr: stderr.view(),
+    status,
+    timedOut,
+    truncated: stdout.truncated || stderr.truncated,
+    error: childError,
+  });
+
+  const completion = new Promise<DockerResult>((resolve) => {
+    const finish = (status: number | null): void => {
+      if (completed) return;
+      completed = true;
+      resolve(snapshot(status, false));
+    };
+
+    child.stdout?.on("data", (chunk: Buffer | string) => stdout.append(chunk));
+    child.stderr?.on("data", (chunk: Buffer | string) => stderr.append(chunk));
+    child.stdout?.resume();
+    child.stderr?.resume();
+
+    child.once("exit", (code) => {
+      exitCode = typeof code === "number" ? code : null;
+    });
+    child.once("error", (error) => {
+      childError = asError(error);
+      finish(null);
+    });
+    child.once("close", (code) => {
+      finish(typeof code === "number" ? code : exitCode);
+    });
+  });
+
+  let timeoutHandle: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<DockerResult>((resolve) => {
+    timeoutHandle = setTimeout(
+      () => {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // The close/error handlers still own the normal completion path.
+        }
+        resolve(snapshot(null, true));
+      },
+      Math.max(0, timeoutMs),
+    );
+  });
+
+  const first = await Promise.race([completion, timeout]);
+  if (!first.timedOut) {
+    if (timeoutHandle !== undefined) clearTimeout(timeoutHandle);
+    return first;
+  }
+
+  let reapHandle: ReturnType<typeof setTimeout> | undefined;
+  const reaped = await Promise.race([
+    completion,
+    new Promise<null>((resolve) => {
+      reapHandle = setTimeout(() => resolve(null), EXEC_REAP_TIMEOUT_MS);
+    }),
+  ]);
+  if (reapHandle !== undefined) clearTimeout(reapHandle);
+
+  if (reaped !== null) {
+    return {
+      ...reaped,
+      status: null,
+      timedOut: true,
+    };
+  }
+  // The client did not close within the bounded reap window.  The Docker
+  // operation itself has still timed out; later close events cannot block the
+  // caller or reset its deadline.
+  return first;
 }
 
 export class DockerExecutor {
@@ -30,37 +176,38 @@ export class DockerExecutor {
   private targetId: string | null = null;
   private targetName: string | null = null;
   private executionDeadline: number | null = null;
-  private executionMonotonic: (() => number) | null = null;
   private preparationDeadline: number | null = null;
   private preparationRemaining: number | null = null;
+  private clock: () => number = monotonicNow;
 
   constructor(private opts: { image?: string; networkMode?: string } = {}) {
     this.opts.networkMode ??= "none";
-    if (!["none", "local"].includes(this.opts.networkMode))
+    if (!["none", "local"].includes(this.opts.networkMode)) {
       throw new Error(`unsupported network_mode ${this.opts.networkMode}`);
+    }
   }
 
   setRemaining(remaining: number): void {
     this.preparationRemaining = Math.max(0, remaining);
   }
+
   setExecutionDeadline(deadline: number, monotonic: () => number): void {
     this.executionDeadline = deadline;
-    this.executionMonotonic = monotonic;
+    this.clock = monotonic;
   }
 
   private preparationTimeout(fixed: number): number {
     if (this.preparationDeadline == null) return fixed;
-    const rem =
-      this.preparationDeadline - (this.executionMonotonic?.() ?? Date.now() / 1000);
-    if (rem <= 0) throw new SandboxError("preparation budget exhausted");
-    return Math.min(fixed, rem);
+    const remaining = this.preparationDeadline - this.clock();
+    if (remaining <= 0) throw new SandboxError("preparation budget exhausted");
+    return Math.min(fixed, remaining);
   }
+
   private executionTimeout(fixed: number): number {
     if (this.executionDeadline == null) return fixed;
-    const rem =
-      this.executionDeadline - (this.executionMonotonic?.() ?? Date.now() / 1000);
-    if (rem <= 0) throw new SandboxError("execution budget exhausted");
-    return Math.min(fixed, rem);
+    const remaining = this.executionDeadline - this.clock();
+    if (remaining <= 0) throw new SandboxError("execution budget exhausted");
+    return Math.min(fixed, remaining);
   }
 
   private validateEndpoint(): void {
@@ -78,60 +225,67 @@ export class DockerExecutor {
     }
   }
 
-  prepare(workspace: string, runId: string): void {
+  async prepare(workspace: string, runId: string): Promise<void> {
     if (this.containerId) throw new SandboxError("already prepared");
     validateRunId(runId);
     if (process.getuid?.() === 0) throw new SandboxError("running as root unsupported");
+
     this.containerName = `flagagent-agent-${runId}`;
     if (this.preparationRemaining != null) {
-      if (this.preparationRemaining <= 0)
-        throw new SandboxError("preparation budget exhausted");
-      this.preparationDeadline =
-        (this.executionMonotonic?.() ?? Date.now() / 1000) + this.preparationRemaining;
+      const remaining = this.preparationRemaining;
       this.preparationRemaining = null;
+      if (remaining <= 0) throw new SandboxError("preparation budget exhausted");
+      this.preparationDeadline = this.clock() + remaining;
     }
+
     try {
       this.validateEndpoint();
-      if (this.opts.networkMode === "local") this.prepareLocal(workspace, runId);
-      else this.prepareNone(workspace, runId);
+      if (this.opts.networkMode === "local") {
+        await this.prepareLocal(workspace, runId);
+      } else {
+        await this.prepareNone(workspace, runId);
+      }
     } finally {
       this.preparationDeadline = null;
     }
   }
 
-  private prepareNone(workspace: string, runId: string): void {
+  private async prepareNone(workspace: string, runId: string): Promise<void> {
     try {
-      this.createAgent(workspace, runId);
-    } catch (e) {
+      await this.createAgent(workspace, runId);
+    } catch (error) {
       if (
         this.preparationDeadline != null &&
-        (this.executionMonotonic?.() ?? Date.now() / 1000) >= this.preparationDeadline
-      )
-        throw e;
-      this.removeOwned();
-      throw e;
-    }
-  }
-  private prepareLocal(workspace: string, runId: string): void {
-    this.networkName = `flagagent-net-${runId}`;
-    this.targetName = `flagagent-target-${runId}`;
-    try {
-      this.createNetwork(runId);
-      this.createTarget(runId);
-      this.waitTargetReady();
-      this.createAgent(workspace, runId);
-    } catch (e) {
-      if (
-        this.preparationDeadline != null &&
-        (this.executionMonotonic?.() ?? Date.now() / 1000) >= this.preparationDeadline
-      )
-        throw e;
-      this.removeOwned();
-      throw e;
+        this.clock() >= this.preparationDeadline
+      ) {
+        throw error;
+      }
+      await this.removeOwned();
+      throw error;
     }
   }
 
-  private createAgent(workspace: string, runId: string): void {
+  private async prepareLocal(workspace: string, runId: string): Promise<void> {
+    this.networkName = `flagagent-net-${runId}`;
+    this.targetName = `flagagent-target-${runId}`;
+    try {
+      await this.createNetwork(runId);
+      await this.createTarget(runId);
+      await this.waitTargetReady();
+      await this.createAgent(workspace, runId);
+    } catch (error) {
+      if (
+        this.preparationDeadline != null &&
+        this.clock() >= this.preparationDeadline
+      ) {
+        throw error;
+      }
+      await this.removeOwned();
+      throw error;
+    }
+  }
+
+  private async createAgent(workspace: string, runId: string): Promise<void> {
     const args = [
       "run",
       "-d",
@@ -168,18 +322,24 @@ export class DockerExecutor {
       "sleep",
       "infinity",
     ];
-    const r = runDocker(args, this.preparationTimeout(60) * 1000);
-    if (r.status !== 0) throw new SandboxError(`docker run failed: ${r.stderr.trim()}`);
-    const id = r.stdout.trim();
+    const result = await runDocker(args, this.preparationTimeout(60) * 1000);
+    if (result.timedOut) throw new SandboxError("docker run timed out");
+    if (result.error)
+      throw new SandboxError(`docker run failed: ${resultDetail(result)}`);
+    if (result.status !== 0) {
+      throw new SandboxError(`docker run failed: ${resultDetail(result)}`);
+    }
+    const id = result.stdout.trim();
     if (!id) throw new SandboxError("docker run returned no id");
     this.containerId = id;
-    if (!this.isContainerRunning(this.containerId)) {
-      this.forceRemove(this.containerId);
+    if (!(await this.isContainerRunning(this.containerId))) {
+      await this.forceRemove(this.containerId);
       this.containerId = null;
       throw new SandboxError("agent container not running");
     }
   }
-  private createNetwork(runId: string): void {
+
+  private async createNetwork(runId: string): Promise<void> {
     const args = [
       "network",
       "create",
@@ -196,14 +356,22 @@ export class DockerExecutor {
       "flagagent.version=0.1.1",
       this.networkName!,
     ];
-    const r = runDocker(args, this.preparationTimeout(30) * 1000);
-    if (r.status !== 0)
-      throw new SandboxError(`docker network create failed: ${r.stderr.trim()}`);
-    const id = r.stdout.trim();
+    const result = await runDocker(args, this.preparationTimeout(30) * 1000);
+    if (result.timedOut) {
+      throw new SandboxError("docker network create timed out");
+    }
+    if (result.error) {
+      throw new SandboxError(`docker network create failed: ${resultDetail(result)}`);
+    }
+    if (result.status !== 0) {
+      throw new SandboxError(`docker network create failed: ${resultDetail(result)}`);
+    }
+    const id = result.stdout.trim();
     if (!id) throw new SandboxError("docker network no id");
     this.networkId = id;
   }
-  private createTarget(runId: string): void {
+
+  private async createTarget(runId: string): Promise<void> {
     const args = [
       "run",
       "-d",
@@ -236,21 +404,28 @@ export class DockerExecutor {
       "flagagent.version=0.1.1",
       TARGET_IMAGE,
     ];
-    const r = runDocker(args, this.preparationTimeout(60) * 1000);
-    if (r.status !== 0)
-      throw new SandboxError(`docker target run failed: ${r.stderr.trim()}`);
-    const id = r.stdout.trim();
+    const result = await runDocker(args, this.preparationTimeout(60) * 1000);
+    if (result.timedOut) throw new SandboxError("docker target run timed out");
+    if (result.error) {
+      throw new SandboxError(`docker target run failed: ${resultDetail(result)}`);
+    }
+    if (result.status !== 0) {
+      throw new SandboxError(`docker target run failed: ${resultDetail(result)}`);
+    }
+    const id = result.stdout.trim();
     if (!id) throw new SandboxError("target no id");
     this.targetId = id;
   }
-  private waitTargetReady(): void {
-    for (let i = 0; i < 30; i++) {
+
+  private async waitTargetReady(): Promise<void> {
+    for (let attempt = 0; attempt < 30; attempt += 1) {
       if (
         this.preparationDeadline != null &&
-        (this.executionMonotonic?.() ?? Date.now() / 1000) >= this.preparationDeadline
-      )
+        this.clock() >= this.preparationDeadline
+      ) {
         throw new SandboxError("preparation budget exhausted");
-      const r = runDocker(
+      }
+      const result = await runDocker(
         [
           "exec",
           this.targetId!,
@@ -258,150 +433,205 @@ export class DockerExecutor {
           "-c",
           "import socket,sys; s=socket.create_connection(('127.0.0.1',9999),2); sys.stdout.write(s.recv(64).decode()); s.close()",
         ],
-        5000,
+        this.preparationTimeout(5) * 1000,
       );
-      if (r.status === 0 && r.stdout.includes("flagagent-target-ok")) return;
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 500);
+      if (
+        !result.error &&
+        !result.timedOut &&
+        result.status === 0 &&
+        result.stdout.includes("flagagent-target-ok")
+      ) {
+        return;
+      }
+
+      if (attempt === 29) break;
+      let delayMs = 500;
+      if (this.preparationDeadline != null) {
+        delayMs = Math.min(
+          delayMs,
+          Math.max(0, this.preparationDeadline - this.clock()) * 1000,
+        );
+      }
+      if (delayMs <= 0) throw new SandboxError("preparation budget exhausted");
+      await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
     }
     throw new SandboxError("target not ready");
   }
 
-  execute(command: string, timeoutSeconds: number): ShellResult {
+  async execute(command: string, timeoutSeconds: number): Promise<ShellResult> {
     if (!this.containerId) throw new SandboxError("not prepared");
-    const running = runDocker(
-      ["inspect", "--format", "{{.State.Running}}", this.containerId],
-      this.executionTimeout(10) * 1000,
-    );
-    if (running.stdout.trim() !== "true") throw new SandboxError("agent not running");
-    const deadline =
-      (this.executionMonotonic?.() ?? Date.now() / 1000) + timeoutSeconds;
-    const boundedDeadline =
-      this.executionDeadline != null
-        ? Math.min(deadline, this.executionDeadline)
-        : deadline;
+
     try {
-      const proc = spawn("docker", [
-        "exec",
-        "-w",
-        WORKSPACE_TARGET,
-        this.containerId,
-        "/bin/bash",
-        "-lc",
-        command,
-      ]);
-      let stdout = Buffer.alloc(0),
-        stderr = Buffer.alloc(0);
-      let timedOut = false;
-      const limit = 64 * 1024;
-      proc.stdout?.on("data", (d: Buffer) => {
-        stdout = Buffer.concat([stdout, d]);
-        if (stdout.length > limit * 2)
-          stdout = stdout.subarray(stdout.length - limit * 2);
-      });
-      proc.stderr?.on("data", (d: Buffer) => {
-        stderr = Buffer.concat([stderr, d]);
-        if (stderr.length > limit * 2)
-          stderr = stderr.subarray(stderr.length - limit * 2);
-      });
-      // Use sync wait with timeout via polling
-      const code = (() => {
-        const timeoutMs = Math.max(0, boundedDeadline * 1000 - Date.now());
-        let result: number | null = null;
-        let done = false;
-        proc.on("close", (c) => {
-          result = c;
-          done = true;
-        });
-        const deadlineMs = Date.now() + timeoutMs;
-        while (!done && Date.now() < deadlineMs)
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-        if (!done) {
-          timedOut = true;
-          try {
-            proc.kill("SIGKILL");
-          } catch {
-            /* ignore */
-          }
-        }
-        // wait a bit for close
-        const end = Date.now() + 1000;
-        while (!done && Date.now() < end)
-          Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 20);
-        return result;
-      })();
-      if (timedOut) {
-        this.recoverAfterTimeout();
+      const running = await runDocker(
+        ["inspect", "--format", "{{.State.Running}}", this.containerId],
+        this.executionTimeout(10) * 1000,
+      );
+      if (
+        running.error ||
+        running.timedOut ||
+        running.status !== 0 ||
+        running.stdout.trim() !== "true"
+      ) {
+        throw new SandboxError("agent not running");
+      }
+
+      const commandDeadline = this.clock() + Math.max(0, timeoutSeconds);
+      const boundedDeadline =
+        this.executionDeadline == null
+          ? commandDeadline
+          : Math.min(commandDeadline, this.executionDeadline);
+      const remaining = boundedDeadline - this.clock();
+      if (remaining <= 0) throw new SandboxError("execution budget exhausted");
+
+      const result = await runDocker(
+        ["exec", "-w", WORKSPACE_TARGET, this.containerId, "/bin/bash", "-lc", command],
+        remaining * 1000,
+      );
+      if (result.timedOut) {
+        await this.recoverAfterTimeout();
         return new ShellResult(
-          stdout.toString("utf8", 0, Math.min(stdout.length, limit)),
-          stderr.toString("utf8", 0, Math.min(stderr.length, limit)),
+          result.stdout,
+          result.stderr,
           null,
           true,
+          result.truncated,
         );
       }
+      if (result.error) {
+        throw new SandboxError(`docker exec failed: ${resultDetail(result)}`);
+      }
       return new ShellResult(
-        stdout.toString("utf8"),
-        stderr.toString("utf8"),
-        code ?? 0,
+        result.stdout,
+        result.stderr,
+        result.status ?? 1,
         false,
+        result.truncated,
       );
     } finally {
       this.executionDeadline = null;
-      this.executionMonotonic = null;
     }
   }
 
-  private recoverAfterTimeout(): void {
-    if (this.containerId) {
-      runDocker(["kill", this.containerId], 30000);
-      runDocker(["start", this.containerId], 60000);
+  private async recoverAfterTimeout(): Promise<void> {
+    if (!this.containerId) {
+      throw new SandboxError("timeout recovery failed: no agent container");
+    }
+    if (this.executionDeadline != null && this.clock() >= this.executionDeadline) {
+      throw new SandboxError("execution budget exhausted");
+    }
+
+    const killed = await runDocker(
+      ["kill", this.containerId],
+      this.executionTimeout(30) * 1000,
+    );
+    if (killed.error || killed.timedOut || killed.status !== 0) {
+      throw new SandboxError(
+        `timeout recovery failed: docker kill failed: ${resultDetail(killed)}`,
+      );
+    }
+
+    if (this.executionDeadline != null && this.clock() >= this.executionDeadline) {
+      throw new SandboxError("execution budget exhausted");
+    }
+    const started = await runDocker(
+      ["start", this.containerId],
+      this.executionTimeout(60) * 1000,
+    );
+    if (started.error || started.timedOut || started.status !== 0) {
+      throw new SandboxError(
+        `timeout recovery failed: docker start failed: ${resultDetail(started)}`,
+      );
     }
   }
 
-  private isContainerRunning(id: string): boolean {
-    const r = runDocker(["inspect", "--format", "{{.State.Running}}", id], 10000);
-    return r.stdout.trim() === "true";
-  }
-  private forceRemove(id: string): void {
+  private async isContainerRunning(id: string): Promise<boolean> {
+    let timeout: number;
     try {
-      runDocker(["rm", "-f", id], 30000);
+      timeout = this.preparationTimeout(10);
     } catch {
-      /* ignore */
+      return false;
     }
+    const result = await runDocker(
+      ["inspect", "--format", "{{.State.Running}}", id],
+      timeout * 1000,
+    );
+    return (
+      !result.error &&
+      !result.timedOut &&
+      result.status === 0 &&
+      result.stdout.trim() === "true"
+    );
   }
-  private removeOwned(): string[] {
-    const errs: string[] = [];
+
+  private async forceRemove(id: string): Promise<void> {
+    const result = await runDocker(["rm", "-f", id], 30000);
+    // Removal is best effort during preparation.  The caller owns the
+    // original preparation error and final cleanup retries known resources.
+    void result;
+  }
+
+  private async removeOwned(): Promise<string[]> {
+    const errors: string[] = [];
+
     if (this.containerId) {
-      const r = runDocker(["rm", "-f", this.containerId], 30000);
-      if (r.status !== 0 && !r.stderr.includes("No such container"))
-        errs.push(r.stderr);
-      else {
+      const id = this.containerId;
+      const result = await this.removeDockerResource(["rm", "-f", id]);
+      if (result !== null) {
+        errors.push(result);
+      } else {
         this.containerId = null;
         this.containerName = null;
       }
     }
+
     if (this.targetId) {
-      const r = runDocker(["rm", "-f", this.targetId], 30000);
-      if (r.status !== 0) errs.push(r.stderr);
-      else {
+      const id = this.targetId;
+      const result = await this.removeDockerResource(["rm", "-f", id]);
+      if (result !== null) {
+        errors.push(result);
+      } else {
         this.targetId = null;
         this.targetName = null;
       }
     }
+
     if (this.networkId) {
-      const r = runDocker(["network", "rm", this.networkId], 30000);
-      if (r.status !== 0) errs.push(r.stderr);
-      else {
+      const id = this.networkId;
+      const result = await this.removeDockerResource(["network", "rm", id]);
+      if (result !== null) {
+        errors.push(result);
+      } else {
         this.networkId = null;
         this.networkName = null;
       }
     }
-    return errs;
+
+    return errors;
   }
 
-  cleanup(runId: string): void {
+  private async removeDockerResource(args: string[]): Promise<string | null> {
+    let timeout = 30000;
+    try {
+      if (this.preparationDeadline != null)
+        timeout = this.preparationTimeout(30) * 1000;
+    } catch (error) {
+      return asError(error).message;
+    }
+    const result = await runDocker(args, timeout);
+    if (
+      result.status === 0 ||
+      result.stderr.includes("No such container") ||
+      result.stderr.includes("No such network")
+    ) {
+      return null;
+    }
+    return resultDetail(result);
+  }
+
+  async cleanup(runId: string): Promise<void> {
     validateRunId(runId);
-    const errs = this.removeOwned();
-    if (errs.length) throw new SandboxError(`cleanup failed: ${errs.join("; ")}`);
+    const errors = await this.removeOwned();
+    if (errors.length) throw new SandboxError(`cleanup failed: ${errors.join("; ")}`);
   }
 
   sandboxProvenance(): Record<string, unknown> {
@@ -416,6 +646,7 @@ export class DockerExecutor {
       security_relaxations: [],
     };
   }
+
   sandboxLifecycle(): Record<string, unknown> {
     const info: Record<string, unknown> = {};
     if (this.containerId) info.agent_container_id = this.containerId;

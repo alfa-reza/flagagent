@@ -1,4 +1,4 @@
-import { readFileSync, statSync } from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { AgentLoop } from "./loop.js";
 import { Limits } from "./limits.js";
@@ -13,31 +13,112 @@ import {
   SOLVER_PROMPT_VERSION,
 } from "./prompt.js";
 
-function loadChallenge(challengeDir: string): {
+export const MAX_CHALLENGE_DESCRIPTOR_BYTES = 64 * 1024;
+const PROTOCOL_NAMES = ["openai-chat", "openai-responses", "anthropic"] as const;
+type Protocol = (typeof PROTOCOL_NAMES)[number];
+
+function isIdentifier(value: string): boolean {
+  return /^[\p{ID_Start}_][\p{ID_Continue}_]*$/u.test(value);
+}
+
+function requireString(payload: Record<string, unknown>, key: string): string {
+  const value = payload[key];
+  if (typeof value !== "string" || value.trim().length === 0) {
+    throw new Error(`challenge descriptor requires non-empty ${key}`);
+  }
+  return value;
+}
+
+export function loadChallenge(challengeDir: string): {
   identity: string;
   description: string;
   expectedFlag: string;
-  networkMode: string;
+  networkMode: "none" | "local";
   targetContext?: string;
   sourceDir?: string;
 } {
-  const stat = statSync(challengeDir);
-  if (!stat.isDirectory()) throw new Error("challenge must be a directory");
-  const raw = readFileSync(join(challengeDir, "challenge.json"), "utf8");
-  const payload = JSON.parse(raw);
-  const filesDir = join(challengeDir, "files");
+  const challengeStat = lstatSync(challengeDir);
+  if (challengeStat.isSymbolicLink() || !challengeStat.isDirectory()) {
+    throw new Error("challenge must be a directory");
+  }
+
+  const descriptorPath = join(challengeDir, "challenge.json");
+  const descriptorStat = lstatSync(descriptorPath);
+  if (descriptorStat.isSymbolicLink() || !descriptorStat.isFile()) {
+    throw new Error("challenge.json must be a regular file");
+  }
+  if (descriptorStat.size > MAX_CHALLENGE_DESCRIPTOR_BYTES) {
+    throw new Error(
+      `challenge.json exceeds maximum size of ${MAX_CHALLENGE_DESCRIPTOR_BYTES} bytes`,
+    );
+  }
+
+  const data = readFileSync(descriptorPath);
+  if (data.byteLength > MAX_CHALLENGE_DESCRIPTOR_BYTES) {
+    throw new Error(
+      `challenge.json exceeds maximum size of ${MAX_CHALLENGE_DESCRIPTOR_BYTES} bytes`,
+    );
+  }
+  let payloadValue: unknown;
+  try {
+    payloadValue = JSON.parse(new TextDecoder("utf-8", { fatal: true }).decode(data));
+  } catch (error) {
+    throw new Error("challenge.json must be valid JSON", { cause: error });
+  }
+  if (
+    payloadValue === null ||
+    typeof payloadValue !== "object" ||
+    Array.isArray(payloadValue)
+  ) {
+    throw new TypeError("challenge.json must contain an object");
+  }
+  const payload = payloadValue as Record<string, unknown>;
+  const allowed = new Set([
+    "identity",
+    "description",
+    "expected_flag",
+    "network_mode",
+    "target_context",
+  ]);
+  if (Object.keys(payload).some((key) => !allowed.has(key))) {
+    throw new Error("challenge.json contains unsupported fields");
+  }
+
+  const identity = requireString(payload, "identity");
+  const description = payload.description;
+  if (typeof description !== "string") {
+    throw new TypeError("challenge descriptor requires string description");
+  }
+  const expectedFlag = requireString(payload, "expected_flag");
+  const networkMode = payload.network_mode;
+  if (networkMode !== "none" && networkMode !== "local") {
+    throw new Error("challenge network_mode must be none or local");
+  }
+  const targetContext = payload.target_context;
+  if (targetContext !== undefined && targetContext !== null) {
+    if (typeof targetContext !== "string") {
+      throw new TypeError("challenge target_context must be a string");
+    }
+  }
+
+  const filesPath = join(challengeDir, "files");
   let sourceDir: string | undefined;
   try {
-    if (statSync(filesDir).isDirectory()) sourceDir = filesDir;
-  } catch {
-    /* none */
+    const filesStat = lstatSync(filesPath);
+    if (filesStat.isSymbolicLink() || !filesStat.isDirectory()) {
+      throw new Error("challenge files must be a directory");
+    }
+    sourceDir = filesPath;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
+
   return {
-    identity: payload.identity,
-    description: payload.description,
-    expectedFlag: payload.expected_flag,
-    networkMode: payload.network_mode ?? "none",
-    targetContext: payload.target_context,
+    identity,
+    description,
+    expectedFlag,
+    networkMode,
+    targetContext: targetContext ?? undefined,
     sourceDir,
   };
 }
@@ -48,22 +129,31 @@ export async function runCli(argv: string[]): Promise<void> {
     return idx >= 0 ? argv[idx + 1] : undefined;
   };
   const challenge = get("--challenge");
-  const protocol = get("--protocol");
+  const protocolValue = get("--protocol");
   const model = get("--model");
   const apiBase = get("--api-base");
+  const apiKeyEnv = get("--api-key-env");
   const runsRoot = get("--runs-root") ?? "runs";
-  if (!challenge || !protocol || !model) {
+  if (!challenge || !protocolValue || !model) {
     console.error(
       "usage: flagagent run --challenge DIR --protocol openai-chat|openai-responses|anthropic --model MODEL",
     );
     process.exit(2);
   }
+  if (!PROTOCOL_NAMES.includes(protocolValue as Protocol)) {
+    throw new Error(`unsupported protocol: ${protocolValue}`);
+  }
+  const protocol = protocolValue as Protocol;
   const ch = loadChallenge(challenge);
-  const apiKey =
-    process.env[protocol === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY"] ??
-    "";
+  const defaultKeyEnv =
+    protocol === "anthropic" ? "ANTHROPIC_API_KEY" : "OPENAI_API_KEY";
+  const keyEnv = apiKeyEnv ?? defaultKeyEnv;
+  if (!isIdentifier(keyEnv)) {
+    throw new Error("api-key-env must be a valid environment variable name");
+  }
+  const apiKey = process.env[keyEnv] ?? "";
   if (!apiKey) {
-    console.error("missing API key");
+    console.error(`missing API key environment variable: ${keyEnv}`);
     process.exit(2);
   }
   let modelInst: import("./model.js").Model;
@@ -79,12 +169,13 @@ export async function runCli(argv: string[]): Promise<void> {
       apiKey,
       baseURL: apiBase,
     }) as unknown as import("./model.js").Model;
-  else
+  else if (protocol === "anthropic")
     modelInst = new AnthropicMessagesModel({
       model,
       apiKey,
       baseURL: apiBase,
     }) as unknown as import("./model.js").Model;
+  else throw new Error(`unsupported protocol: ${protocol}`);
   const executor = new DockerExecutor({ networkMode: ch.networkMode });
   const loop = new AgentLoop({
     model: modelInst,
