@@ -126,16 +126,26 @@ export function loadChallenge(challengeDir: string): {
 }
 
 export async function runCli(argv: string[]): Promise<void> {
-  const get = (flag: string) => {
-    const idx = argv.indexOf(flag);
-    return idx >= 0 ? argv[idx + 1] : undefined;
+  if (argv.length === 0 || argv[0] !== "run") {
+    console.error(
+      "usage: flagagent run --challenge DIR --protocol openai-chat|openai-responses|anthropic --model MODEL",
+    );
+    process.exit(2);
+  }
+  const args = argv.slice(1);
+  const getArg = (flag: string) => {
+    const idx = args.indexOf(flag);
+    return idx >= 0 ? args[idx + 1] : undefined;
   };
-  const challenge = get("--challenge");
-  const protocolValue = get("--protocol");
-  const model = get("--model");
-  const apiBase = get("--api-base");
-  const apiKeyEnv = get("--api-key-env");
-  const runsRoot = get("--runs-root") ?? "runs";
+  const challenge = getArg("--challenge");
+  const protocolValue = getArg("--protocol");
+  const model = getArg("--model");
+  const apiBase = getArg("--api-base");
+  const apiKeyEnv = getArg("--api-key-env");
+  const runsRoot = getArg("--runs-root") ?? "runs";
+  const maxModelTurnsRaw = getArg("--max-model-turns");
+  const wallTimeoutRaw = getArg("--wall-timeout-seconds");
+  const commandTimeoutRaw = getArg("--command-timeout-seconds");
   if (!challenge || !protocolValue || !model) {
     console.error(
       "usage: flagagent run --challenge DIR --protocol openai-chat|openai-responses|anthropic --model MODEL",
@@ -178,6 +188,25 @@ export async function runCli(argv: string[]): Promise<void> {
       baseURL: apiBase,
     }) as unknown as import("./model.js").Model;
   else throw new Error(`unsupported protocol: ${protocol}`);
+  const limitOverrides: Record<string, number> = {};
+  if (maxModelTurnsRaw != null) {
+    const v = Number(maxModelTurnsRaw);
+    if (!Number.isInteger(v) || v <= 0)
+      throw new Error("--max-model-turns must be a positive integer");
+    limitOverrides.maxModelTurns = v;
+  }
+  if (wallTimeoutRaw != null) {
+    const v = Number(wallTimeoutRaw);
+    if (!Number.isFinite(v) || v <= 0)
+      throw new Error("--wall-timeout-seconds must be a positive number");
+    limitOverrides.wallTimeoutSeconds = v;
+  }
+  if (commandTimeoutRaw != null) {
+    const v = Number(commandTimeoutRaw);
+    if (!Number.isFinite(v) || v <= 0)
+      throw new Error("--command-timeout-seconds must be a positive number");
+    limitOverrides.commandTimeoutSeconds = v;
+  }
   const executor = new DockerExecutor({ networkMode: ch.networkMode });
   const loop = new AgentLoop({
     model: modelInst,
@@ -190,7 +219,7 @@ export async function runCli(argv: string[]): Promise<void> {
       targetContext: ch.targetContext,
       networkMode: ch.networkMode,
     },
-    limits: new Limits(),
+    limits: new Limits(limitOverrides),
     runsRoot,
     monotonic: () => Number(process.hrtime.bigint()) / 1_000_000_000,
     utcNow: () => new Date(),

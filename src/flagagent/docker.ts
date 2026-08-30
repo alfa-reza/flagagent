@@ -210,19 +210,91 @@ export class DockerExecutor {
     return Math.min(fixed, remaining);
   }
 
-  private validateEndpoint(): void {
-    const host = process.env.DOCKER_HOST?.trim() ?? "";
-    const ctx = process.env.DOCKER_CONTEXT?.trim() ?? "";
-    if (
-      ctx ||
-      (host &&
-        !host.startsWith("unix://") &&
-        !host.startsWith("npipe://") &&
-        !host.startsWith("fd://") &&
-        !host.startsWith("/"))
-    ) {
-      throw new SandboxError(`unsupported remote Docker endpoint ${host || ctx}`);
+  private async validateEndpoint(): Promise<void> {
+    const dockerContext = process.env.DOCKER_CONTEXT?.trim() ?? "";
+    const dockerHost = process.env.DOCKER_HOST?.trim() ?? "";
+    let effectiveHost: string;
+    if (dockerContext) {
+      effectiveHost = await this.hostForContext(dockerContext);
+    } else if (dockerHost) {
+      effectiveHost = dockerHost;
+    } else {
+      const ctxName = await this.currentContextName();
+      effectiveHost = await this.hostForContext(ctxName);
     }
+    if (!this.isLocalEndpoint(effectiveHost)) {
+      throw new SandboxError(
+        `unsupported remote Docker endpoint ${JSON.stringify(effectiveHost)}; FlagAgent v0.1 supports only local Docker Engine via unix/npipe/fd sockets; check DOCKER_HOST, DOCKER_CONTEXT, and docker context`,
+      );
+    }
+  }
+
+  private async currentContextName(): Promise<string> {
+    const result = await runDocker(
+      ["context", "show"],
+      this.preparationTimeout(5) * 1000,
+    );
+    if (result.timedOut)
+      throw new SandboxError("unable to determine Docker context: timed out");
+    if (result.error)
+      throw new SandboxError(
+        `unable to determine Docker context: ${result.error.message}`,
+      );
+    if (result.status !== 0) {
+      const detail = result.stderr.trim() || result.stdout.trim() || "unknown error";
+      throw new SandboxError(`unable to determine Docker context: ${detail}`);
+    }
+    const name = result.stdout.trim();
+    if (!name)
+      throw new SandboxError("unable to determine Docker context: empty context name");
+    return name;
+  }
+
+  private async hostForContext(name: string): Promise<string> {
+    const result = await runDocker(
+      ["context", "inspect", name, "--format", "{{.Endpoints.docker.Host}}"],
+      this.preparationTimeout(5) * 1000,
+    );
+    if (result.timedOut)
+      throw new SandboxError(
+        `unable to validate Docker endpoint for context ${JSON.stringify(name)}: timed out`,
+      );
+    if (result.error)
+      throw new SandboxError(
+        `unable to validate Docker endpoint for context ${JSON.stringify(name)}: ${result.error.message}`,
+      );
+    if (result.status !== 0) {
+      const detail = result.stderr.trim() || result.stdout.trim() || "unknown error";
+      throw new SandboxError(
+        `unable to validate Docker endpoint for context ${JSON.stringify(name)}: ${detail}`,
+      );
+    }
+    const host = result.stdout.trim();
+    if (!host)
+      throw new SandboxError(
+        `unable to validate Docker endpoint for context ${JSON.stringify(name)}: empty host`,
+      );
+    return host;
+  }
+
+  private isLocalEndpoint(host: string): boolean {
+    const h = host.trim();
+    if (!h) throw new SandboxError("unable to validate Docker endpoint: empty host");
+    const lower = h.toLowerCase();
+    if (
+      lower.startsWith("unix://") ||
+      lower.startsWith("npipe://") ||
+      lower.startsWith("fd://")
+    )
+      return true;
+    if (
+      lower.startsWith("unix:") ||
+      lower.startsWith("npipe:") ||
+      lower.startsWith("fd:")
+    )
+      return true;
+    if (h.startsWith("/")) return true;
+    return false;
   }
 
   async prepare(workspace: string, runId: string): Promise<void> {
@@ -239,7 +311,7 @@ export class DockerExecutor {
     }
 
     try {
-      this.validateEndpoint();
+      await this.validateEndpoint();
       if (this.opts.networkMode === "local") {
         await this.prepareLocal(workspace, runId);
       } else {
