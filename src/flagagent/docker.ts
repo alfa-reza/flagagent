@@ -16,6 +16,7 @@ interface DockerResult {
   timedOut: boolean;
   truncated: boolean;
   error: Error | null;
+  errorCode: string | null;
 }
 
 function monotonicNow(): number {
@@ -32,6 +33,15 @@ function asError(error: unknown): Error {
 
 function resultDetail(result: DockerResult): string {
   return result.stderr.trim() || result.error?.message || "unknown error";
+}
+
+function isDockerCliNotFound(result: DockerResult): boolean {
+  const message = result.error?.message ?? "";
+  return (
+    result.errorCode === "ENOENT" ||
+    message.includes("ENOENT") ||
+    message.toLowerCase().includes("not found")
+  );
 }
 
 class BoundedOutput {
@@ -91,6 +101,7 @@ async function runDocker(args: string[], timeoutMs = 30000): Promise<DockerResul
   const stderr = new BoundedOutput();
   let exitCode: number | null = null;
   let childError: Error | null = null;
+  let errorCode: string | null = null;
   let completed = false;
 
   const snapshot = (status: number | null, timedOut: boolean): DockerResult => ({
@@ -100,6 +111,7 @@ async function runDocker(args: string[], timeoutMs = 30000): Promise<DockerResul
     timedOut,
     truncated: stdout.truncated || stderr.truncated,
     error: childError,
+    errorCode,
   });
 
   const completion = new Promise<DockerResult>((resolve) => {
@@ -119,6 +131,8 @@ async function runDocker(args: string[], timeoutMs = 30000): Promise<DockerResul
     });
     child.once("error", (error) => {
       childError = asError(error);
+      const code = (error as NodeJS.ErrnoException).code;
+      errorCode = typeof code === "string" ? code : null;
       finish(null);
     });
     child.once("close", (code) => {
@@ -179,7 +193,31 @@ async function runDocker(args: string[], timeoutMs = 30000): Promise<DockerResul
     const final = snapshot(null, true);
     return { ...final, timedOut: true };
   }
-  return first;
+
+  try {
+    if (child.pid != null) {
+      try {
+        process.kill(-child.pid, "SIGKILL");
+      } catch {
+        try {
+          child.kill("SIGKILL");
+        } catch {
+          // ignore
+        }
+      }
+    } else {
+      child.kill("SIGKILL");
+    }
+  } catch {
+    // The close/error handlers still own the completion path.
+  }
+  const final = await completion;
+  return {
+    ...final,
+    status: null,
+    timedOut: true,
+    error: final.error ?? new Error("docker CLI did not exit after timeout"),
+  };
 }
 
 function classifyCandidates(
@@ -442,6 +480,7 @@ export class DockerExecutor {
       throw new SandboxError("docker run timed out");
     }
     if (result.error) {
+      if (isDockerCliNotFound(result)) this.pendingAgent = false;
       throw new SandboxError(`docker run failed: ${resultDetail(result)}`);
     }
     if (result.status !== 0) {
@@ -452,14 +491,9 @@ export class DockerExecutor {
       throw new SandboxError("docker run returned no id");
     }
     this.containerId = id;
-    if (!(await this.isContainerRunning(this.containerId))) {
-      const rm = await runDocker(["rm", "-f", this.containerId], 30000);
-      if (rm.status === 0 || rm.stderr.includes("No such container")) {
-        this.containerId = null;
-        this.pendingAgent = false;
-      } else {
-        this.containerId = null;
-      }
+    if (!(await this.isContainerRunning(id))) {
+      await this.forceRemove(id, "agent");
+      this.containerId = null;
       throw new SandboxError("agent container not running");
     }
     this.pendingAgent = false;
@@ -488,6 +522,7 @@ export class DockerExecutor {
       throw new SandboxError("docker network create timed out");
     }
     if (result.error) {
+      if (isDockerCliNotFound(result)) this.pendingNetwork = false;
       throw new SandboxError(`docker network create failed: ${resultDetail(result)}`);
     }
     if (result.status !== 0) {
@@ -540,6 +575,7 @@ export class DockerExecutor {
       throw new SandboxError("docker target run timed out");
     }
     if (result.error) {
+      if (isDockerCliNotFound(result)) this.pendingTarget = false;
       throw new SandboxError(`docker target run failed: ${resultDetail(result)}`);
     }
     if (result.status !== 0) {
@@ -550,6 +586,11 @@ export class DockerExecutor {
       throw new SandboxError("target no id");
     }
     this.targetId = id;
+    if (!(await this.isContainerRunning(id))) {
+      await this.forceRemove(id, "target");
+      this.targetId = null;
+      throw new SandboxError("target container not running");
+    }
     this.pendingTarget = false;
   }
 
@@ -643,12 +684,22 @@ export class DockerExecutor {
         "is not running",
         "rpc error",
       ];
-      const combined = `${result.stdout}\n${result.stderr}`;
-      if (result.status !== 0 && CONTROL_MARKERS.some((m) => combined.includes(m))) {
-        throw new SandboxError(`docker exec failed: ${resultDetail(result)}`);
-      }
-      if (result.status !== 0 && result.stderr.includes("No such container")) {
-        throw new SandboxError(`docker exec failed: ${resultDetail(result)}`);
+      if (
+        result.status === 125 &&
+        CONTROL_MARKERS.some((marker) => result.stderr.includes(marker))
+      ) {
+        const running = await this.isContainerRunning(this.containerId);
+        const probe = running
+          ? await runDocker(
+              ["exec", this.containerId, "/bin/true"],
+              this.executionTimeout(10) * 1000,
+            )
+          : null;
+        const healthy =
+          probe != null && !probe.error && !probe.timedOut && probe.status === 0;
+        if (!running || !healthy) {
+          throw new SandboxError(`docker exec failed: ${resultDetail(result)}`);
+        }
       }
       return new ShellResult(
         result.stdout,
@@ -742,12 +793,17 @@ export class DockerExecutor {
     );
   }
 
-  private async forceRemove(id: string): Promise<void> {
+  private async forceRemove(id: string, kind: "agent" | "target"): Promise<void> {
     const result = await runDocker(["rm", "-f", id], 30000);
-    if (result.status !== 0 && !result.stderr.includes("No such container")) {
-      this.pendingAgent = true;
+    const failed =
+      result.timedOut ||
+      result.error != null ||
+      (result.status !== 0 && !result.stderr.includes("No such container"));
+    if (kind === "agent") {
+      this.pendingAgent = failed;
+    } else {
+      this.pendingTarget = failed;
     }
-    void result;
   }
 
   private async removeOwned(): Promise<string[]> {
