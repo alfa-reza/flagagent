@@ -704,13 +704,10 @@ export class AgentLoop {
           ((err as Error).name === "AbortError" ||
             ((err as Error).message?.includes("aborted") ?? false) ||
             ((err as Error).message?.includes("AbortError") ?? false));
-        if (isAbort && this.expired()) {
+        if (isAbort && this.expired() && commit.committedAt >= this.deadline) {
           return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
         }
         const logged = this.error("provider_error", "model");
-        if (this.expired()) {
-          return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
-        }
         return {
           status: logged.status,
           reason: logged.reason,

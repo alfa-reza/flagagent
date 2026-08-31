@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { SandboxError, ShellResult } from "./tools.js";
 import { validateRunId } from "./artifacts.js";
+import { FLAGAGENT_VERSION } from "./version.js";
 
 const SANDBOX_IMAGE = "flagagent-sandbox:dev";
 const TARGET_IMAGE = "flagagent-target:dev";
@@ -470,7 +471,7 @@ export class DockerExecutor {
       "--label",
       "flagagent.role=agent",
       "--label",
-      "flagagent.version=0.1.1",
+      `flagagent.version=${FLAGAGENT_VERSION}`,
       this.opts.image ?? SANDBOX_IMAGE,
       "sleep",
       "infinity",
@@ -514,7 +515,7 @@ export class DockerExecutor {
       "--label",
       "flagagent.role=network",
       "--label",
-      "flagagent.version=0.1.1",
+      `flagagent.version=${FLAGAGENT_VERSION}`,
       this.networkName!,
     ];
     const result = await runDocker(args, this.preparationTimeout(30) * 1000);
@@ -567,7 +568,7 @@ export class DockerExecutor {
       "--label",
       "flagagent.role=target",
       "--label",
-      "flagagent.version=0.1.1",
+      `flagagent.version=${FLAGAGENT_VERSION}`,
       TARGET_IMAGE,
     ];
     const result = await runDocker(args, this.preparationTimeout(60) * 1000);
