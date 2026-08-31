@@ -10,9 +10,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
@@ -37,17 +37,17 @@ jobs:
     needs: typescript
     steps:
       - name: Check out repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: 24
           cache: npm
       - name: Install dependencies
         run: npm ci
       - name: Build sandbox image
-        run: docker build -t flagagent-sandbox:dev -f images/sandbox/Dockerfile .
+        run: docker build -t flagagent-sandbox:dev images/sandbox
       - name: Build target image
-        run: docker build -t flagagent-target:dev -f images/target/Dockerfile .
+        run: docker build -t flagagent-target:dev images/target
       - name: Real Docker integration
         run: npm run test:real-docker

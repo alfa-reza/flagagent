@@ -7,12 +7,13 @@
 - **Source:** `v0.1.1`
 - **Target:** `v0.2.0`
 - **Strategy:** greenfield parallel rewrite
-- **Current milestone:** RC closure — all local gates PASS, remote CI pending
+- **Current milestone:** RC-2 closure — all local gates PASS, remote CI pending
 - **Blockers:** none (local)
 - [x] M0 — Foundation, core, artifacts, providers (ae39b47, bf94602 + b08cfdf carry-forward)
 - [x] M1 — AgentLoop and provider supervision (a4aa81d + closure `94ef11f` corrective)
 - [x] M2 — Source staging, Docker, CLI, integration (partial `64fc4f9` + corrections `78d03f6` etc.)
 - [x] RC — Provider/deadline semantic proof, Docker lifecycle/provenance, staging boundaries, CLI/package real-artifact, real-Docker packed CLI integration (local PASS)
+- [x] RC-2 — Test partition, Actions v7, direct bin proof, local network, provenance parity, sentinel flag isolation (local PASS — see RC-2 gate below)
 
 Complete one milestone, verify it, update this file, then stop.
 
@@ -295,19 +296,22 @@ Use a scripted/fake provider.
 - [x] no containment/security boundary weakened (non-root, cap-drop, no-new-privileges, bounded output)
 - [ ] remote CI verification (requires push — not done in this task)
 
-**M2 status:** corrections applied `78d03f6` (M1 corrective `94ef11f`); RC closure `b852a2c` + current head adds semantic adversarial proof, bounded Docker lifecycle, staging boundaries, real-Docker packed CLI gate. Local: PASS, remote: pending.
+**M2 status:** corrections applied `78d03f6` (M1 corrective `94ef11f`); RC closure `b852a2c` + `1e8f025` adds semantic adversarial proof, bounded Docker lifecycle, staging boundaries, real-Docker packed CLI gate. Local: PASS, remote: pending.
 
-## RC local pre-cutover gate (2026-08-31, this head — local only)
+## RC-2 local pre-cutover gate (2026-09-01, this head — local only)
 - `npm ci` — PASS
 - `npm run typecheck` — PASS
 - `npm run lint` — PASS
 - `npm run format:check` — PASS
 - `npm run build` — PASS
-- `npm test` (ordinary) — 115 passed
-- `npm run test:real-docker` — 1 passed (packed CLI → local HTTP → AgentLoop → Docker → verifier)
-- `npm pack --dry-run` / `npm pack` + clean install + bin smoke — PASS
-- `git diff --check` — PASS
+- `npm test` (ordinary, `vitest.config.ts` excludes `real-docker*`) — 116 passed (14 files)
+- `npm run test:real-docker` (`vitest.real-docker.config.ts`, `fileParallelism:false`) — 3 passed (none/local packed CLI + direct)
+- `npm pack --dry-run` / `npm pack` + clean install + direct `flagagent` bin smoke — PASS
+- CI: `actions/checkout@v7` + `actions/setup-node@v7`, `docker build -t flagagent-*:dev images/*` — local syntax PASS
 - Docker images `flagagent-sandbox:dev` / `flagagent-target:dev` present, non-root execution (uid 1000) — PASS
+- Provenance: `docker_engine`/`rootless`/`flagagent_version` keys + `sandboxLifecycle` `image_id`/`network_name` when applicable
+- Sentinel flag isolation: initial provider request + `run.json` + workspace + Docker argv absent sentinel
+- `git diff --check` — PASS
 - Verdict: **LOCAL PRE-CUTOVER PASS — REMOTE CI NOT YET VERIFIED**
 
 # Final — Deterministic Completion Gate

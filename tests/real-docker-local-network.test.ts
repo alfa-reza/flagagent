@@ -1,18 +1,11 @@
 import { describe, it, expect, beforeAll } from "vitest";
 import { createServer } from "node:http";
-import {
-  mkdtempSync,
-  rmSync,
-  mkdirSync,
-  writeFileSync,
-  readFileSync,
-  existsSync,
-} from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { spawn, execSync } from "node:child_process";
 
-function requireDockerOrFail(): void {
+function requireDockerLocalOrFail(): void {
   try {
     execSync("docker info --format '{{.ServerVersion}}'", { stdio: "ignore" });
   } catch {
@@ -23,14 +16,17 @@ function requireDockerOrFail(): void {
       stdio: "ignore",
     });
   } catch {
-    throw new Error(
-      "Missing image flagagent-sandbox:dev - run: docker build -t flagagent-sandbox:dev -f images/sandbox/Dockerfile .",
-    );
+    throw new Error("Missing image flagagent-sandbox:dev - build it first");
+  }
+  try {
+    execSync("docker image inspect flagagent-target:dev --format '{{.Id}}'", {
+      stdio: "ignore",
+    });
+  } catch {
+    throw new Error("Missing image flagagent-target:dev - build it first");
   }
   if (process.getuid?.() === 0) {
-    throw new Error(
-      "Running as root unsupported - real-Docker gate requires non-root user (uid != 0) with docker group",
-    );
+    throw new Error("Running as root unsupported");
   }
 }
 
@@ -78,49 +74,49 @@ function chatStop(): string {
   });
 }
 
-describe("real-Docker packed CLI integration: installed flagagent → provider → Docker → verifier", () => {
+describe("real-Docker local network: installed flagagent → local target → verifier", () => {
   beforeAll(() => {
-    requireDockerOrFail();
+    requireDockerLocalOrFail();
   });
 
-  it("staged file shell + wrong flag continues + correct solves via installed CLI", async () => {
-    const tmpRoot = mkdtempSync(join(tmpdir(), "flagagent-real-cli-"));
+  it("agent reaches target:9999 via internal network, derives flag, solves", async () => {
+    const tmpRoot = mkdtempSync(join(tmpdir(), "flagagent-real-local-"));
     let server: import("node:http").Server | null = null;
     let packTmp: string | null = null;
+    let runDir: string | null = null;
     try {
       const challengeDir = join(tmpRoot, "challenge");
       mkdirSync(challengeDir, { recursive: true });
-      const filesDir = join(challengeDir, "files");
-      mkdirSync(filesDir);
-      writeFileSync(join(filesDir, "secret.txt"), "hello-staged");
       writeFileSync(
         join(challengeDir, "challenge.json"),
         JSON.stringify({
-          identity: "real-cli-integration",
-          description: "solve it - cat the staged file then submit the flag",
-          expected_flag: "Flag{ok}",
-          network_mode: "none",
+          identity: "real-local-integration",
+          description:
+            "Connect to target:9999, read marker flagagent-target-ok, strip -ok, replace hyphens with underscores, wrap as Flag{...}, submit via submit_flag",
+          expected_flag: "Flag{flagagent_target}",
+          network_mode: "local",
+          target_context:
+            "The audited local target is reachable at target:9999. It returns one deterministic marker per connection.",
         }),
       );
 
       let callIdx = 0;
-      let lastRequestBody = "";
       server = createServer((req, res) => {
         let body = "";
         req.on("data", (c) => (body += c));
         req.on("end", () => {
-          lastRequestBody = body;
           callIdx++;
           let payload: string;
-          if (callIdx === 1)
-            payload = chatToolResponse("c1", "shell", { command: "cat secret.txt" });
-          else if (callIdx === 2)
-            payload = chatToolResponse("c2", "submit_flag", {
-              candidate: "Flag{wrong}",
+          if (callIdx === 1) {
+            payload = chatToolResponse("c1", "shell", {
+              command:
+                "python3 -c \"import socket; s=socket.create_connection(('target',9999),2); print(s.recv(64).decode().strip())\"",
             });
-          else if (callIdx === 3)
-            payload = chatToolResponse("c3", "submit_flag", { candidate: "Flag{ok}" });
-          else payload = chatStop();
+          } else if (callIdx === 2) {
+            payload = chatToolResponse("c2", "submit_flag", {
+              candidate: "Flag{flagagent_target}",
+            });
+          } else payload = chatStop();
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(payload);
         });
@@ -133,7 +129,7 @@ describe("real-Docker packed CLI integration: installed flagagent → provider �
       const packOut = execSync("npm pack", { cwd: process.cwd(), encoding: "utf8" });
       const tgzName = packOut.trim().split("\n").pop()!.trim();
       const tgzPath = join(process.cwd(), tgzName);
-      packTmp = mkdtempSync(join(tmpdir(), "flagagent-pack-install-"));
+      packTmp = mkdtempSync(join(tmpdir(), "flagagent-pack-local-"));
       const projDir = join(packTmp, "proj");
       mkdirSync(projDir);
       writeFileSync(
@@ -142,7 +138,6 @@ describe("real-Docker packed CLI integration: installed flagagent → provider �
       );
       execSync(`npm install ${tgzPath} --silent`, { cwd: projDir, stdio: "ignore" });
       const installedBin = join(projDir, "node_modules", ".bin", "flagagent");
-      expect(existsSync(installedBin)).toBe(true);
 
       const runsRoot = join(tmpRoot, "runs");
       const runResult = await new Promise<{
@@ -166,7 +161,9 @@ describe("real-Docker packed CLI integration: installed flagagent → provider �
             "--runs-root",
             runsRoot,
           ],
-          { env: { ...process.env, OPENAI_API_KEY: "sk-test-dummy" } },
+          {
+            env: { ...process.env, OPENAI_API_KEY: "sk-test-dummy" },
+          },
         );
         let stdout = "";
         let stderr = "";
@@ -182,89 +179,52 @@ describe("real-Docker packed CLI integration: installed flagagent → provider �
             status: null,
             stdout,
             stderr,
-            error: new Error("CLI timeout 90s"),
+            error: new Error("CLI timeout 120s"),
           });
-        }, 90000);
-        child.on("close", (code: number | null) => {
+        }, 120000);
+        child.on("close", (code) => {
           clearTimeout(t);
           resolve({ status: code, stdout, stderr });
         });
-        child.on("error", (e: Error) => {
+        child.on("error", (e) => {
           clearTimeout(t);
           resolve({ status: null, stdout, stderr, error: e });
         });
       });
 
       if (runResult.status !== 0) {
-        console.error("CLI stdout:", runResult.stdout?.slice(0, 2000));
-        console.error("CLI stderr:", runResult.stderr?.slice(0, 2000));
-        console.error("CLI error:", runResult.error);
+        console.error("STDOUT", runResult.stdout.slice(0, 3000));
+        console.error("STDERR", runResult.stderr.slice(0, 3000));
+        console.error("ERROR", runResult.error);
       }
       expect(runResult.status).toBe(0);
       expect(runResult.stdout).toContain("solved:verified_flag");
-      const runDirMatch = runResult.stdout.match(/run=([^\n]+)/);
-      expect(runDirMatch).not.toBeNull();
-      const runDir = runDirMatch![1]!.trim();
-      expect(existsSync(join(runDir, "result.json"))).toBe(true);
-      expect(existsSync(join(runDir, "events.jsonl"))).toBe(true);
-      expect(existsSync(join(runDir, "writeup.md"))).toBe(true);
-
+      const m = runResult.stdout.match(/run=([^\n]+)/);
+      expect(m).not.toBeNull();
+      runDir = m![1]!.trim();
       const resultJson = JSON.parse(readFileSync(join(runDir, "result.json"), "utf8"));
       expect(resultJson["status:reason"]).toBe("solved:verified_flag");
-
-      const eventsRaw = readFileSync(join(runDir, "events.jsonl"), "utf8");
-      const events = eventsRaw
+      const events = readFileSync(join(runDir, "events.jsonl"), "utf8")
         .split("\n")
         .filter(Boolean)
         .map((l) => JSON.parse(l));
-      expect(events.some((e: { type: string }) => e.type === "tool_call")).toBe(true);
-      expect(
-        events.some(
-          (e: { type: string; payload: { name?: string } }) =>
-            e.type === "tool_call" && e.payload.name === "shell",
-        ),
-      ).toBe(true);
-      expect(
-        events.filter((e: { type: string }) => e.type === "verifier_result").length,
-      ).toBe(2);
-      const vrs = events.filter((e: { type: string }) => e.type === "verifier_result");
-      expect((vrs[0] as { payload: { outcome: string } }).payload.outcome).toBe(
-        "incorrect",
-      );
-      expect((vrs[1] as { payload: { outcome: string } }).payload.outcome).toBe(
-        "correct",
-      );
-
       const toolResults = events.filter(
         (e: { type: string }) => e.type === "tool_result",
       );
       expect(
         toolResults.some((e: { payload: { result?: { stdout?: string } } }) =>
-          JSON.stringify(e.payload).includes("hello-staged"),
+          JSON.stringify(e.payload).includes("flagagent-target-ok"),
         ),
       ).toBe(true);
 
-      expect(lastRequestBody).toContain("cat secret.txt");
-      void "Flag{ok}";
-      void "Flag{wrong}";
-
-      const dockerLog =
-        eventsRaw +
-        JSON.stringify(runResult.stdout) +
-        JSON.stringify(runResult.stderr ?? "");
-      void dockerLog;
-
-      const runMeta = JSON.parse(readFileSync(join(runDir, "run.json"), "utf8"));
-      expect(JSON.stringify(runMeta)).not.toContain("Flag{ok}");
-      expect(events.some((e: { type: string }) => e.type === "terminal_decision")).toBe(
-        true,
+      const lifecycle = events.find(
+        (e: { type: string }) => e.type === "sandbox_lifecycle",
       );
-      expect(resultJson["status:reason"]).toBe("solved:verified_flag");
-
-      const workspaceSecret = join(runDir, "workspace", "secret.txt");
-      if (existsSync(workspaceSecret)) {
-        expect(readFileSync(workspaceSecret, "utf8")).toBe("hello-staged");
-      }
+      expect(lifecycle).toBeDefined();
+      const lifePayload = (lifecycle as { payload: Record<string, unknown> }).payload;
+      expect(lifePayload.agent_container_id).toBeDefined();
+      expect(lifePayload.network_id).toBeDefined();
+      expect(lifePayload.target_container_id).toBeDefined();
 
       try {
         execSync(`rm -f ${tgzPath}`);
@@ -276,5 +236,18 @@ describe("real-Docker packed CLI integration: installed flagagent → provider �
       if (packTmp) rmSync(packTmp, { recursive: true, force: true });
       rmSync(tmpRoot, { recursive: true, force: true });
     }
-  }, 120000);
+    if (runDir) {
+      const runId = runDir.split("/").pop()!;
+      const containers = execSync(
+        `docker ps -a --filter "label=flagagent.run_id=${runId}" --format "{{.ID}}"`,
+        { encoding: "utf8" },
+      ).trim();
+      const networks = execSync(
+        `docker network ls --filter "label=flagagent.run_id=${runId}" --format "{{.ID}}"`,
+        { encoding: "utf8" },
+      ).trim();
+      expect(containers).toBe("");
+      expect(networks).toBe("");
+    }
+  }, 150000);
 });

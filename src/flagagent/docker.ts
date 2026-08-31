@@ -522,6 +522,13 @@ export class DockerExecutor {
       this.containerId = null;
       throw new SandboxError("agent container not running");
     }
+    const imageId = await this.resolveImageId(id);
+    if (!imageId) {
+      await this.forceRemove(id, "agent");
+      this.containerId = null;
+      throw new SandboxError("resolved image identity unavailable");
+    }
+    (this as unknown as { resolvedImageId: string }).resolvedImageId = imageId;
     this.pendingAgent = false;
   }
 
@@ -1062,29 +1069,52 @@ export class DockerExecutor {
     return out;
   }
 
+  private dockerEngineInfo(): { version: string | null; rootless: boolean | null } {
+    return { version: null, rootless: null };
+  }
+
   sandboxProvenance(): Record<string, unknown> {
+    const engine = this.dockerEngineInfo();
     return {
       backend: "docker",
       image: this.opts.image ?? SANDBOX_IMAGE,
-      image_id: null,
       network_mode: this.opts.networkMode,
-      network_name: this.networkName ?? null,
       memory: "2g",
       cpus: "2",
       pids_limit: 256,
       container_user: runtimeUser(),
-      rootless: null,
-      engine_version: null,
-      flagagent_version: FLAGAGENT_VERSION,
       security_relaxations: [],
+      docker_engine: engine.version,
+      rootless: engine.rootless,
+      flagagent_version: FLAGAGENT_VERSION,
     };
   }
 
   sandboxLifecycle(): Record<string, unknown> {
     const info: Record<string, unknown> = {};
     if (this.containerId) info.agent_container_id = this.containerId;
-    if (this.networkId) info.network_id = this.networkId;
     if (this.targetId) info.target_container_id = this.targetId;
+    if (this.networkId) info.network_id = this.networkId;
+    if (this.networkName) info.network_name = this.networkName;
+    if ((this as unknown as { resolvedImageId?: string | null }).resolvedImageId) {
+      info.image_id = (this as unknown as { resolvedImageId: string }).resolvedImageId;
+    }
     return info;
+  }
+
+  private async resolveImageId(containerId: string): Promise<string | null> {
+    try {
+      const timeout =
+        this.preparationDeadline != null ? this.preparationTimeout(10) : 10;
+      const result = await runDocker(
+        ["inspect", "--format", "{{.Image}}", containerId],
+        timeout * 1000,
+      );
+      if (result.timedOut || result.error || result.status !== 0) return null;
+      const id = result.stdout.trim();
+      return id || null;
+    } catch {
+      return null;
+    }
   }
 }

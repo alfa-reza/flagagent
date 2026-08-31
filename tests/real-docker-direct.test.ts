@@ -57,17 +57,25 @@ function chatStop(): string {
   });
 }
 
+function requireDockerOrFail(): void {
+  try {
+    execSync("docker info --format '{{.ServerVersion}}'", { stdio: "ignore" });
+  } catch {
+    throw new Error("Docker unavailable - real-Docker gate requires Docker Engine");
+  }
+  try {
+    execSync("docker image inspect flagagent-sandbox:dev --format '{{.Id}}'", {
+      stdio: "ignore",
+    });
+  } catch {
+    throw new Error("Missing image flagagent-sandbox:dev");
+  }
+  if (process.getuid?.() === 0) throw new Error("Running as root unsupported");
+}
+
 describe("provider → AgentLoop → Docker → verifier (direct construction, not CLI)", () => {
   it("staged file shell + incorrect flag continues + correct solves via real Docker", async () => {
-    try {
-      const out = execSync("docker info --format '{{.ServerVersion}}'", {
-        encoding: "utf8",
-      });
-      void out;
-    } catch {
-      console.warn("Docker unavailable - skipping direct-construction smoke");
-      return;
-    }
+    requireDockerOrFail();
 
     const tmp = mkdtempSync(join(tmpdir(), "flagagent-assembled-"));
     let server: import("node:http").Server | null = null;
