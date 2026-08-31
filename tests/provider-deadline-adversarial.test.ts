@@ -10,7 +10,10 @@ import { readEvents } from "../src/flagagent/artifacts.js";
 
 const NOW = new Date("2026-08-14T16:15:30.000Z");
 
-class EarlyCommitLateObserveSuccessModel {
+class SemanticEarlySuccessModel {
+  private built = false;
+  response: ModelResponse | null = null;
+  pendingUsage: Record<string, number> | null = null;
   lastCommittedAt: number | undefined;
   private monotonic: () => number = () => Date.now() / 1000;
   setMonotonic(m: () => number): void {
@@ -20,43 +23,25 @@ class EarlyCommitLateObserveSuccessModel {
     this.lastCommittedAt = this.monotonic();
   }
   async generate(): Promise<ModelResponse> {
-    // Commit before deadline
-    this.capture();
-    const committed = this.lastCommittedAt!;
-    // Independent timing witness: captured < deadline, but we delay settlement past deadline
-    // Delay 80ms after deadline window to ensure parent observes late but within 150ms drain
-    // Wall is 0.2s, so capture at ~0.01, settlement at ~0.28 (80ms after deadline 0.2) -> within 150ms drain
-    await new Promise<void>((r) => setTimeout(r, 280));
-    // Verify capture was before deadline independently (caller checks via monotonic)
-    void committed;
-    return new ModelResponse(
+    const parsed = new ModelResponse(
       "",
       [new ToolCall("c1", "shell", { command: "echo hi" })],
-      {
-        input_tokens: 7,
-        output_tokens: 3,
-      },
+      { input_tokens: 7, output_tokens: 3 },
     );
-  }
-}
-
-class EarlyCommitLateObserveFailureModel {
-  lastCommittedAt: number | undefined;
-  private monotonic: () => number = () => Date.now() / 1000;
-  setMonotonic(m: () => number): void {
-    this.monotonic = m;
-  }
-  private capture(): void {
-    this.lastCommittedAt = this.monotonic();
-  }
-  async generate(): Promise<ModelResponse> {
+    this.response = parsed;
+    this.pendingUsage = { input_tokens: 7, output_tokens: 3 };
+    this.built = true;
     this.capture();
     await new Promise<void>((r) => setTimeout(r, 280));
-    throw new Error("provider boom");
+    return parsed;
+  }
+  isBuilt(): boolean {
+    return this.built;
   }
 }
 
-class LateCommitModel {
+class SemanticEarlyErrorModel {
+  error: Error | null = null;
   lastCommittedAt: number | undefined;
   private monotonic: () => number = () => Date.now() / 1000;
   setMonotonic(m: () => number): void {
@@ -66,18 +51,39 @@ class LateCommitModel {
     this.lastCommittedAt = this.monotonic();
   }
   async generate(): Promise<ModelResponse> {
-    // Sleep past deadline AND past 150ms drain BEFORE capture -> committedAt >= deadline
-    await new Promise<void>((r) => setTimeout(r, 500));
+    const err = new Error("provider boom");
+    (err as unknown as { name: string }).name = "ProviderError";
+    this.error = err;
     this.capture();
-    return new ModelResponse("", [new ToolCall("c1", "shell", { command: "echo hi" })]);
+    await new Promise<void>((r) => setTimeout(r, 280));
+    throw err;
   }
 }
 
-describe("provider/deadline adversarial completion semantics", () => {
-  it("pre-deadline success observed late is preserved (model_response, usage, unprocessed, no shell)", async () => {
+class LateIncompleteModel {
+  lastCommittedAt: number | undefined;
+  private monotonic: () => number = () => Date.now() / 1000;
+  setMonotonic(m: () => number): void {
+    this.monotonic = m;
+  }
+  private capture(): void {
+    this.lastCommittedAt = this.monotonic();
+  }
+  async generate(): Promise<ModelResponse> {
+    await new Promise<void>((r) => setTimeout(r, 500));
+    const parsed = new ModelResponse("", [
+      new ToolCall("c1", "shell", { command: "echo hi" }),
+    ]);
+    this.capture();
+    return parsed;
+  }
+}
+
+describe("provider/deadline semantic completion", () => {
+  it("pre-deadline completed success observed late is preserved with usage and state, no tool after deadline", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "flagagent-adv-"));
     try {
-      const model = new EarlyCommitLateObserveSuccessModel();
+      const model = new SemanticEarlySuccessModel();
       let shellExecuted = false;
       const executor = {
         execute: async () => {
@@ -100,11 +106,13 @@ describe("provider/deadline adversarial completion semantics", () => {
         utcNow: () => NOW,
         runId: "FA-20260814T000000Z-a13f4c2d",
       });
+      const t0 = Number(process.hrtime.bigint()) / 1_000_000_000;
+      const deadline = t0 + 0.2;
       const result = await loop.run();
-      // Must NOT be wall_limit swallowing the preserved response; committed before deadline => wall_limit with unprocessed preservation via committed path?
-      // For success case, pre-deadline tool_calls are preserved as unprocessed, no shell executed
-      // Implementation preserves model_response and unprocessed ids even though status is wall_limit (since tools not executed)
-      // Check that model_response exists and usage preserved, and shell not executed
+      expect(model.isBuilt()).toBe(true);
+      expect(model.response).not.toBeNull();
+      expect(model.lastCommittedAt).toBeDefined();
+      expect(model.lastCommittedAt! < deadline + 0.05).toBe(true);
       expect(result.model_calls).toBe(1);
       expect(shellExecuted).toBe(false);
       const events = readEvents(
@@ -113,27 +121,27 @@ describe("provider/deadline adversarial completion semantics", () => {
       const mrs = events.filter((e) => e.type === "model_response");
       expect(mrs.length).toBe(1);
       const payload = mrs[0]!.payload as Record<string, unknown>;
-      expect(payload.tool_calls).toBeDefined();
-      // usage preserved
       expect((payload.usage as Record<string, unknown>)?.input_tokens).toBe(7);
+      expect(payload.tool_calls).toBeDefined();
+      const state = (loop as unknown as { messages: unknown[] }).messages;
+      expect(
+        state.some((m: unknown) => (m as Record<string, unknown>).role === "assistant"),
+      ).toBe(true);
       const terminal = events.find((e) => e.type === "terminal_decision");
       expect(terminal).toBeDefined();
       const unprocessed = (terminal!.payload as Record<string, unknown>)
         .unprocessed_call_ids as string[];
       expect(unprocessed).toEqual(["c1"]);
-      // No tool_call executed
       expect(events.filter((e) => e.type === "tool_call").length).toBe(0);
-      // Independent timing witness: captured before deadline
-      expect(typeof model.lastCommittedAt).toBe("number");
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
   });
 
-  it("pre-deadline provider error observed late remains provider_error", async () => {
+  it("pre-deadline completed provider error observed late remains provider_error", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "flagagent-adv-"));
     try {
-      const model = new EarlyCommitLateObserveFailureModel();
+      const model = new SemanticEarlyErrorModel();
       const loop = new AgentLoop({
         model: model as never,
         executor: { execute: async () => new ShellResult("ok", "", 0, false) } as never,
@@ -149,7 +157,12 @@ describe("provider/deadline adversarial completion semantics", () => {
         utcNow: () => NOW,
         runId: "FA-20260814T000000Z-a13f4c2d",
       });
+      const t0 = Number(process.hrtime.bigint()) / 1_000_000_000;
+      const deadline = t0 + 0.2;
       const result = await loop.run();
+      expect(model.error).not.toBeNull();
+      expect(model.lastCommittedAt).toBeDefined();
+      expect(model.lastCommittedAt! < deadline + 0.05).toBe(true);
       expect(result["status:reason"]).toBe("error:provider_error");
       expect(result.model_calls).toBe(1);
       const events = readEvents(
@@ -162,10 +175,10 @@ describe("provider/deadline adversarial completion semantics", () => {
     }
   });
 
-  it("late/incomplete completion rejected as pre-deadline evidence, no tool executes", async () => {
+  it("late or incomplete completion not accepted as pre-deadline evidence, no tool executes", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "flagagent-adv-"));
     try {
-      const model = new LateCommitModel();
+      const model = new LateIncompleteModel();
       let shellExecuted = false;
       const executor = {
         execute: async () => {
@@ -195,15 +208,8 @@ describe("provider/deadline adversarial completion semantics", () => {
       const events = readEvents(
         (loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath,
       );
-      // Late commit must NOT create model_response (rejected)
       expect(events.filter((e) => e.type === "model_response").length).toBe(0);
       expect(events.filter((e) => e.type === "tool_call").length).toBe(0);
-      // Timing witness: if committedAt was captured, it must be >= deadline (rejected)
-      // However if the drain timed out before commit settled, lastCommittedAt may still be undefined
-      // The key invariant is no model_response/tool_call regardless
-      if (model.lastCommittedAt !== undefined) {
-        expect(typeof model.lastCommittedAt).toBe("number");
-      }
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }

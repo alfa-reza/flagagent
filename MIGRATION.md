@@ -7,11 +7,12 @@
 - **Source:** `v0.1.1`
 - **Target:** `v0.2.0`
 - **Strategy:** greenfield parallel rewrite
-- **Current milestone:** M2 corrections applied — pending gate sign-off
-- **Blockers:** none
+- **Current milestone:** RC closure — all local gates PASS, remote CI pending
+- **Blockers:** none (local)
 - [x] M0 — Foundation, core, artifacts, providers (ae39b47, bf94602 + b08cfdf carry-forward)
 - [x] M1 — AgentLoop and provider supervision (a4aa81d + closure `94ef11f` corrective)
-- [x] M2 — Source staging, Docker, CLI, integration (partial `64fc4f9` + corrections `78d03f6` etc., pending final verification)
+- [x] M2 — Source staging, Docker, CLI, integration (partial `64fc4f9` + corrections `78d03f6` etc.)
+- [x] RC — Provider/deadline semantic proof, Docker lifecycle/provenance, staging boundaries, CLI/package real-artifact, real-Docker packed CLI integration (local PASS)
 
 Complete one milestone, verify it, update this file, then stop.
 
@@ -282,17 +283,32 @@ CLI/challenge
 
 Use a scripted/fake provider.
 
-## Gate (observed 2026-08-30, M2 corrections `78d03f6`)
-- [x] source/executable-bit regressions pass — `tests/staging.test.ts` 5 green
-- [x] Docker executor/network/lifecycle/recovery — `src/flagagent/docker.ts` async spawn, flowing drain, bounded prefix+suffix, Promise.race timeouts, monotonic deadlines, recovery; no Atomics.wait blocking (corrected)
-- [x] CLI — `src/flagagent/cli.ts` descriptor 64 KiB bound, UTF-8 fatal, object/field validation, network_mode none|local, lstat symlink checks, protocol rejection, --api-key-env identifier check, lstat files symlink, expected_flag stays control-side; bin `flagagent`
-- [x] end-to-end smoke — `tests/e2e.test.ts` source staging → prepare → shell → submit_flag → verifier → artifacts → cleanup green
-- [x] typecheck/build/lint/format pass, `npm pack` green, `git diff --check` clean
-- [x] Python oracle remains runnable (sampled)
-- [x] no containment/security boundary weakened
-- [ ] Docker daemon integration (requires daemon — deferred), dead/unneeded code review
+## Gate (observed 2026-08-31, RC closure — local)
+- [x] typecheck / lint / format:check / build PASS
+- [x] ordinary tests PASS (115 tests: core/providers/loop/deadline/transport/staging/security/boundaries/cli/docker/e2e/adversarial)
+- [x] real-Docker packed CLI integration PASS (local, non-root uid 1000, images flagagent-sandbox:dev/target:dev built)
+- [x] package artifact: npm pack → clean install → bin smoke PASS
+- [x] Docker lifecycle: bounded reap, descendant stdio, execution-budget probe, provenance version labels PASS
+- [x] provider/deadline: semantic completion (built Response + state committed before deadline, late observation) preserved; incomplete/late rejected PASS
+- [x] staging: symlink/special-file/TOCTOU boundaries, exec bits, digest framing, boundaries PASS
+- [x] CLI descriptor/package: allowlist, symlink, protocol, env handling, installed bin PASS
+- [x] no containment/security boundary weakened (non-root, cap-drop, no-new-privileges, bounded output)
+- [ ] remote CI verification (requires push — not done in this task)
 
-**M2 status:** corrections applied `78d03f6` (M1 corrective `94ef11f` is dedicated M1 commit); M2 verification 74 tests green, awaiting optional Docker daemon + final reviewer if required
+**M2 status:** corrections applied `78d03f6` (M1 corrective `94ef11f`); RC closure `b852a2c` + current head adds semantic adversarial proof, bounded Docker lifecycle, staging boundaries, real-Docker packed CLI gate. Local: PASS, remote: pending.
+
+## RC local pre-cutover gate (2026-08-31, this head — local only)
+- `npm ci` — PASS
+- `npm run typecheck` — PASS
+- `npm run lint` — PASS
+- `npm run format:check` — PASS
+- `npm run build` — PASS
+- `npm test` (ordinary) — 115 passed
+- `npm run test:real-docker` — 1 passed (packed CLI → local HTTP → AgentLoop → Docker → verifier)
+- `npm pack --dry-run` / `npm pack` + clean install + bin smoke — PASS
+- `git diff --check` — PASS
+- Docker images `flagagent-sandbox:dev` / `flagagent-target:dev` present, non-root execution (uid 1000) — PASS
+- Verdict: **LOCAL PRE-CUTOVER PASS — REMOTE CI NOT YET VERIFIED**
 
 # Final — Deterministic Completion Gate
 Do not remove Python before this gate.

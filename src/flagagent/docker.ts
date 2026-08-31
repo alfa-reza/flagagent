@@ -84,14 +84,6 @@ class BoundedOutput {
   }
 }
 
-/**
- * Run one Docker CLI operation without blocking the event loop.
- *
- * stdout and stderr are always put into flowing mode and retain only a
- * bounded prefix plus a rolling suffix.  A timeout kills the CLI client and
- * waits briefly for its close event so any already-delivered output is still
- * included in the returned view.
- */
 async function runDocker(args: string[], timeoutMs = 30000): Promise<DockerResult> {
   const child = spawn("docker", args, {
     stdio: ["ignore", "pipe", "pipe"],
@@ -196,6 +188,16 @@ async function runDocker(args: string[], timeoutMs = 30000): Promise<DockerResul
   }
 
   try {
+    child.stdout?.destroy();
+  } catch {
+    // ignore
+  }
+  try {
+    child.stderr?.destroy();
+  } catch {
+    // ignore
+  }
+  try {
     if (child.pid != null) {
       try {
         process.kill(-child.pid, "SIGKILL");
@@ -210,14 +212,35 @@ async function runDocker(args: string[], timeoutMs = 30000): Promise<DockerResul
       child.kill("SIGKILL");
     }
   } catch {
-    // The close/error handlers still own the completion path.
+    // ignore
   }
-  const final = await completion;
+  const boundedFinal = await Promise.race([
+    completion,
+    new Promise<DockerResult>((resolve) =>
+      setTimeout(() => resolve(snapshot(null, true)), EXEC_REAP_TIMEOUT_MS),
+    ),
+  ]);
+  if (boundedFinal.timedOut && !completed) {
+    try {
+      child.stdout?.destroy();
+    } catch {
+      // ignore
+    }
+    try {
+      child.stderr?.destroy();
+    } catch {
+      // ignore
+    }
+    return {
+      ...snapshot(null, true),
+      error: new Error("docker CLI did not exit after timeout"),
+    };
+  }
   return {
-    ...final,
+    ...boundedFinal,
     status: null,
     timedOut: true,
-    error: final.error ?? new Error("docker CLI did not exit after timeout"),
+    error: boundedFinal.error ?? new Error("docker CLI did not exit after timeout"),
   };
 }
 
@@ -384,6 +407,9 @@ export class DockerExecutor {
     if (process.getuid?.() === 0) throw new SandboxError("running as root unsupported");
 
     this.containerName = `flagagent-agent-${runId}`;
+    if (this.opts.networkMode === "local") {
+      this.networkName = `flagagent-net-${runId}`;
+    }
     if (this.preparationRemaining != null) {
       const remaining = this.preparationRemaining;
       this.preparationRemaining = null;
@@ -419,7 +445,6 @@ export class DockerExecutor {
   }
 
   private async prepareLocal(workspace: string, runId: string): Promise<void> {
-    this.networkName = `flagagent-net-${runId}`;
     this.targetName = `flagagent-target-${runId}`;
     try {
       await this.createNetwork(runId);
@@ -689,13 +714,23 @@ export class DockerExecutor {
         result.status === 125 &&
         CONTROL_MARKERS.some((marker) => result.stderr.includes(marker))
       ) {
-        const running = await this.isContainerRunning(this.containerId);
-        const probe = running
-          ? await runDocker(
+        let running: boolean;
+        try {
+          running = await this.isContainerRunning(this.containerId);
+        } catch {
+          throw new SandboxError(`docker exec failed: ${resultDetail(result)}`);
+        }
+        let probe: DockerResult | null = null;
+        if (running) {
+          try {
+            probe = await runDocker(
               ["exec", this.containerId, "/bin/true"],
               this.executionTimeout(10) * 1000,
-            )
-          : null;
+            );
+          } catch {
+            throw new SandboxError(`docker exec failed: ${resultDetail(result)}`);
+          }
+        }
         const healthy =
           probe != null && !probe.error && !probe.timedOut && probe.status === 0;
         if (!running || !healthy) {
@@ -778,7 +813,8 @@ export class DockerExecutor {
   private async isContainerRunning(id: string): Promise<boolean> {
     let timeout: number;
     try {
-      timeout = this.preparationTimeout(10);
+      if (this.executionDeadline != null) timeout = this.executionTimeout(10);
+      else timeout = this.preparationTimeout(10);
     } catch {
       return false;
     }
@@ -1030,11 +1066,16 @@ export class DockerExecutor {
     return {
       backend: "docker",
       image: this.opts.image ?? SANDBOX_IMAGE,
+      image_id: null,
       network_mode: this.opts.networkMode,
+      network_name: this.networkName ?? null,
       memory: "2g",
       cpus: "2",
       pids_limit: 256,
       container_user: runtimeUser(),
+      rootless: null,
+      engine_version: null,
+      flagagent_version: FLAGAGENT_VERSION,
       security_relaxations: [],
     };
   }

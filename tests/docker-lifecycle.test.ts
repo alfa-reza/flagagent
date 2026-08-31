@@ -1,6 +1,6 @@
 /* eslint-disable @typescript-eslint/no-explicit-any, no-empty, no-useless-escape */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { DockerExecutor } from "../src/flagagent/docker.js";
@@ -311,6 +311,8 @@ esac`;
   });
 
   it("provenance fields include version, docker info not mocked (smoke)", async () => {
+    const logFile = join(tmp, "docker-provenance.log");
+    process.env.FAKE_DOCKER_LOG = logFile;
     makeFakeDocker(fakeBin, "success");
     process.env.PATH = `${fakeBin}:${origPath}`;
     const ex = new DockerExecutor();
@@ -318,9 +320,14 @@ esac`;
     await ex.prepare(ws, "FA-20260814T000000Z-aaaa");
     const prov = ex.sandboxProvenance();
     expect(prov.backend).toBe("docker");
-    // flagagent.version label is 0.2.0 via FLAGAGENT_VERSION
-    void join(tmpdir(), "fake-docker.log");
-    // cleanup will have used version label; we check via prov not log
+    expect(prov.flagagent_version).toBe("0.2.0");
+    expect(prov.image).toBeDefined();
+    expect(prov.network_mode).toBe("none");
+    const log = readFileSync(logFile, "utf8");
+    expect(log).toContain("flagagent.version=0.2.0");
+    expect(log).toContain("flagagent.managed=true");
+    expect(log).toContain("flagagent.run_id=FA-20260814T000000Z-aaaa");
+    delete process.env.FAKE_DOCKER_LOG;
     await ex.cleanup("FA-20260814T000000Z-aaaa");
   });
 });

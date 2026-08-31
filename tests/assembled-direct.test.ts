@@ -1,13 +1,7 @@
 import { describe, it, expect } from "vitest";
 import { createServer } from "node:http";
-import {
-  mkdtempSync,
-  rmSync,
-  mkdirSync,
-  writeFileSync,
-  existsSync,
-  execSync as execSyncImport,
-} from "node:fs";
+import { mkdtempSync, rmSync, mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { execSync } from "node:child_process";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { AgentLoop } from "../src/flagagent/loop.js";
@@ -63,15 +57,15 @@ function chatStop(): string {
   });
 }
 
-describe("assembled production-boundary smoke: real CLI->AgentLoop->Docker->verifier", () => {
+describe("provider → AgentLoop → Docker → verifier (direct construction, not CLI)", () => {
   it("staged file shell + incorrect flag continues + correct solves via real Docker", async () => {
     try {
-      const out = execSyncImport("docker info --format '{{.ServerVersion}}'", {
+      const out = execSync("docker info --format '{{.ServerVersion}}'", {
         encoding: "utf8",
       });
       void out;
     } catch {
-      console.warn("Docker unavailable - skipping assembled smoke");
+      console.warn("Docker unavailable - skipping direct-construction smoke");
       return;
     }
 
