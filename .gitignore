@@ -12,10 +12,3 @@ runs/
 
 # Development-agent workspace
 .superpowers/
-
-# Python cache
-__pycache__/
-*.py[cod]
-.pytest_cache/
-.ruff_cache/
-.venv/
