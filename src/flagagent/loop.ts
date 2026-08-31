@@ -278,14 +278,23 @@ export class AgentLoop {
         // ignore
       }
     }
-    this.artifacts = RunArtifacts.create(
-      this.runsRoot,
-      metadata as Record<string, unknown>,
-      {
-        runId: selectedId,
-        now: () => this.utcNow(),
-      },
-    );
+    try {
+      this.artifacts = RunArtifacts.create(
+        this.runsRoot,
+        metadata as Record<string, unknown>,
+        {
+          runId: selectedId,
+          now: () => this.utcNow(),
+        },
+      );
+    } catch (e) {
+      try {
+        preSnapshot?.cleanup();
+      } catch {
+        // ignore
+      }
+      throw e;
+    }
 
     // Build messages
     let userContent = this.challenge.description;

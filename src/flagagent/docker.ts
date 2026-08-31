@@ -175,6 +175,10 @@ async function runDocker(args: string[], timeoutMs = 30000): Promise<DockerResul
       timedOut: true,
     };
   }
+  if (completed) {
+    const final = snapshot(null, true);
+    return { ...final, timedOut: true };
+  }
   return first;
 }
 
@@ -396,6 +400,7 @@ export class DockerExecutor {
   }
 
   private async createAgent(workspace: string, runId: string): Promise<void> {
+    this.pendingAgent = true;
     const args = [
       "run",
       "-d",
@@ -434,13 +439,9 @@ export class DockerExecutor {
     ];
     const result = await runDocker(args, this.preparationTimeout(60) * 1000);
     if (result.timedOut) {
-      this.pendingAgent = true;
       throw new SandboxError("docker run timed out");
     }
     if (result.error) {
-      if (!result.stdout.trim() && result.stderr.trim() === "") {
-        this.pendingAgent = true;
-      }
       throw new SandboxError(`docker run failed: ${resultDetail(result)}`);
     }
     if (result.status !== 0) {
@@ -448,19 +449,24 @@ export class DockerExecutor {
     }
     const id = result.stdout.trim();
     if (!id) {
-      this.pendingAgent = true;
       throw new SandboxError("docker run returned no id");
     }
     this.containerId = id;
-    this.pendingAgent = false;
     if (!(await this.isContainerRunning(this.containerId))) {
-      await this.forceRemove(this.containerId);
-      this.containerId = null;
+      const rm = await runDocker(["rm", "-f", this.containerId], 30000);
+      if (rm.status === 0 || rm.stderr.includes("No such container")) {
+        this.containerId = null;
+        this.pendingAgent = false;
+      } else {
+        this.containerId = null;
+      }
       throw new SandboxError("agent container not running");
     }
+    this.pendingAgent = false;
   }
 
   private async createNetwork(runId: string): Promise<void> {
+    this.pendingNetwork = true;
     const args = [
       "network",
       "create",
@@ -479,13 +485,9 @@ export class DockerExecutor {
     ];
     const result = await runDocker(args, this.preparationTimeout(30) * 1000);
     if (result.timedOut) {
-      this.pendingNetwork = true;
       throw new SandboxError("docker network create timed out");
     }
     if (result.error) {
-      if (!result.stdout.trim() && result.stderr.trim() === "") {
-        this.pendingNetwork = true;
-      }
       throw new SandboxError(`docker network create failed: ${resultDetail(result)}`);
     }
     if (result.status !== 0) {
@@ -493,7 +495,6 @@ export class DockerExecutor {
     }
     const id = result.stdout.trim();
     if (!id) {
-      this.pendingNetwork = true;
       throw new SandboxError("docker network no id");
     }
     this.networkId = id;
@@ -501,6 +502,7 @@ export class DockerExecutor {
   }
 
   private async createTarget(runId: string): Promise<void> {
+    this.pendingTarget = true;
     const args = [
       "run",
       "-d",
@@ -535,13 +537,9 @@ export class DockerExecutor {
     ];
     const result = await runDocker(args, this.preparationTimeout(60) * 1000);
     if (result.timedOut) {
-      this.pendingTarget = true;
       throw new SandboxError("docker target run timed out");
     }
     if (result.error) {
-      if (!result.stdout.trim() && result.stderr.trim() === "") {
-        this.pendingTarget = true;
-      }
       throw new SandboxError(`docker target run failed: ${resultDetail(result)}`);
     }
     if (result.status !== 0) {
@@ -549,7 +547,6 @@ export class DockerExecutor {
     }
     const id = result.stdout.trim();
     if (!id) {
-      this.pendingTarget = true;
       throw new SandboxError("target no id");
     }
     this.targetId = id;
@@ -637,45 +634,18 @@ export class DockerExecutor {
         );
       }
       if (result.error) {
-        const msg = resultDetail(result);
-        const isControlError =
-          msg.includes("No such container") ||
-          msg.includes("is not running") ||
-          msg.includes("Error response from daemon") ||
-          msg.includes("Cannot connect to the Docker daemon") ||
-          msg.includes("rpc error");
-        if (isControlError) {
-          const probe = await runDocker(
-            ["inspect", "--format", "{{.State.Running}}", this.containerId],
-            this.executionTimeout(5) * 1000,
-          );
-          const stillRunning =
-            !probe.error &&
-            !probe.timedOut &&
-            probe.status === 0 &&
-            probe.stdout.trim() === "true";
-          const healthProbe = stillRunning
-            ? await runDocker(
-                ["exec", this.containerId, "/bin/true"],
-                this.executionTimeout(5) * 1000,
-              )
-            : null;
-          const healthy =
-            healthProbe != null &&
-            !healthProbe.error &&
-            !healthProbe.timedOut &&
-            healthProbe.status === 0;
-          if (!stillRunning || !healthy) {
-            throw new SandboxError(`docker exec failed: ${msg}`);
-          }
-        }
-        return new ShellResult(
-          result.stdout,
-          result.stderr,
-          result.status ?? 1,
-          false,
-          result.truncated,
-        );
+        throw new SandboxError(`docker exec failed: ${resultDetail(result)}`);
+      }
+      const CONTROL_MARKERS = [
+        "Error response from daemon",
+        "Cannot connect to the Docker daemon",
+        "No such container",
+        "is not running",
+        "rpc error",
+      ];
+      const combined = `${result.stdout}\n${result.stderr}`;
+      if (result.status !== 0 && CONTROL_MARKERS.some((m) => combined.includes(m))) {
+        throw new SandboxError(`docker exec failed: ${resultDetail(result)}`);
       }
       if (result.status !== 0 && result.stderr.includes("No such container")) {
         throw new SandboxError(`docker exec failed: ${resultDetail(result)}`);
@@ -774,8 +744,9 @@ export class DockerExecutor {
 
   private async forceRemove(id: string): Promise<void> {
     const result = await runDocker(["rm", "-f", id], 30000);
-    // Removal is best effort during preparation.  The caller owns the
-    // original preparation error and final cleanup retries known resources.
+    if (result.status !== 0 && !result.stderr.includes("No such container")) {
+      this.pendingAgent = true;
+    }
     void result;
   }
 

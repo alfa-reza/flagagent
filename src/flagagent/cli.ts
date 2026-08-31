@@ -247,14 +247,13 @@ export async function runCli(argv: string[]): Promise<void> {
 }
 
 {
-  const doRun = async (): Promise<void> => {
-    try {
-      const { realpathSync, existsSync } = await import("node:fs");
-      const { fileURLToPath } = await import("node:url");
-      const selfPath = fileURLToPath(import.meta.url);
-      const entry = process.argv[1];
-      if (!entry) return;
-      let shouldRun = false;
+  let shouldRun = false;
+  try {
+    const { realpathSync, existsSync } = await import("node:fs");
+    const { fileURLToPath } = await import("node:url");
+    const selfPath = fileURLToPath(import.meta.url);
+    const entry = process.argv[1];
+    if (entry) {
       if (existsSync(entry)) {
         try {
           shouldRun = realpathSync(entry) === realpathSync(selfPath);
@@ -264,10 +263,15 @@ export async function runCli(argv: string[]): Promise<void> {
       } else {
         shouldRun = selfPath.endsWith(entry.slice(-32));
       }
-      if (shouldRun) await runCli(process.argv.slice(2));
-    } catch {
-      // ignore
     }
-  };
-  await doRun();
+  } catch {
+    shouldRun = false;
+  }
+  if (shouldRun) {
+    await runCli(process.argv.slice(2)).catch((err: unknown) => {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error(msg);
+      process.exit(2);
+    });
+  }
 }
