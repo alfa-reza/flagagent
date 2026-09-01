@@ -279,10 +279,13 @@ export class AgentLoop {
       .sandboxProvenanceAsync as
       (() => Record<string, unknown> | Promise<Record<string, unknown>>) | undefined;
     let syncProvenance: Record<string, unknown> | null = null;
+    let maybeAsync: Promise<Record<string, unknown>> | null = null;
     if (typeof trySync === "function") {
       try {
-        const maybe = trySync.call(this.executor);
-        if (maybe != null && typeof (maybe as Promise<unknown>).then !== "function") {
+        const maybe = trySync.call(this.executor) as unknown;
+        if (maybe != null && typeof (maybe as Promise<unknown>).then === "function") {
+          maybeAsync = maybe as Promise<Record<string, unknown>>;
+        } else if (maybe != null) {
           syncProvenance = maybe as Record<string, unknown>;
         }
       } catch {
@@ -304,15 +307,8 @@ export class AgentLoop {
       } catch {
         // ignore
       }
-    } else if (typeof trySync === "function") {
-      try {
-        const p = trySync.call(this.executor) as unknown;
-        if (p != null && typeof (p as Promise<unknown>).then === "function") {
-          asyncProvenancePromise = p as Promise<Record<string, unknown>>;
-        }
-      } catch {
-        // ignore
-      }
+    } else if (maybeAsync) {
+      asyncProvenancePromise = maybeAsync;
     }
     let bestEffortSandbox: Record<string, unknown> | null = null;
     if (asyncProvenancePromise) {
