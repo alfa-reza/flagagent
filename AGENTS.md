@@ -1,126 +1,51 @@
 # FlagAgent Repository Instructions
 
-FlagAgent is a small, model-independent agent harness for authorized CTFs, security labs, benchmarks, and sandboxed experiments.
+FlagAgent is a small, model-independent LLM agent harness for authorized CTFs, security labs, benchmarks, and sandboxed experiments.
 
-This file contains durable repository-level guidance for coding agents. Keep changes consistent with the current code, tests, and public documentation.
+## Engineering Principles
 
-## Development Principles
-
-Prefer simple, explicit, maintainable solutions.
+Prefer the smallest correct design.
 
 - **KISS:** choose the simplest implementation that satisfies the concrete requirement.
 - **YAGNI:** do not add features, abstractions, dependencies, configuration, or extensibility for hypothetical future needs.
-- **DRY:** avoid meaningful duplication, but do not introduce abstraction solely to eliminate small or incidental repetition.
-- Prefer deterministic verification over assumptions or LLM judgement.
+- **DRY with restraint:** remove meaningful duplication, but do not abstract small incidental repetition.
+- Prefer explicit control flow, clear ownership, and deterministic verification.
 - Read relevant code and tests before changing behavior.
-- Avoid unrelated refactors while implementing a focused change.
-- Preserve existing behavior unless the task intentionally changes it.
+- Avoid unrelated refactors while implementing focused work.
 
-Abstract proven variation, not anticipated variation.
+## Architecture
 
-## Repository Structure
+- **Runtime:** Node.js 24 LTS, TypeScript `strict`, ESM, npm.
+- **Providers:** official `openai` and `@anthropic-ai/sdk` (Chat Completions, Responses, Anthropic Messages).
+- **Sandbox:** Docker CLI, run-scoped Agent container (plus optional internal network/target for `local` mode).
+- **Core modules:** `src/flagagent/loop.ts` (orchestration, deadlines), `src/flagagent/docker.ts` (sandbox lifecycle), `src/flagagent/staging.ts` (source snapshot/staging), `src/flagagent/providers/*` (adapters), `src/flagagent/artifacts.ts` / `writeup.ts` (persistence), `src/flagagent/cli.ts` (challenge loading + CLI).
 
-- `src/flagagent/` — FlagAgent implementation.
-- `tests/` — deterministic and Docker-backed tests.
-- `challenges/` — project-owned challenge fixtures.
-- `images/` — project-owned Docker images.
-
-Use `README.md` as the source for user-facing behavior, supported features, setup, security limitations, and usage.
-
-## Development and Verification
-
-FlagAgent requires Python 3.12 or newer and uses `uv`.
-
-Common checks:
+## Verification
 
 ```bash
-uv sync
-uv lock --check
-uv run pytest
-uv run pytest -m docker
-uv run ruff check .
-uv run ruff format --check .
-uv build
+npm ci
+npm run typecheck
+npm test
+npm run build
+npm run lint
+npm run format:check
+npm pack --dry-run
 git diff --check
 ```
 
-Run the smallest relevant checks first, followed by broader applicable checks.
+Docker-backed integration requires a reachable Docker Engine.
 
-Docker-backed tests require Docker Engine.
+## Security & Invariants
 
-Never claim that a test, command, security property, or Docker behavior passed unless it was actually observed.
+- Only `shell` and `submit_flag` are exposed; unknown/malformed tool calls never execute.
+- Only the verifier establishes `solved`; provider credentials and expected flag stay control-side.
+- One absolute Run wall deadline is authoritative; no tool executes after it wins.
+- Source staging uses procfd-anchored `O_NOFOLLOW` techniques; do not replace with naive path-based copy.
+- Docker containers run non-root, `--cap-drop ALL`, `no-new-privileges`, bounded resources, no host network/socket unless explicitly required by `local` mode's internal network.
 
-When behavior changes, add or update deterministic tests when that behavior can reasonably be tested.
+## Dependencies & Git
 
-Preserve documented runtime semantics: non-zero shell exits and incorrect flag submissions are execution evidence, not automatically harness errors.
-
-## Dependencies
-
-Add dependencies only for a concrete requirement.
-
-Prefer the Python standard library or existing dependencies when they adequately solve the task. Do not add dependencies speculatively.
-
-When changing dependencies:
-
-1. update `pyproject.toml`;
-2. update `uv.lock` using `uv`;
-3. run the relevant checks.
-
-Do not edit `uv.lock` manually.
-
-## Security Invariants
-
-FlagAgent is intended only for legal and authorized CTFs, security labs, benchmarks, and sandboxed experiments.
-
-Preserve the repository's containment and trust boundaries:
-
-- model-generated challenge commands must not intentionally execute directly on the host;
-- provider and verifier secrets must remain outside Agent and Target containers;
-- unknown model-requested tools must never execute;
-- only the authoritative verifier may establish a solved result;
-- security relaxations must be explicit rather than silent;
-- do not silently broaden container networking or host access;
-- do not automatically execute untrusted challenge provisioning with host privileges.
-
-Docker is a containment baseline, not a perfect isolation boundary.
-
-Do not weaken security controls merely to make a test or challenge work.
-
-## Code and Documentation
-
-Follow existing code style and local patterns before introducing new ones.
-
-Keep implementation, tests, and public documentation consistent. Update the relevant documentation when user-facing behavior changes.
-
-Do not introduce speculative frameworks, generic plugin systems, architectural layers, or generalized abstractions unless a concrete requirement justifies them.
-
-## Third-Party Code
-
-Treat external repositories as references unless source reuse is explicitly justified.
-
-Before copying or adapting third-party source, verify its provenance, license, compatibility, and attribution requirements.
-
-Do not copy code from sources whose licensing is incompatible with FlagAgent.
-
-## Git Safety
-
-Keep changes focused and reviewable.
-
-Use Conventional Commits when creating commits.
-
-Do not modify Git identity, remotes, repository settings, repository visibility, or branch protection unless explicitly requested.
-
-Do not run destructive operations such as `git reset --hard`, `git clean -fd`, force-pushes, or history rewrites without explicit authorization.
-
-## Definition of Done
-
-A change is complete when:
-
-- the requested behavior is implemented;
-- relevant deterministic checks pass;
-- security boundaries remain intact;
-- dependency state is consistent;
-- documentation is updated when required; and
-- the final diff contains no unrelated changes.
-
-When uncertain, prefer evidence and the smallest reversible change.
+- Add dependencies only for demonstrated need; prefer Node built-ins and official SDK capabilities.
+- Do not add agent/DI/Docker-SDK/state-machine/plugin frameworks without explicit justification.
+- Keep `package-lock.json` committed; use Conventional Commits; do not rewrite history or force-push.
+- Do not touch `.github/workflows/opencode.yml`.

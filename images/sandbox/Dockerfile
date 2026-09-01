@@ -10,7 +10,7 @@
 FROM ubuntu:24.04@sha256:33ceb71981b602c1a7443a53469e4dba065f7503eab3078a2d7a57a2ab987517
 
 LABEL flagagent.managed=true \
-      flagagent.version=0.1.1
+      flagagent.version=0.2.0
 
 # ubuntu:24.04 ships a ``ubuntu`` user at UID/GID 1000; rename it to ``agent``
 # as the image's named non-root default.  DockerExecutor overrides this user

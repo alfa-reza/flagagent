@@ -1,0 +1,43 @@
+{
+  "name": "flagagent",
+  "version": "0.2.0",
+  "type": "module",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:real-docker": "vitest run --config vitest.real-docker.config.ts",
+    "lint": "eslint .",
+    "format": "prettier --write \"package.json\" \"tsconfig.json\" \"vitest.config.ts\" \"eslint.config.js\" \"src/**/*.ts\" \"tests/**/*.ts\" \".github/workflows/ci.yml\"",
+    "format:check": "prettier --check \"package.json\" \"tsconfig.json\" \"vitest.config.ts\" \"eslint.config.js\" \"src/**/*.ts\" \"tests/**/*.ts\" \".github/workflows/ci.yml\""
+  },
+  "bin": {
+    "flagagent": "./dist/flagagent/cli.js"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/flagagent/index.d.ts",
+      "import": "./dist/flagagent/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "dependencies": {
+    "openai": "^5.19.1",
+    "@anthropic-ai/sdk": "^0.67.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^9.39.5",
+    "@types/node": "^24.9.2",
+    "eslint": "^9.39.5",
+    "prettier": "^3.6.2",
+    "typescript": "~6.0.3",
+    "typescript-eslint": "^8.46.2",
+    "vitest": "^4.1.4"
+  }
+}

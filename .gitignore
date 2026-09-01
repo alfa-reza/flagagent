@@ -1,20 +1,6 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-
-# Virtual environment
-.venv/
-
-# Test / lint / coverage
-.pytest_cache/
-.ruff_cache/
-.coverage
-htmlcov/
-
 # Build artifacts
-build/
 dist/
+node_modules/
 
 # Runtime artifacts
 runs/
@@ -26,3 +12,10 @@ runs/
 
 # Development-agent workspace
 .superpowers/
+
+# Python cache
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/

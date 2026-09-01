@@ -4,7 +4,7 @@
 
 **A small, inspectable LLM agent harness for CTFs, security labs, and reproducible security experiments.**
 
-[![Python](https://img.shields.io/badge/Python-3.12%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![Node](https://img.shields.io/badge/Node-24%20LTS-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
 [![License](https://img.shields.io/badge/License-AGPL_v3-green.svg)](LICENSE)
 
 </div>
@@ -44,8 +44,8 @@ Only a verifier-accepted submission marks the run as solved.
 ### Requirements
 
 - Linux
-- Python 3.12+
-- [uv](https://docs.astral.sh/uv/)
+- Node.js 24 LTS
+- npm
 - Docker Engine and the Docker CLI
 
 Clone the repository and install the project:
@@ -53,13 +53,19 @@ Clone the repository and install the project:
 ```bash
 git clone https://github.com/alfa-reza/flagagent.git
 cd flagagent
-uv sync
+npm ci
 ```
 
 Build the agent sandbox:
 
 ```bash
 docker build -t flagagent-sandbox:dev images/sandbox
+```
+
+Build FlagAgent:
+
+```bash
+npm run build
 ```
 
 Set an API key. For example:
@@ -71,7 +77,16 @@ export OPENAI_API_KEY="your-key"
 Run the included file challenge:
 
 ```bash
-uv run flagagent run \
+node dist/flagagent/cli.js run \
+  --challenge challenges/layered-file \
+  --protocol openai-chat \
+  --model your-model
+```
+
+Or via the installed bin after `npm pack` / `npm install`:
+
+```bash
+flagagent run \
   --challenge challenges/layered-file \
   --protocol openai-chat \
   --model your-model
@@ -97,7 +112,7 @@ FlagAgent currently exposes three protocol paths:
 ```bash
 export OPENROUTER_API_KEY="your-key"
 
-uv run flagagent run \
+node dist/flagagent/cli.js run \
   --challenge challenges/layered-file \
   --protocol openai-chat \
   --model provider/model \
@@ -134,7 +149,7 @@ A minimal descriptor looks like this:
 Then run it like any other challenge:
 
 ```bash
-uv run flagagent run \
+node dist/flagagent/cli.js run \
   --challenge path/to/my-challenge \
   --protocol openai-chat \
   --model your-model
@@ -180,7 +195,7 @@ docker build -t flagagent-target:dev images/target
 Then run:
 
 ```bash
-uv run flagagent run \
+node dist/flagagent/cli.js run \
   --challenge challenges/local-marker \
   --protocol openai-chat \
   --model your-model
@@ -236,17 +251,17 @@ Digests are multi-architecture image-index digests verified against `docker.io/l
 ## Development
 
 ```bash
-uv sync
-uv lock --check
-uv run pytest
-uv run pytest -m docker
-uv run ruff check .
-uv run ruff format --check .
-uv build
+npm ci
+npm run typecheck
+npm test
+npm run build
+npm run lint
+npm run format:check
+npm pack --dry-run
 git diff --check
 ```
 
-Docker-backed tests require Docker Engine.
+Docker-backed behavior requires Docker Engine.
 
 ## License
 
