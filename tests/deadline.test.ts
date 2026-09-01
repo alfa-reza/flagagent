@@ -398,4 +398,205 @@ describe("deadline invariants", () => {
       rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  it("deadline timers use ceil semantics (no truncation below absolute deadline)", async () => {
+    const captured: number[] = [];
+    const orig = globalThis.setTimeout as unknown as (
+      fn: () => void,
+      ms: number,
+    ) => ReturnType<typeof setTimeout>;
+    (globalThis as unknown as { setTimeout: unknown }).setTimeout = (
+      fn: () => void,
+      ms: number,
+    ) => orig(fn, ms) as unknown as ReturnType<typeof setTimeout>;
+    const spy = (fn: () => void, ms: number) => {
+      captured.push(ms);
+      return orig(fn, ms);
+    };
+    const savedSetTimeout = globalThis.setTimeout;
+    (globalThis as unknown as { setTimeout: unknown }).setTimeout =
+      spy as unknown as typeof setTimeout;
+    const tmp = mkdtempSync(join(tmpdir(), "flagagent-"));
+    try {
+      const now = 0;
+      const monotonic = () => now;
+      const model = new ControlledModel();
+      const loop = new AgentLoop({
+        model: model as never,
+        executor: { execute: async () => new ShellResult("ok", "", 0, false) },
+        verifier: new ExactStringVerifier("Flag{ok}"),
+        challenge: { identity: "fixture", description: "test" },
+        limits: new Limits({
+          maxModelTurns: 2,
+          wallTimeoutSeconds: 0.6,
+          commandTimeoutSeconds: 10,
+        }),
+        runsRoot: tmp,
+        monotonic,
+        utcNow: () => NOW,
+        runId: "FA-20260814T000000Z-a13f4c2d",
+      });
+      const p = loop.run();
+      await new Promise((r) => setTimeout(r, 10));
+      model.resolveNext(new ModelResponse("done"));
+      await p;
+      expect(captured.some((v) => v === 600)).toBe(true);
+      expect(captured.some((v) => v === 599)).toBe(false);
+      const remainingMs = captured.filter((v) => v > 0 && v <= 600);
+      expect(remainingMs.length).toBeGreaterThan(0);
+    } finally {
+      (globalThis as unknown as { setTimeout: unknown }).setTimeout = savedSetTimeout;
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("genuine independent provider failure before deadline remains provider_error", async () => {
+    const { ProviderError } = await import("../src/flagagent/providers/chat.js");
+    const tmp = mkdtempSync(join(tmpdir(), "flagagent-"));
+    try {
+      const failing = {
+        lastCommittedAt: 0.1,
+        setRemaining() {},
+        setMonotonic() {},
+        async generate(): Promise<ModelResponse> {
+          (this as unknown as { lastCommittedAt: number }).lastCommittedAt = 0.1;
+          throw new ProviderError("upstream 500");
+        },
+      };
+      const now = 0;
+      const monotonic = () => now;
+      const loop = new AgentLoop({
+        model: failing as never,
+        executor: { execute: async () => new ShellResult("ok", "", 0, false) },
+        verifier: new ExactStringVerifier("Flag{ok}"),
+        challenge: { identity: "fixture", description: "test" },
+        limits: new Limits({
+          maxModelTurns: 2,
+          wallTimeoutSeconds: 5,
+          commandTimeoutSeconds: 10,
+        }),
+        runsRoot: tmp,
+        monotonic,
+        utcNow: () => NOW,
+        runId: "FA-20260814T000000Z-a13f4c2d",
+      });
+      const result = await loop.run();
+      expect(result["status:reason"]).toBe("error:provider_error");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("independent timeout-like adapter failure before deadline is provider_error", async () => {
+    const { ChatCompletionsModel } = await import("../src/flagagent/providers/chat.js");
+    const { AnthropicMessagesModel } =
+      await import("../src/flagagent/providers/anthropic.js");
+    const { ResponsesModel } = await import("../src/flagagent/providers/responses.js");
+    class SDKTimeoutError extends Error {
+      constructor() {
+        super("Connection timed out");
+        this.name = "APIConnectionTimeoutError";
+      }
+    }
+    const adapters = [
+      () =>
+        new ChatCompletionsModel({
+          model: "m",
+          apiKey: "sk-test",
+          client: {
+            chat: {
+              completions: {
+                create: async () => {
+                  throw new SDKTimeoutError();
+                },
+              },
+            },
+          } as unknown,
+        }),
+      () =>
+        new AnthropicMessagesModel({
+          model: "m",
+          apiKey: "sk-test",
+          client: {
+            messages: {
+              create: async () => {
+                throw new SDKTimeoutError();
+              },
+            },
+          } as unknown,
+        }),
+      () =>
+        new ResponsesModel({
+          model: "m",
+          apiKey: "sk-test",
+          client: {
+            responses: {
+              create: async () => {
+                throw new SDKTimeoutError();
+              },
+            },
+          } as unknown,
+        }),
+    ];
+    for (const make of adapters) {
+      const tmp = mkdtempSync(join(tmpdir(), "flagagent-"));
+      try {
+        const loop = new AgentLoop({
+          model: make() as never,
+          executor: { execute: async () => new ShellResult("", "", 0, false) } as never,
+          verifier: new ExactStringVerifier("Flag{ok}"),
+          challenge: { identity: "fixture", description: "test" },
+          limits: new Limits({
+            maxModelTurns: 2,
+            wallTimeoutSeconds: 5,
+            commandTimeoutSeconds: 10,
+          }),
+          runsRoot: tmp,
+          monotonic: () => 0,
+          utcNow: () => NOW,
+          runId: "FA-20260814T000000Z-a13f4c2d",
+        });
+        const result = await loop.run();
+        expect(result["status:reason"]).toBe("error:provider_error");
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
+    }
+  });
+
+  it("completion at/after deadline is wall_limit even if provider succeeded", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "flagagent-"));
+    try {
+      const model = {
+        lastCommittedAt: 1,
+        setRemaining() {},
+        setMonotonic() {},
+        async generate(): Promise<ModelResponse> {
+          (this as unknown as { lastCommittedAt: number }).lastCommittedAt = 1;
+          return new ModelResponse("done");
+        },
+      };
+      const now = 0;
+      const monotonic = () => now;
+      const loop = new AgentLoop({
+        model: model as never,
+        executor: { execute: async () => new ShellResult("ok", "", 0, false) },
+        verifier: new ExactStringVerifier("Flag{ok}"),
+        challenge: { identity: "fixture", description: "test" },
+        limits: new Limits({
+          maxModelTurns: 2,
+          wallTimeoutSeconds: 1,
+          commandTimeoutSeconds: 10,
+        }),
+        runsRoot: tmp,
+        monotonic,
+        utcNow: () => NOW,
+        runId: "FA-20260814T000000Z-a13f4c2d",
+      });
+      const result = await loop.run();
+      expect(result["status:reason"]).toBe("unsolved:wall_limit");
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
