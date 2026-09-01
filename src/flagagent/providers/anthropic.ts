@@ -226,30 +226,45 @@ export class AnthropicMessagesModel {
     messages: Record<string, unknown>[],
     tools: Record<string, unknown>[],
   ): Promise<ModelResponse> {
-    const systemPrompt = messages.find((m) => m.role === "system")?.content as
-      string | undefined;
-    const requestMessages = toAnthropicMessages(
-      messages.filter((m) => m.role !== "system"),
-      this.thinkingHistory,
-    );
-    const requestTools = tools.map((t) => toAnthropicTool(t));
-    const params: Record<string, unknown> = {
-      model: this.model,
-      max_tokens: ANTHROPIC_MAX_TOKENS,
-      messages: requestMessages,
-      tools: requestTools,
-    };
-    if (systemPrompt != null) params.system = systemPrompt;
+    this._lastCommittedAt = undefined;
+    let systemPrompt: string | undefined;
+    let requestMessages: Record<string, unknown>[];
+    let requestTools: Record<string, unknown>[];
+    let params: Record<string, unknown>;
+    try {
+      systemPrompt = messages.find((m) => m.role === "system")?.content as
+        string | undefined;
+      requestMessages = toAnthropicMessages(
+        messages.filter((m) => m.role !== "system"),
+        this.thinkingHistory,
+      );
+      requestTools = tools.map((t) => toAnthropicTool(t));
+      params = {
+        model: this.model,
+        max_tokens: ANTHROPIC_MAX_TOKENS,
+        messages: requestMessages,
+        tools: requestTools,
+      };
+      if (systemPrompt != null) params.system = systemPrompt;
+    } catch (e) {
+      this.captureCommittedAt();
+      throw e;
+    }
 
     let client: unknown = this.client;
     let requestOptions: Record<string, unknown> | undefined;
-    if (this.remainingBudget != null) {
-      if (this.remainingBudget <= 0)
-        throw new ProviderError("messages request budget exhausted");
-      const signal = (this as unknown as { _signal?: AbortSignal })._signal;
-      const res = clientForBudget(this.client, this.remainingBudget, signal);
-      client = res.client;
-      requestOptions = res.options;
+    try {
+      if (this.remainingBudget != null) {
+        if (this.remainingBudget <= 0)
+          throw new ProviderError("messages request budget exhausted");
+        const signal = (this as unknown as { _signal?: AbortSignal })._signal;
+        const res = clientForBudget(this.client, this.remainingBudget, signal);
+        client = res.client;
+        requestOptions = res.options;
+      }
+    } catch (e) {
+      this.captureCommittedAt();
+      throw e;
     }
 
     try {

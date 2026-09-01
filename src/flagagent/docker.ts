@@ -275,6 +275,7 @@ export class DockerExecutor {
   private networkName: string | null = null;
   private targetId: string | null = null;
   private targetName: string | null = null;
+  private resolvedImageId: string | null = null;
   private executionDeadline: number | null = null;
   private preparationDeadline: number | null = null;
   private preparationRemaining: number | null = null;
@@ -526,9 +527,10 @@ export class DockerExecutor {
     if (!imageId) {
       await this.forceRemove(id, "agent");
       this.containerId = null;
+      this.resolvedImageId = null;
       throw new SandboxError("resolved image identity unavailable");
     }
-    (this as unknown as { resolvedImageId: string }).resolvedImageId = imageId;
+    this.resolvedImageId = imageId;
     this.pendingAgent = false;
   }
 
@@ -861,6 +863,7 @@ export class DockerExecutor {
       } else {
         this.containerId = null;
         this.containerName = null;
+        this.resolvedImageId = null;
       }
     }
 
@@ -1069,12 +1072,49 @@ export class DockerExecutor {
     return out;
   }
 
-  private dockerEngineInfo(): { version: string | null; rootless: boolean | null } {
+  private dockerEngineInfoSync(): { version: string | null; rootless: boolean | null } {
     return { version: null, rootless: null };
   }
 
+  private async dockerEngineInfo(): Promise<{
+    version: string | null;
+    rootless: boolean | null;
+  }> {
+    try {
+      const info = await runDocker(["info", "--format", "{{.ServerVersion}}"], 2000);
+      if (info.timedOut || info.error || info.status !== 0)
+        return { version: null, rootless: null };
+      const version = info.stdout.trim() || null;
+      const sec = await runDocker(["info", "--format", "{{.SecurityOptions}}"], 2000);
+      let rootless: boolean | null = null;
+      if (!sec.timedOut && !sec.error && sec.status === 0) {
+        rootless = sec.stdout.toLowerCase().includes("rootless");
+      }
+      return { version, rootless };
+    } catch {
+      return { version: null, rootless: null };
+    }
+  }
+
   sandboxProvenance(): Record<string, unknown> {
-    const engine = this.dockerEngineInfo();
+    const engine = this.dockerEngineInfoSync();
+    return {
+      backend: "docker",
+      image: this.opts.image ?? SANDBOX_IMAGE,
+      network_mode: this.opts.networkMode,
+      memory: "2g",
+      cpus: "2",
+      pids_limit: 256,
+      container_user: runtimeUser(),
+      security_relaxations: [],
+      docker_engine: engine.version,
+      rootless: engine.rootless,
+      flagagent_version: FLAGAGENT_VERSION,
+    };
+  }
+
+  async sandboxProvenanceAsync(): Promise<Record<string, unknown>> {
+    const engine = await this.dockerEngineInfo();
     return {
       backend: "docker",
       image: this.opts.image ?? SANDBOX_IMAGE,
@@ -1096,9 +1136,7 @@ export class DockerExecutor {
     if (this.targetId) info.target_container_id = this.targetId;
     if (this.networkId) info.network_id = this.networkId;
     if (this.networkName) info.network_name = this.networkName;
-    if ((this as unknown as { resolvedImageId?: string | null }).resolvedImageId) {
-      info.image_id = (this as unknown as { resolvedImageId: string }).resolvedImageId;
-    }
+    if (this.resolvedImageId) info.image_id = this.resolvedImageId;
     return info;
   }
 

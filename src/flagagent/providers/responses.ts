@@ -205,6 +205,7 @@ export class ResponsesModel {
     messages: Record<string, unknown>[],
     tools: Record<string, unknown>[],
   ): Promise<ModelResponse> {
+    this._lastCommittedAt = undefined;
     try {
       if (this.remainingBudget != null && this.remainingBudget <= 0) {
         throw new ProviderError("responses request budget exhausted");

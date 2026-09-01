@@ -250,7 +250,9 @@ export interface Executor {
   cleanup?: (runId: string) => void | Promise<void>;
   setRemaining?: (remaining: number) => void;
   setExecutionDeadline?: (deadline: number, monotonic: () => number) => void;
-  sandboxProvenance?: () => Record<string, unknown>;
+  sandboxProvenance?: () => Record<string, unknown> | Promise<Record<string, unknown>>;
+  sandboxProvenanceAsync?: () =>
+    Record<string, unknown> | Promise<Record<string, unknown>>;
   sandboxLifecycle?: () => Record<string, unknown>;
 }
 

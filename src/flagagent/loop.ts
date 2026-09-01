@@ -33,7 +33,10 @@ export interface AgentLoopOptions {
     cleanup?: (runId: string) => void | Promise<void>;
     setRemaining?: (remaining: number) => void;
     setExecutionDeadline?: (deadline: number, monotonic: () => number) => void;
-    sandboxProvenance?: () => Record<string, unknown>;
+    sandboxProvenance?: () =>
+      Record<string, unknown> | Promise<Record<string, unknown>>;
+    sandboxProvenanceAsync?: () =>
+      Record<string, unknown> | Promise<Record<string, unknown>>;
     sandboxLifecycle?: () => Record<string, unknown>;
   };
   verifier: Verifier;
@@ -269,15 +272,62 @@ export class AgentLoop {
         base_url: apiBase,
       };
     }
-    const provenance = (this.executor as unknown as Record<string, unknown>)
-      .sandboxProvenance as (() => Record<string, unknown>) | undefined;
-    if (typeof provenance === "function") {
+    const trySync = (this.executor as unknown as Record<string, unknown>)
+      .sandboxProvenance as
+      (() => Record<string, unknown> | Promise<Record<string, unknown>>) | undefined;
+    const tryAsync = (this.executor as unknown as Record<string, unknown>)
+      .sandboxProvenanceAsync as
+      (() => Record<string, unknown> | Promise<Record<string, unknown>>) | undefined;
+    let syncProvenance: Record<string, unknown> | null = null;
+    if (typeof trySync === "function") {
       try {
-        metadata.sandbox = provenance.call(this.executor);
+        const maybe = trySync.call(this.executor);
+        if (maybe != null && typeof (maybe as Promise<unknown>).then !== "function") {
+          syncProvenance = maybe as Record<string, unknown>;
+        }
+      } catch {
+        // ignore sync failure
+      }
+    }
+    if (syncProvenance) {
+      metadata.sandbox = syncProvenance;
+    }
+    let asyncProvenancePromise: Promise<Record<string, unknown>> | null = null;
+    if (typeof tryAsync === "function") {
+      try {
+        const p = tryAsync.call(this.executor) as unknown;
+        if (p != null && typeof (p as Promise<unknown>).then === "function") {
+          asyncProvenancePromise = p as Promise<Record<string, unknown>>;
+        } else if (p != null) {
+          metadata.sandbox = p as Record<string, unknown>;
+        }
+      } catch {
+        // ignore
+      }
+    } else if (typeof trySync === "function") {
+      try {
+        const p = trySync.call(this.executor) as unknown;
+        if (p != null && typeof (p as Promise<unknown>).then === "function") {
+          asyncProvenancePromise = p as Promise<Record<string, unknown>>;
+        }
       } catch {
         // ignore
       }
     }
+    let bestEffortSandbox: Record<string, unknown> | null = null;
+    if (asyncProvenancePromise) {
+      const raced = await Promise.race([
+        asyncProvenancePromise.then(
+          (v) => ({ ok: true as const, v }),
+          () => ({ ok: false as const }),
+        ),
+        new Promise<{ ok: false }>((resolve) =>
+          setTimeout(() => resolve({ ok: false }), 2500),
+        ),
+      ]);
+      if (raced.ok) bestEffortSandbox = raced.v;
+    }
+    if (bestEffortSandbox) metadata.sandbox = bestEffortSandbox;
     try {
       this.artifacts = RunArtifacts.create(
         this.runsRoot,

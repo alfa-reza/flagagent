@@ -226,6 +226,7 @@ export class ChatCompletionsModel {
     messages: Record<string, unknown>[],
     tools: Record<string, unknown>[],
   ): Promise<ModelResponse> {
+    this._lastCommittedAt = undefined;
     try {
       const requestMessages = messages.map((m) => toChatMessage(m));
       const requestTools = tools.map((t) => toChatTool(t));

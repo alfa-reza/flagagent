@@ -201,6 +201,7 @@ export class ScriptedModel implements Model {
   }
 
   async generate(messages: ModelMessage[], tools: ModelTool[]): Promise<ModelResponse> {
+    this._lastCommittedAt = undefined;
     try {
       const messageSnapshot = snapshotJson(messages);
       const toolSnapshot = snapshotJson(tools);
