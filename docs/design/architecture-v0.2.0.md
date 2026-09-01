@@ -47,10 +47,14 @@ AgentLoop arbitrates the witness against the absolute wall deadline: valid pre-d
 
 Only `shell`/`submit_flag` are model-visible; verifier alone establishes `solved`; wall deadline is authoritative; staging uses `procfd`/`O_NOFOLLOW`; containers run non-root, `--cap-drop ALL`, `no-new-privileges`, bounded resources, no host network unless `local` internal network.
 
-## 7. Decisions
+## 7. Budget-derived timeout vs wall-limit
+
+All deadline timers use `Math.ceil(seconds*1000)` so fractional Run budgets are not truncated below the authoritative absolute deadline. Provider adapters distinguish budget-derived expiry from independent provider failures: an abort/timeout that occurs while the Run budget is authoritative is surfaced as `ProviderBudgetTimeoutError` and classified by `AgentLoop` as `unsolved:wall_limit` regardless of `lastCommittedAt`. Genuine pre-deadline provider failures remain `error:provider_error`, and completion at/after the absolute deadline is always `unsolved:wall_limit`.
+
+## 8. Decisions
 
 **D011 — Manual strict-JSON validation:** FlagAgent uses explicit `isRecord`/`snapshotJson` with null-prototype snapshots for untrusted model/tool/artifact JSON. This is intentional `__proto__`-pollution hardening (see `src/flagagent/model.ts`). Do not introduce a schema dependency without demonstrated need.
 
-## 8. Artifacts
+## 9. Artifacts
 
 `result.json` is authoritative; `run.json` records static sandbox provenance (`docker_engine`, `rootless`, `flagagent_version` best-effort, image reference, network mode); dynamic lifecycle identifiers (container, network, image IDs) are recorded in `sandbox_lifecycle` events in `events.jsonl`; `events.jsonl` is the trajectory; `workspace/` is the agent’s writable bind.

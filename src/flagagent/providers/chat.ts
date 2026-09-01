@@ -15,6 +15,85 @@ export class ProviderError extends Error {
   }
 }
 
+export class ProviderBudgetTimeoutError extends ProviderError {
+  constructor(message: string, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "ProviderBudgetTimeoutError";
+  }
+}
+
+function isAbortOrTimeoutError(value: unknown): boolean {
+  if (value == null || typeof value !== "object") return false;
+  const err = value as Record<string, unknown>;
+  const name = typeof err.name === "string" ? err.name : "";
+  const message = typeof err.message === "string" ? err.message : "";
+  if (
+    name === "AbortError" ||
+    name === "APIConnectionTimeoutError" ||
+    name === "APIUserAbortError" ||
+    name.includes("Timeout") ||
+    name.includes("Abort")
+  )
+    return true;
+  const lower = message.toLowerCase();
+  if (
+    lower.includes("timed out") ||
+    lower.includes("timeout") ||
+    lower.includes("aborted") ||
+    lower.includes("aborterror")
+  )
+    return true;
+  return false;
+}
+
+function hasAbortOrTimeoutCause(error: unknown): boolean {
+  let current: unknown = error;
+  const seen = new Set<unknown>();
+  while (current != null && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    if (isAbortOrTimeoutError(current)) return true;
+    const cause = (current as Record<string, unknown>).cause;
+    if (cause == null) break;
+    current = cause;
+  }
+  return false;
+}
+
+export function isProviderBudgetTimeoutError(error: unknown): boolean {
+  let current: unknown = error;
+  const seen = new Set<unknown>();
+  while (current != null && typeof current === "object" && !seen.has(current)) {
+    seen.add(current);
+    const rec = current as Record<string, unknown>;
+    if (rec.name === "ProviderBudgetTimeoutError") return true;
+    if (hasAbortOrTimeoutCause(current)) {
+      const msg = typeof rec.message === "string" ? rec.message.toLowerCase() : "";
+      if (msg.includes("budget") || hasAbortOrTimeoutCause(rec.cause)) return true;
+    }
+    const cause = rec.cause;
+    if (cause == null) break;
+    current = cause;
+  }
+  return false;
+}
+
+function toBudgetTimeoutIfNeeded(
+  error: unknown,
+  remainingBudget: number | undefined,
+  signal: unknown,
+): ProviderError | null {
+  if (remainingBudget == null) return null;
+  const sig = signal as AbortSignal | undefined;
+  const signalAborted = sig?.aborted === true;
+  if (hasAbortOrTimeoutCause(error) || signalAborted) {
+    const cause = error instanceof Error ? error : new Error(String(error));
+    return new ProviderBudgetTimeoutError("provider request budget timeout", {
+      cause,
+    });
+  }
+  return null;
+}
+
 function toJson(value: unknown): string {
   return JSON.stringify(value);
 }
@@ -277,6 +356,9 @@ export class ChatCompletionsModel {
     } catch (e) {
       this.captureCommittedAt();
       if (e instanceof ProviderError) throw e;
+      const signal = (this as unknown as { _signal?: AbortSignal })._signal;
+      const budgetMapped = toBudgetTimeoutIfNeeded(e, this.remainingBudget, signal);
+      if (budgetMapped) throw budgetMapped;
       throw new ProviderError("chat completions request failed", { cause: e as Error });
     }
   }

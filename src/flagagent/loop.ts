@@ -359,8 +359,7 @@ export class AgentLoop {
     this.deadline = this.started + this.limits.wallTimeoutSeconds;
     this.abortController = new AbortController();
 
-    // Schedule absolute deadline abort — keep referenced so run() doesn't exit early with no result
-    const wallMs = Math.max(0, this.deadline - this.started) * 1000;
+    const wallMs = Math.ceil(Math.max(0, this.deadline - this.started) * 1000);
     const deadlineTimer = setTimeout(() => {
       this.abortController?.abort(new Error("wall_limit"));
     }, wallMs);
@@ -467,7 +466,7 @@ export class AgentLoop {
           terminalWritten = true;
           return r;
         }
-        const prepareMs = Math.max(0, this.remaining()) * 1000;
+        const prepareMs = Math.ceil(Math.max(0, this.remaining()) * 1000);
         if (prepareMs <= 0) {
           const r = this.terminal("unsolved", "wall_limit", []);
           terminalWritten = true;
@@ -670,7 +669,9 @@ export class AgentLoop {
         if (this.expired() || this.remaining() <= 0) {
           return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
         }
-        const deadlineMs = Math.max(0, this.deadline - this.monotonic()) * 1000;
+        const deadlineMs = Math.ceil(
+          Math.max(0, this.deadline - this.monotonic()) * 1000,
+        );
         if (deadlineMs <= 0) {
           return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
         }
@@ -744,13 +745,26 @@ export class AgentLoop {
       }
       if (commit.kind === "failure") {
         const err = commit.error;
-        const isAbort =
+        const budgetTimeout =
           err != null &&
           typeof err === "object" &&
-          ((err as Error).name === "AbortError" ||
-            ((err as Error).message?.includes("aborted") ?? false) ||
-            ((err as Error).message?.includes("AbortError") ?? false));
-        if (isAbort && this.expired() && commit.committedAt >= this.deadline) {
+          ((err as Record<string, unknown>).name === "ProviderBudgetTimeoutError" ||
+            ((): boolean => {
+              let cur: unknown = err;
+              const seen = new Set<unknown>();
+              while (cur != null && typeof cur === "object" && !seen.has(cur)) {
+                seen.add(cur);
+                if (
+                  (cur as Record<string, unknown>).name === "ProviderBudgetTimeoutError"
+                )
+                  return true;
+                const cause = (cur as Record<string, unknown>).cause;
+                if (cause == null) break;
+                cur = cause;
+              }
+              return false;
+            })());
+        if (budgetTimeout) {
           return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
         }
         const logged = this.error("provider_error", "model");

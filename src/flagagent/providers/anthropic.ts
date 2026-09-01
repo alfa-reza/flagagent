@@ -1,6 +1,12 @@
 import Anthropic from "@anthropic-ai/sdk";
 import { ModelResponse, ToolCall } from "../model.js";
-import { ProviderError, clientForBudget, usageField, toJson } from "./chat.js";
+import {
+  ProviderError,
+  ProviderBudgetTimeoutError,
+  clientForBudget,
+  usageField,
+  toJson,
+} from "./chat.js";
 
 export const ANTHROPIC_MAX_TOKENS = 4096;
 
@@ -286,6 +292,19 @@ export class AnthropicMessagesModel {
     } catch (e) {
       this.captureCommittedAt();
       if (e instanceof ProviderError) throw e;
+      const signal = (this as unknown as { _signal?: AbortSignal })._signal;
+      const causeStr =
+        String((e as Error)?.message ?? "") +
+        " " +
+        String((e as Record<string, unknown>)?.cause ?? "");
+      const isAbortLike =
+        (e as Error)?.name === "AbortError" ||
+        /abort|cancel|timed?\s*out|timeout/i.test(causeStr);
+      if ((isAbortLike || signal?.aborted) && this.remainingBudget != null) {
+        throw new ProviderBudgetTimeoutError("provider request budget timeout", {
+          cause: e as Error,
+        });
+      }
       throw new ProviderError("messages request failed", { cause: e as Error });
     }
   }

@@ -1,6 +1,12 @@
 import OpenAI from "openai";
 import { ModelResponse, ToolCall } from "../model.js";
-import { ProviderError, clientForBudget, usageField, toJson } from "./chat.js";
+import {
+  ProviderError,
+  ProviderBudgetTimeoutError,
+  clientForBudget,
+  usageField,
+  toJson,
+} from "./chat.js";
 
 function toResponsesTool(tool: Record<string, unknown>): Record<string, unknown> {
   return {
@@ -293,6 +299,19 @@ export class ResponsesModel {
     } catch (e) {
       this.captureCommittedAt();
       if (e instanceof ProviderError) throw e;
+      const signal = (this as unknown as { _signal?: AbortSignal })._signal;
+      const causeStr =
+        String((e as Error)?.message ?? "") +
+        " " +
+        String((e as Record<string, unknown>)?.cause ?? "");
+      const isAbortLike =
+        (e as Error)?.name === "AbortError" ||
+        /abort|cancel|timed?\s*out|timeout/i.test(causeStr);
+      if ((isAbortLike || signal?.aborted) && this.remainingBudget != null) {
+        throw new ProviderBudgetTimeoutError("provider request budget timeout", {
+          cause: e as Error,
+        });
+      }
       throw new ProviderError("responses request failed", { cause: e as Error });
     }
   }
