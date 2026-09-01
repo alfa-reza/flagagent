@@ -122,4 +122,37 @@ describe("staging security", () => {
       rmSync(tmp, { recursive: true, force: true });
     }
   });
+
+  it("accepts consecutive-dot filenames and directories (issue #61)", async () => {
+    const { readFileSync } = await import("node:fs");
+    const tmp = mkdtempSync(join(tmpdir(), "flagagent-"));
+    try {
+      const src = join(tmp, "src");
+      mkdirSync(src);
+      writeFileSync(join(src, "foo..bar"), "content-foo");
+      writeFileSync(join(src, "notes..txt"), "content-notes");
+      mkdirSync(join(src, "dir..name"));
+      writeFileSync(join(src, "dir..name", "file.txt"), "content-nested");
+      const snap = snapshotSourceFiles(src);
+      try {
+        const rels = snap.files.map(([, rel]) => rel).sort();
+        expect(rels).toEqual(["dir..name/file.txt", "foo..bar", "notes..txt"]);
+        const ws = mkdtempSync(join(tmpdir(), "flagagent-ws-"));
+        try {
+          stageSourceFiles(ws, snap.files);
+          expect(readFileSync(join(ws, "foo..bar"), "utf8")).toBe("content-foo");
+          expect(readFileSync(join(ws, "notes..txt"), "utf8")).toBe("content-notes");
+          expect(readFileSync(join(ws, "dir..name", "file.txt"), "utf8")).toBe(
+            "content-nested",
+          );
+        } finally {
+          rmSync(ws, { recursive: true, force: true });
+        }
+      } finally {
+        snap.cleanup();
+      }
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
 });
