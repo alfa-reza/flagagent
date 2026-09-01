@@ -109,7 +109,7 @@ export function snapshotSourceFiles(
     }
     for (const name of names.sort()) {
       const entryRelative = relative ? `${relative}/${name}` : name;
-      if (entryRelative.includes("..") || entryRelative.startsWith("/"))
+      if (entryRelative.startsWith("/"))
         throw new InvalidChallengeSourceError("challenge source path is unsafe");
       let entryMode: number;
       try {
