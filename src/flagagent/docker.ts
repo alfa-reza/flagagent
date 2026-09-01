@@ -1072,23 +1072,34 @@ export class DockerExecutor {
     return out;
   }
 
-  private dockerEngineInfoSync(): { version: string | null; rootless: boolean | null } {
-    return { version: null, rootless: null };
-  }
-
   private async dockerEngineInfo(): Promise<{
     version: string | null;
     rootless: boolean | null;
   }> {
     try {
-      const info = await runDocker(["info", "--format", "{{.ServerVersion}}"], 2000);
+      const info = await runDocker(["info", "--format", "{{json .}}"], 2000);
       if (info.timedOut || info.error || info.status !== 0)
         return { version: null, rootless: null };
-      const version = info.stdout.trim() || null;
-      const sec = await runDocker(["info", "--format", "{{.SecurityOptions}}"], 2000);
+      let parsed: Record<string, unknown> | null = null;
+      try {
+        parsed = JSON.parse(info.stdout) as Record<string, unknown>;
+      } catch {
+        return { version: null, rootless: null };
+      }
+      const version =
+        typeof parsed.ServerVersion === "string" && parsed.ServerVersion.trim()
+          ? (parsed.ServerVersion as string).trim()
+          : null;
       let rootless: boolean | null = null;
-      if (!sec.timedOut && !sec.error && sec.status === 0) {
-        rootless = sec.stdout.toLowerCase().includes("rootless");
+      const sec = parsed.SecurityOptions;
+      if (Array.isArray(sec)) {
+        rootless = sec.some(
+          (v) => typeof v === "string" && v.toLowerCase().includes("rootless"),
+        );
+      } else if (typeof sec === "string") {
+        rootless = sec.toLowerCase().includes("rootless");
+      } else if (sec == null) {
+        rootless = null;
       }
       return { version, rootless };
     } catch {
@@ -1097,7 +1108,6 @@ export class DockerExecutor {
   }
 
   sandboxProvenance(): Record<string, unknown> {
-    const engine = this.dockerEngineInfoSync();
     return {
       backend: "docker",
       image: this.opts.image ?? SANDBOX_IMAGE,
@@ -1107,8 +1117,8 @@ export class DockerExecutor {
       pids_limit: 256,
       container_user: runtimeUser(),
       security_relaxations: [],
-      docker_engine: engine.version,
-      rootless: engine.rootless,
+      docker_engine: null,
+      rootless: null,
       flagagent_version: FLAGAGENT_VERSION,
     };
   }

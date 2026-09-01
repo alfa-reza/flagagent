@@ -1,6 +1,13 @@
 import OpenAI from "openai";
 import { ModelResponse, ToolCall } from "../model.js";
 
+/**
+ * A provider invocation becomes semantically committed after the adapter has
+ * obtained and normalized the complete result/error and updated provider-owned
+ * replay/continuation state required by subsequent turns, then records the
+ * current-invocation completion witness before returning or throwing that
+ * completed outcome to AgentLoop.
+ */
 export class ProviderError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);

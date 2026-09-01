@@ -244,6 +244,14 @@ export class SandboxError extends Error {
   }
 }
 
+/**
+ * Custom executors must be cooperative and non-blocking with respect to the
+ * Node event loop. Asynchronous work must be bounded and respect available
+ * budget/deadline hooks where applicable (see `AgentLoop`'s `setRemaining` /
+ * `setExecutionDeadline`). v0.2.0 does not promise hard process-level
+ * preemption for arbitrary synchronous custom executors. `DockerExecutor` is the
+ * supported production implementation with bounded behavior covered by tests.
+ */
 export interface Executor {
   execute(command: string, timeoutSeconds: number): ShellResult | Promise<ShellResult>;
   prepare?: (workspace: string, runId: string) => void | Promise<void>;

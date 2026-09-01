@@ -12,7 +12,7 @@ FROM python:3.12-slim@sha256:2c941e860699f878900b0edc2403613c234d4b32eda3cc9fa70
 
 LABEL flagagent.managed=true \
       flagagent.role=target \
-      flagagent.version=0.1.1
+      flagagent.version=0.2.0
 
 RUN groupadd --gid 1001 target \
     && useradd --uid 1001 --gid 1001 --no-create-home target
