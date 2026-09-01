@@ -450,47 +450,6 @@ describe("deadline invariants", () => {
     }
   });
 
-  it("budget-derived timeout maps to wall_limit even though committedAt < deadline", async () => {
-    const { ProviderBudgetTimeoutError } =
-      await import("../src/flagagent/providers/chat.js");
-    const tmp = mkdtempSync(join(tmpdir(), "flagagent-"));
-    try {
-      const failing = {
-        _signal: new AbortController().signal,
-        lastCommittedAt: 0.1,
-        setRemaining() {},
-        setMonotonic() {},
-        async generate(): Promise<ModelResponse> {
-          (this as unknown as { lastCommittedAt: number }).lastCommittedAt = 0.1;
-          throw new ProviderBudgetTimeoutError("provider request budget timeout", {
-            cause: new Error("aborted"),
-          });
-        },
-      };
-      const now = 0;
-      const monotonic = () => now;
-      const loop = new AgentLoop({
-        model: failing as never,
-        executor: { execute: async () => new ShellResult("ok", "", 0, false) },
-        verifier: new ExactStringVerifier("Flag{ok}"),
-        challenge: { identity: "fixture", description: "test" },
-        limits: new Limits({
-          maxModelTurns: 2,
-          wallTimeoutSeconds: 1,
-          commandTimeoutSeconds: 10,
-        }),
-        runsRoot: tmp,
-        monotonic,
-        utcNow: () => NOW,
-        runId: "FA-20260814T000000Z-a13f4c2d",
-      });
-      const result = await loop.run();
-      expect(result["status:reason"]).toBe("unsolved:wall_limit");
-    } finally {
-      rmSync(tmp, { recursive: true, force: true });
-    }
-  });
-
   it("genuine independent provider failure before deadline remains provider_error", async () => {
     const { ProviderError } = await import("../src/flagagent/providers/chat.js");
     const tmp = mkdtempSync(join(tmpdir(), "flagagent-"));
@@ -525,6 +484,83 @@ describe("deadline invariants", () => {
       expect(result["status:reason"]).toBe("error:provider_error");
     } finally {
       rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
+  it("independent timeout-like adapter failure before deadline is provider_error", async () => {
+    const { ChatCompletionsModel } = await import("../src/flagagent/providers/chat.js");
+    const { AnthropicMessagesModel } =
+      await import("../src/flagagent/providers/anthropic.js");
+    const { ResponsesModel } = await import("../src/flagagent/providers/responses.js");
+    class SDKTimeoutError extends Error {
+      constructor() {
+        super("Connection timed out");
+        this.name = "APIConnectionTimeoutError";
+      }
+    }
+    const adapters = [
+      () =>
+        new ChatCompletionsModel({
+          model: "m",
+          apiKey: "sk-test",
+          client: {
+            chat: {
+              completions: {
+                create: async () => {
+                  throw new SDKTimeoutError();
+                },
+              },
+            },
+          } as unknown,
+        }),
+      () =>
+        new AnthropicMessagesModel({
+          model: "m",
+          apiKey: "sk-test",
+          client: {
+            messages: {
+              create: async () => {
+                throw new SDKTimeoutError();
+              },
+            },
+          } as unknown,
+        }),
+      () =>
+        new ResponsesModel({
+          model: "m",
+          apiKey: "sk-test",
+          client: {
+            responses: {
+              create: async () => {
+                throw new SDKTimeoutError();
+              },
+            },
+          } as unknown,
+        }),
+    ];
+    for (const make of adapters) {
+      const tmp = mkdtempSync(join(tmpdir(), "flagagent-"));
+      try {
+        const loop = new AgentLoop({
+          model: make() as never,
+          executor: { execute: async () => new ShellResult("", "", 0, false) } as never,
+          verifier: new ExactStringVerifier("Flag{ok}"),
+          challenge: { identity: "fixture", description: "test" },
+          limits: new Limits({
+            maxModelTurns: 2,
+            wallTimeoutSeconds: 5,
+            commandTimeoutSeconds: 10,
+          }),
+          runsRoot: tmp,
+          monotonic: () => 0,
+          utcNow: () => NOW,
+          runId: "FA-20260814T000000Z-a13f4c2d",
+        });
+        const result = await loop.run();
+        expect(result["status:reason"]).toBe("error:provider_error");
+      } finally {
+        rmSync(tmp, { recursive: true, force: true });
+      }
     }
   });
 

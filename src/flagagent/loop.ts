@@ -744,29 +744,6 @@ export class AgentLoop {
         return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
       }
       if (commit.kind === "failure") {
-        const err = commit.error;
-        const budgetTimeout =
-          err != null &&
-          typeof err === "object" &&
-          ((err as Record<string, unknown>).name === "ProviderBudgetTimeoutError" ||
-            ((): boolean => {
-              let cur: unknown = err;
-              const seen = new Set<unknown>();
-              while (cur != null && typeof cur === "object" && !seen.has(cur)) {
-                seen.add(cur);
-                if (
-                  (cur as Record<string, unknown>).name === "ProviderBudgetTimeoutError"
-                )
-                  return true;
-                const cause = (cur as Record<string, unknown>).cause;
-                if (cause == null) break;
-                cur = cause;
-              }
-              return false;
-            })());
-        if (budgetTimeout) {
-          return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
-        }
         const logged = this.error("provider_error", "model");
         return {
           status: logged.status,

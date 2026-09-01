@@ -47,9 +47,9 @@ AgentLoop arbitrates the witness against the absolute wall deadline: valid pre-d
 
 Only `shell`/`submit_flag` are model-visible; verifier alone establishes `solved`; wall deadline is authoritative; staging uses `procfd`/`O_NOFOLLOW`; containers run non-root, `--cap-drop ALL`, `no-new-privileges`, bounded resources, no host network unless `local` internal network.
 
-## 7. Budget-derived timeout vs wall-limit
+## 7. Deadline correctness
 
-All deadline timers use `Math.ceil(seconds*1000)` so fractional Run budgets are not truncated below the authoritative absolute deadline. Provider adapters distinguish budget-derived expiry from independent provider failures: an abort/timeout that occurs while the Run budget is authoritative is surfaced as `ProviderBudgetTimeoutError` and classified by `AgentLoop` as `unsolved:wall_limit` regardless of `lastCommittedAt`. Genuine pre-deadline provider failures remain `error:provider_error`, and completion at/after the absolute deadline is always `unsolved:wall_limit`.
+All deadline timers use `Math.ceil(seconds*1000)` so fractional Run budgets are not truncated below the authoritative absolute deadline. The wall budget is enforced deterministically by `AgentLoop`'s absolute `deadline` plus the `lastCommittedAt` witness; provider SDK timeouts are defense-in-depth only and not used as a causal classifier. Independent provider or transport timeouts before the deadline remain `error:provider_error`, while completion at/after the absolute deadline is `unsolved:wall_limit`.
 
 ## 8. Decisions
 
