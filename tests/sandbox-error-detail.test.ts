@@ -5,7 +5,11 @@ import { tmpdir } from "node:os";
 import { AgentLoop } from "../src/flagagent/loop.js";
 import { Limits } from "../src/flagagent/limits.js";
 import { ModelResponse, ToolCall, ScriptedModel } from "../src/flagagent/model.js";
-import { ExactStringVerifier, ShellResult, SandboxError } from "../src/flagagent/tools.js";
+import {
+  ExactStringVerifier,
+  ShellResult,
+  SandboxError,
+} from "../src/flagagent/tools.js";
 import { readEvents } from "../src/flagagent/artifacts.js";
 
 const NOW = new Date("2026-08-14T16:15:30.000Z");
@@ -30,7 +34,11 @@ describe("SandboxError detail persistence (issue #68)", () => {
         executor: executor as never,
         verifier: new ExactStringVerifier("Flag{ok}"),
         challenge: { identity: "fixture", description: "solve it" },
-        limits: new Limits({ maxModelTurns: 5, wallTimeoutSeconds: 100, commandTimeoutSeconds: 10 }),
+        limits: new Limits({
+          maxModelTurns: 5,
+          wallTimeoutSeconds: 100,
+          commandTimeoutSeconds: 10,
+        }),
         runsRoot: tmp,
         monotonic: () => 0,
         utcNow: () => NOW,
@@ -40,7 +48,9 @@ describe("SandboxError detail persistence (issue #68)", () => {
       expect(result.status).toBe("error");
       expect(result.reason).toBe("sandbox_error");
       expect(result["status:reason"]).toBe("error:sandbox_error");
-      const events = readEvents((loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath);
+      const events = readEvents(
+        (loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath,
+      );
       const err = events.find((e) => e.type === "error")!;
       expect(err).toBeDefined();
       const payload = err.payload as Record<string, unknown>;
@@ -63,11 +73,17 @@ describe("SandboxError detail persistence (issue #68)", () => {
         },
       };
       const loop = new AgentLoop({
-        model: new ScriptedModel([new ModelResponse("", [new ToolCall("c1", "shell", { command: "echo hi" })])]),
+        model: new ScriptedModel([
+          new ModelResponse("", [new ToolCall("c1", "shell", { command: "echo hi" })]),
+        ]),
         executor: executor as never,
         verifier: new ExactStringVerifier("Flag{ok}"),
         challenge: { identity: "fixture", description: "solve it" },
-        limits: new Limits({ maxModelTurns: 5, wallTimeoutSeconds: 100, commandTimeoutSeconds: 10 }),
+        limits: new Limits({
+          maxModelTurns: 5,
+          wallTimeoutSeconds: 100,
+          commandTimeoutSeconds: 10,
+        }),
         runsRoot: tmp,
         monotonic: () => 0,
         utcNow: () => NOW,
@@ -77,7 +93,9 @@ describe("SandboxError detail persistence (issue #68)", () => {
       expect(result.status).toBe("error");
       expect(result.reason).toBe("sandbox_error");
       expect(result["status:reason"]).toBe("error:sandbox_error");
-      const events = readEvents((loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath);
+      const events = readEvents(
+        (loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath,
+      );
       const err = events.find((e) => e.type === "error")!;
       const payload = err.payload as Record<string, unknown>;
       expect(payload.reason).toBe("sandbox_error");
@@ -103,7 +121,11 @@ describe("SandboxError detail persistence (issue #68)", () => {
         executor: executor as never,
         verifier: new ExactStringVerifier("Flag{ok}"),
         challenge: { identity: "fixture", description: "solve it" },
-        limits: new Limits({ maxModelTurns: 5, wallTimeoutSeconds: 100, commandTimeoutSeconds: 10 }),
+        limits: new Limits({
+          maxModelTurns: 5,
+          wallTimeoutSeconds: 100,
+          commandTimeoutSeconds: 10,
+        }),
         runsRoot: tmp,
         monotonic: () => 0,
         utcNow: () => NOW,
@@ -111,8 +133,13 @@ describe("SandboxError detail persistence (issue #68)", () => {
       });
       const result = await loop.run();
       expect(result["status:reason"]).toBe("error:sandbox_error");
-      const events = readEvents((loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath);
-      const payload = (events.find((e) => e.type === "error")!.payload as Record<string, unknown>);
+      const events = readEvents(
+        (loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath,
+      );
+      const payload = events.find((e) => e.type === "error")!.payload as Record<
+        string,
+        unknown
+      >;
       expect(payload.reason).toBe("sandbox_error");
       expect(payload.detail).toBeUndefined();
       expect(payload.call_id).toBeUndefined();
@@ -130,11 +157,17 @@ describe("SandboxError detail persistence (issue #68)", () => {
         },
       };
       const loop = new AgentLoop({
-        model: new ScriptedModel([new ModelResponse("", [new ToolCall("c2", "shell", { command: "echo hi" })])]),
+        model: new ScriptedModel([
+          new ModelResponse("", [new ToolCall("c2", "shell", { command: "echo hi" })]),
+        ]),
         executor: executor as never,
         verifier: new ExactStringVerifier("Flag{ok}"),
         challenge: { identity: "fixture", description: "solve it" },
-        limits: new Limits({ maxModelTurns: 5, wallTimeoutSeconds: 100, commandTimeoutSeconds: 10 }),
+        limits: new Limits({
+          maxModelTurns: 5,
+          wallTimeoutSeconds: 100,
+          commandTimeoutSeconds: 10,
+        }),
         runsRoot: tmp,
         monotonic: () => 0,
         utcNow: () => NOW,
@@ -142,8 +175,13 @@ describe("SandboxError detail persistence (issue #68)", () => {
       });
       const result = await loop.run();
       expect(result["status:reason"]).toBe("error:tool_error");
-      const events = readEvents((loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath);
-      const payload = (events.find((e) => e.type === "error")!.payload as Record<string, unknown>);
+      const events = readEvents(
+        (loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath,
+      );
+      const payload = events.find((e) => e.type === "error")!.payload as Record<
+        string,
+        unknown
+      >;
       expect(payload.reason).toBe("tool_error");
       expect(payload.detail).toBeUndefined();
       expect(payload.call_id).toBe("c2");
@@ -152,18 +190,15 @@ describe("SandboxError detail persistence (issue #68)", () => {
     }
   });
 
-  it("wall deadline wins over SandboxError", async () => {
+  it("wall deadline wins over SandboxError thrown during prepare", async () => {
     const tmp = tmpDir();
     try {
-      let callCount = 0;
-      const monotonic = () => {
-        callCount++;
-        if (callCount === 1) return 0;
-        return 100;
-      };
+      let monotonicVal = 0;
+      const monotonic = () => monotonicVal;
       const diag = "docker run failed: should be masked";
       const executor = {
         prepare: async () => {
+          monotonicVal = 100;
           throw new SandboxError(diag);
         },
         execute: async () => new ShellResult("", "", 0, false),
@@ -173,7 +208,11 @@ describe("SandboxError detail persistence (issue #68)", () => {
         executor: executor as never,
         verifier: new ExactStringVerifier("Flag{ok}"),
         challenge: { identity: "fixture", description: "solve it" },
-        limits: new Limits({ maxModelTurns: 5, wallTimeoutSeconds: 1, commandTimeoutSeconds: 10 }),
+        limits: new Limits({
+          maxModelTurns: 5,
+          wallTimeoutSeconds: 1,
+          commandTimeoutSeconds: 10,
+        }),
         runsRoot: tmp,
         monotonic,
         utcNow: () => NOW,
@@ -181,53 +220,61 @@ describe("SandboxError detail persistence (issue #68)", () => {
       });
       const result = await loop.run();
       expect(result["status:reason"]).toBe("unsolved:wall_limit");
-      const events = readEvents((loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath);
-      expect(events.some((e) => (e.payload as Record<string, unknown>).reason === "sandbox_error")).toBe(false);
+      const events = readEvents(
+        (loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath,
+      );
+      expect(
+        events.some(
+          (e) => (e.payload as Record<string, unknown>).reason === "sandbox_error",
+        ),
+      ).toBe(false);
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
   });
 
-  it("shell wall deadline wins before execute", async () => {
+  it("wall deadline during shell execution masks SandboxError", async () => {
     const tmp = tmpDir();
     try {
       let monotonicVal = 0;
       const monotonic = () => monotonicVal;
       const diag = "docker exec failed: should be masked";
-      const executed: string[] = [];
       const executor = {
-        execute: async (cmd: string) => {
-          executed.push(cmd);
+        execute: async () => {
+          monotonicVal = 10;
           throw new SandboxError(diag);
         },
       };
       const loop = new AgentLoop({
-        model: new ScriptedModel([new ModelResponse("", [new ToolCall("c1", "shell", { command: "echo hi" })])]),
+        model: new ScriptedModel([
+          new ModelResponse("", [new ToolCall("c1", "shell", { command: "echo hi" })]),
+        ]),
         executor: executor as never,
         verifier: new ExactStringVerifier("Flag{ok}"),
         challenge: { identity: "fixture", description: "solve it" },
-        limits: new Limits({ maxModelTurns: 5, wallTimeoutSeconds: 0.2, commandTimeoutSeconds: 10 }),
+        limits: new Limits({
+          maxModelTurns: 5,
+          wallTimeoutSeconds: 1,
+          commandTimeoutSeconds: 10,
+        }),
         runsRoot: tmp,
         monotonic,
         utcNow: () => NOW,
         runId: "FA-20260814T161530Z-a13f4c2d",
       });
-      const runPromise = loop.run();
-      await new Promise((r) => setTimeout(r, 10));
-      monotonicVal = 1;
-      const result = await runPromise;
-      // The model call may have been committed before deadline; but ensure no sandbox_error detail leaks if wall_limit wins
-      // Accept either status but if wall_limit, no sandbox detail should be present
-      if (result["status:reason"] === "unsolved:wall_limit") {
-        const events = readEvents((loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath);
-        expect(events.some((e) => (e.payload as Record<string, unknown>).reason === "sandbox_error")).toBe(false);
-        expect(executed.length).toBe(0);
-      } else {
-        // if sandbox won, detail must be present (not masking)
-        const events = readEvents((loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath);
-        const err = events.find((e) => e.type === "error");
-        if (err) expect((err.payload as Record<string, unknown>).detail).toBe(diag);
-      }
+      const result = await loop.run();
+      expect(result["status:reason"]).toBe("unsolved:wall_limit");
+      const events = readEvents(
+        (loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath,
+      );
+      expect(
+        events.some(
+          (e) => (e.payload as Record<string, unknown>).reason === "sandbox_error",
+        ),
+      ).toBe(false);
+      expect(
+        events.some((e) => (e.payload as Record<string, unknown>).detail === diag),
+      ).toBe(false);
     } finally {
       rmSync(tmp, { recursive: true, force: true });
     }
