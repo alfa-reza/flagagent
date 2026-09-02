@@ -232,4 +232,4 @@ export class ScriptedModel implements Model {
 
 export function jsonValuesEqual(left: unknown, right: unknown): boolean {
   return isDeepStrictEqual(left, right);
-  }
+}
