@@ -40,12 +40,7 @@ export function snapshotJson(value: unknown): JsonValue {
   if (isRecord(value)) {
     const copy: JsonObject = Object.create(null) as JsonObject;
     for (const [key, item] of Object.entries(value)) {
-      Object.defineProperty(copy, key, {
-        value: snapshotJson(item),
-        writable: true,
-        enumerable: true,
-        configurable: true,
-      });
+      copy[key] = snapshotJson(item);
     }
     return copy;
   }

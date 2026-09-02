@@ -55,7 +55,7 @@ function toChatMessage(message: Record<string, unknown>): Record<string, unknown
     return { role, content: (message.content as string) ?? "" };
   }
   if (role === "assistant") {
-    const toolCalls = (message.tool_calls as unknown[]) ?? [];
+    const toolCalls = message.tool_calls;
     const chatMessage: Record<string, unknown> = {
       role: "assistant",
       content: (message.content as string) || null,
@@ -95,10 +95,8 @@ function parseChatResponse(response: unknown): ModelResponse {
   const rawContent = message.content;
   const content = typeof rawContent === "string" ? rawContent : "";
   const rawToolCalls = message.tool_calls as unknown;
-  let toolCalls: ToolCall[] = [];
-  if (truncated) {
-    toolCalls = [];
-  } else {
+  const toolCalls: ToolCall[] = [];
+  if (!truncated) {
     const list = rawToolCalls == null ? [] : rawToolCalls;
     if (!Array.isArray(list)) throw new ProviderError("tool calls must be a list");
     for (const raw of list) {

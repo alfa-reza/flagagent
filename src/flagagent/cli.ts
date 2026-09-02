@@ -3,6 +3,7 @@ import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { AgentLoop } from "./loop.js";
 import { Limits } from "./limits.js";
+import type { Model } from "./model.js";
 import { ExactStringVerifier } from "./tools.js";
 import { DockerExecutor } from "./docker.js";
 import { ChatCompletionsModel } from "./providers/chat.js";
@@ -168,26 +169,28 @@ export async function runCli(argv: string[]): Promise<void> {
     console.error(`missing API key environment variable: ${keyEnv}`);
     process.exit(2);
   }
-  let modelInst: import("./model.js").Model;
+
+  let modelInst: Model;
   if (protocol === "openai-chat")
     modelInst = new ChatCompletionsModel({
       model,
       apiKey,
       baseURL: apiBase,
-    }) as unknown as import("./model.js").Model;
+    });
   else if (protocol === "openai-responses")
     modelInst = new ResponsesModel({
       model,
       apiKey,
       baseURL: apiBase,
-    }) as unknown as import("./model.js").Model;
+    });
   else if (protocol === "anthropic")
     modelInst = new AnthropicMessagesModel({
       model,
       apiKey,
       baseURL: apiBase,
-    }) as unknown as import("./model.js").Model;
+    });
   else throw new Error(`unsupported protocol: ${protocol}`);
+
   const limitOverrides: Record<string, number> = {};
   if (maxModelTurnsRaw != null) {
     const v = Number(maxModelTurnsRaw);
@@ -207,10 +210,11 @@ export async function runCli(argv: string[]): Promise<void> {
       throw new Error("--command-timeout-seconds must be a positive number");
     limitOverrides.commandTimeoutSeconds = v;
   }
+
   const executor = new DockerExecutor({ networkMode: ch.networkMode });
   const loop = new AgentLoop({
     model: modelInst,
-    executor: executor as unknown as import("./tools.js").Executor,
+    executor,
     verifier: new ExactStringVerifier(ch.expectedFlag),
     challenge: {
       identity: ch.identity,

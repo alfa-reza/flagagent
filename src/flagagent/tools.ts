@@ -162,15 +162,11 @@ function validCodePointAt(data: Buffer, start: number): number {
   return width;
 }
 
-function pyPrefix(data: Buffer, limit: number): string {
+function utf8Prefix(data: Buffer, limit: number): string {
   return data
     .subarray(0, limit)
     .toString("utf8")
     .replace(/\uFFFD/g, "");
-}
-
-function utf8Prefix(data: Buffer, limit: number): string {
-  return pyPrefix(data, limit);
 }
 
 function utf8Suffix(data: Buffer, limit: number): string {
@@ -202,14 +198,14 @@ export function truncateUtf8(value: string, limit: number): [string, boolean] {
   const available = limit - marker.length;
   let headBytes = Math.floor((available + 1) / 2);
   const tailBytes = Math.floor(available / 2);
-  let rendered =
-    utf8Prefix(data, headBytes) + TRUNCATION_MARKER + utf8Suffix(data, tailBytes);
+  const tail = utf8Suffix(data, tailBytes);
+  let rendered = utf8Prefix(data, headBytes) + TRUNCATION_MARKER + tail;
+
   // Shrink head until the UTF-8 byte length fits the limit, mirroring Python's
   // loop that compensates for multi-byte boundary adjustments.
   while (Buffer.byteLength(rendered, "utf8") > limit && headBytes > 0) {
     headBytes -= 1;
-    rendered =
-      utf8Prefix(data, headBytes) + TRUNCATION_MARKER + utf8Suffix(data, tailBytes);
+    rendered = utf8Prefix(data, headBytes) + TRUNCATION_MARKER + tail;
   }
   return [rendered, true];
 }
