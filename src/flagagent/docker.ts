@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { resolve } from "node:path";
 import { SandboxError, ShellResult } from "./tools.js";
 import { validateRunId } from "./artifacts.js";
 import { FLAGAGENT_VERSION } from "./version.js";
@@ -466,6 +467,7 @@ export class DockerExecutor {
 
   private async createAgent(workspace: string, runId: string): Promise<void> {
     this.pendingAgent = true;
+    const hostWorkspace = resolve(workspace);
     const args = [
       "run",
       "-d",
@@ -477,7 +479,7 @@ export class DockerExecutor {
       "-w",
       WORKSPACE_TARGET,
       "--mount",
-      `type=bind,source=${workspace},target=${WORKSPACE_TARGET}`,
+      `type=bind,source=${hostWorkspace},target=${WORKSPACE_TARGET}`,
       "--memory",
       "2g",
       "--cpus",
