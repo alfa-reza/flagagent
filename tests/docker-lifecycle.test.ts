@@ -1,7 +1,14 @@
 /* eslint-disable @typescript-eslint/no-explicit-any, no-empty, no-useless-escape */
 import { describe, it, expect, beforeEach, afterEach } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync, chmodSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  chmodSync,
+  readFileSync,
+  mkdirSync,
+} from "node:fs";
+import { join, resolve, isAbsolute, relative } from "node:path";
 import { tmpdir } from "node:os";
 import { DockerExecutor } from "../src/flagagent/docker.js";
 
@@ -334,5 +341,60 @@ esac`;
     expect(log).toContain("flagagent.run_id=FA-20260814T000000Z-aaaa");
     delete process.env.FAKE_DOCKER_LOG;
     await ex.cleanup("FA-20260814T000000Z-aaaa");
+  });
+
+  it("relative workspace is resolved to absolute bind source at Docker boundary", async () => {
+    const logFile = join(tmp, "docker-relative.log");
+    process.env.FAKE_DOCKER_LOG = logFile;
+    makeFakeDocker(fakeBin, "success");
+    process.env.PATH = `${fakeBin}:${origPath}`;
+    const projectRoot = mkdtempSync(join(tmpdir(), "flagagent-relative-"));
+    try {
+      const rel = join("runs", "FA-20260814T000000Z-aaaa", "workspace");
+      const absWs = join(projectRoot, rel);
+      mkdirSync(absWs, { recursive: true });
+      const origCwd = process.cwd();
+      process.chdir(projectRoot);
+      try {
+        const relWs = relative(process.cwd(), absWs);
+        expect(isAbsolute(relWs)).toBe(false);
+        const ex = new DockerExecutor();
+        await ex.prepare(relWs, "FA-20260814T000000Z-aaaa");
+        const log = readFileSync(logFile, "utf8");
+        const mountLines = log.split("\n").filter((l) => l.includes("--mount"));
+        expect(mountLines.length).toBeGreaterThan(0);
+        for (const line of mountLines) {
+          const m = line.match(/source=([^,]+),target=\/workspace/);
+          expect(m).not.toBeNull();
+          const src = m![1]!;
+          expect(isAbsolute(src)).toBe(true);
+          expect(src).toBe(resolve(relWs));
+        }
+        expect(log).toContain("target=/workspace");
+        expect(log).toContain("--network none");
+        await ex.cleanup("FA-20260814T000000Z-aaaa");
+        const ex2 = new DockerExecutor({ networkMode: "local" });
+        const rel2 = join("runs", "FA-20260814T000000Z-bbbb", "workspace");
+        const absWs2 = join(projectRoot, rel2);
+        mkdirSync(absWs2, { recursive: true });
+        const relWs2 = relative(process.cwd(), absWs2);
+        await ex2.prepare(relWs2, "FA-20260814T000000Z-bbbb");
+        const log2 = readFileSync(logFile, "utf8");
+        const agentMounts = log2
+          .split("\n")
+          .filter((l) => l.includes("flagagent-agent-") && l.includes("--mount"));
+        expect(agentMounts.length).toBeGreaterThan(0);
+        const lastMount = agentMounts[agentMounts.length - 1]!;
+        const m2 = lastMount.match(/source=([^,]+),target=\/workspace/);
+        expect(m2).not.toBeNull();
+        expect(isAbsolute(m2![1]!)).toBe(true);
+        await ex2.cleanup("FA-20260814T000000Z-bbbb");
+      } finally {
+        process.chdir(origCwd);
+      }
+    } finally {
+      rmSync(projectRoot, { recursive: true, force: true });
+      delete process.env.FAKE_DOCKER_LOG;
+    }
   });
 });
