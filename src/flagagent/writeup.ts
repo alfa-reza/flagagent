@@ -8,7 +8,7 @@ import {
   writeSync,
 } from "node:fs";
 import { join } from "node:path";
-import type { JsonObject, JsonValue } from "./model.js";
+import type { JsonObject } from "./model.js";
 import { isRecord } from "./model.js";
 import { readEvents } from "./artifacts.js";
 
@@ -50,8 +50,24 @@ export function codeSpan(value: unknown): string {
   return `${delimiter}${text}${delimiter}`;
 }
 
+function renderToolCall(payload: Record<string, unknown>): string {
+  const name = payload.name ?? "unknown";
+  const callId = payload.call_id ?? "";
+  const argumentsValue = payload.arguments;
+
+  if (name === "shell" && isRecord(argumentsValue)) {
+    const command = argumentsValue.command;
+    if (typeof command === "string") {
+      return `- \`shell\` call ${codeSpan(callId)}: ${codeSpan(command)}`;
+    }
+  }
+
+  return `- ${codeSpan(name)} call ${codeSpan(callId)}`;
+}
+
 function renderActions(events: JsonObject[]): string[] {
   const lines: string[] = [];
+
   for (const event of events) {
     const eventType = event.type;
     const payload = event.payload;
@@ -60,28 +76,15 @@ function renderActions(events: JsonObject[]): string[] {
     }
 
     if (eventType === "tool_call") {
-      const name = payload.name ?? "unknown";
-      const callId = payload.call_id ?? "";
-      const argumentsValue = payload.arguments;
-      if (name === "shell" && isRecord(argumentsValue)) {
-        const command = argumentsValue.command;
-        if (typeof command === "string") {
-          lines.push(`- \`shell\` call ${codeSpan(callId)}: ${codeSpan(command)}`);
-          continue;
-        }
-      }
-      lines.push(`- ${codeSpan(name)} call ${codeSpan(callId)}`);
+      lines.push(renderToolCall(payload));
     } else if (eventType === "flag_submission") {
       lines.push(`- \`submit_flag\` candidate: ${codeSpan(payload.candidate ?? "")}`);
     } else if (eventType === "verifier_result") {
       lines.push(`- verifier outcome: ${codeSpan(payload.outcome ?? "")}`);
     }
   }
-  return lines.length > 0 ? lines : ["- no tool actions recorded"];
-}
 
-function valueAt(object: JsonObject, key: string): JsonValue | undefined {
-  return object[key];
+  return lines.length > 0 ? lines : ["- no tool actions recorded"];
 }
 
 export function renderWriteup(
@@ -95,7 +98,7 @@ export function renderWriteup(
   const lines = [
     "# FlagAgent Run",
     "",
-    `- Run ID: ${codeSpan(valueAt(run, "run_id") ?? "")}`,
+    `- Run ID: ${codeSpan(run.run_id ?? "")}`,
     `- Challenge: ${codeSpan(challenge.identity ?? "")}`,
     `- Status: ${codeSpan(result.status ?? "")}`,
     `- Reason: ${codeSpan(result.reason ?? "")}`,
@@ -115,12 +118,14 @@ export function renderWriteup(
     `- Tool calls: ${codeSpan(result.tool_calls ?? "")}`,
     `- Flag submissions: ${codeSpan(result.flag_submissions ?? "")}`,
   ];
+
   if ("input_tokens" in result) {
     lines.push(`- Input tokens: ${codeSpan(result.input_tokens)}`);
   }
   if ("output_tokens" in result) {
     lines.push(`- Output tokens: ${codeSpan(result.output_tokens)}`);
   }
+
   lines.push("", "Structured artifacts remain authoritative.", "");
   return lines.join("\n");
 }
