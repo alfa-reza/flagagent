@@ -29,22 +29,58 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v6
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
       - name: Configure git identity
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
-      - name: Run opencode
-        
-        uses: anomalyco/opencode/github@774cc7c1914e4329eefde5a669f938b0cf566661 # v1.18.26
+      - name: Install pinned OpenCode
+        env:
+          OPENCODE_VERSION: "1.18.26"
+        run: |
+          set -euo pipefail
 
+          installer="${RUNNER_TEMP}/opencode-install"
+
+          curl \
+            --fail \
+            --silent \
+            --show-error \
+            --location \
+            --proto '=https' \
+            --tlsv1.2 \
+            --retry 3 \
+            "https://raw.githubusercontent.com/anomalyco/opencode/774cc7c1914e4329eefde5a669f938b0cf566661/install" \
+            --output "${installer}"
+
+          bash "${installer}" \
+            --version "${OPENCODE_VERSION}" \
+            --no-modify-path
+
+          installed_version="$(
+            "${HOME}/.opencode/bin/opencode" --version |
+              tail -n 1 |
+              tr -d '\r'
+          )"
+
+          if [ "${installed_version}" != "${OPENCODE_VERSION}" ]; then
+            echo "Expected OpenCode ${OPENCODE_VERSION}, got ${installed_version}" >&2
+            exit 1
+          fi
+
+          echo "${HOME}/.opencode/bin" >> "${GITHUB_PATH}"
+
+      - name: Run OpenCode
         env:
           GITHUB_TOKEN: ${{ github.token }}
+
           OPENCODE_BASE_URL: ${{ secrets.OPENCODE_BASE_URL }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
 
-        with:
-          model: ${{ vars.OPENCODE_MODEL }}
-          use_github_token: true
+          MODEL: ${{ vars.OPENCODE_MODEL }}
+          USE_GITHUB_TOKEN: "true"
+          SHARE: "false"
+
+        run: opencode github run
