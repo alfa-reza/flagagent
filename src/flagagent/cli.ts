@@ -3,6 +3,7 @@ import { lstatSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { AgentLoop } from "./loop.js";
 import { Limits } from "./limits.js";
+import type { Model } from "./model.js";
 import { ExactStringVerifier } from "./tools.js";
 import { DockerExecutor } from "./docker.js";
 import { ChatCompletionsModel } from "./providers/chat.js";
@@ -14,15 +15,15 @@ import {
   SOLVER_PROMPT_VERSION,
 } from "./prompt.js";
 import { writeWriteup } from "./writeup.js";
-
 export const MAX_CHALLENGE_DESCRIPTOR_BYTES = 64 * 1024;
 const PROTOCOL_NAMES = ["openai-chat", "openai-responses", "anthropic"] as const;
 type Protocol = (typeof PROTOCOL_NAMES)[number];
+const USAGE =
+  "usage: flagagent run --challenge DIR --protocol openai-chat|openai-responses|anthropic --model MODEL";
 
 function isIdentifier(value: string): boolean {
   return /^[\p{ID_Start}_][\p{ID_Continue}_]*$/u.test(value);
 }
-
 function requireString(payload: Record<string, unknown>, key: string): string {
   const value = payload[key];
   if (typeof value !== "string" || value.trim().length === 0) {
@@ -30,7 +31,6 @@ function requireString(payload: Record<string, unknown>, key: string): string {
   }
   return value;
 }
-
 export function loadChallenge(challengeDir: string): {
   identity: string;
   description: string;
@@ -43,7 +43,6 @@ export function loadChallenge(challengeDir: string): {
   if (challengeStat.isSymbolicLink() || !challengeStat.isDirectory()) {
     throw new Error("challenge must be a directory");
   }
-
   const descriptorPath = join(challengeDir, "challenge.json");
   const descriptorStat = lstatSync(descriptorPath);
   if (descriptorStat.isSymbolicLink() || !descriptorStat.isFile()) {
@@ -54,7 +53,6 @@ export function loadChallenge(challengeDir: string): {
       `challenge.json exceeds maximum size of ${MAX_CHALLENGE_DESCRIPTOR_BYTES} bytes`,
     );
   }
-
   const data = readFileSync(descriptorPath);
   if (data.byteLength > MAX_CHALLENGE_DESCRIPTOR_BYTES) {
     throw new Error(
@@ -85,7 +83,6 @@ export function loadChallenge(challengeDir: string): {
   if (Object.keys(payload).some((key) => !allowed.has(key))) {
     throw new Error("challenge.json contains unsupported fields");
   }
-
   const identity = requireString(payload, "identity");
   const description = payload.description;
   if (typeof description !== "string") {
@@ -102,7 +99,6 @@ export function loadChallenge(challengeDir: string): {
       throw new TypeError("challenge target_context must be a string");
     }
   }
-
   const filesPath = join(challengeDir, "files");
   let sourceDir: string | undefined;
   try {
@@ -114,7 +110,6 @@ export function loadChallenge(challengeDir: string): {
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
   }
-
   return {
     identity,
     description,
@@ -124,12 +119,9 @@ export function loadChallenge(challengeDir: string): {
     sourceDir,
   };
 }
-
 export async function runCli(argv: string[]): Promise<void> {
   if (argv.length === 0 || argv[0] !== "run") {
-    console.error(
-      "usage: flagagent run --challenge DIR --protocol openai-chat|openai-responses|anthropic --model MODEL",
-    );
+    console.error(USAGE);
     process.exit(2);
   }
   const args = argv.slice(1);
@@ -147,9 +139,7 @@ export async function runCli(argv: string[]): Promise<void> {
   const wallTimeoutRaw = getArg("--wall-timeout-seconds");
   const commandTimeoutRaw = getArg("--command-timeout-seconds");
   if (!challenge || !protocolValue || !model) {
-    console.error(
-      "usage: flagagent run --challenge DIR --protocol openai-chat|openai-responses|anthropic --model MODEL",
-    );
+    console.error(USAGE);
     process.exit(2);
   }
   if (!PROTOCOL_NAMES.includes(protocolValue as Protocol)) {
@@ -168,25 +158,14 @@ export async function runCli(argv: string[]): Promise<void> {
     console.error(`missing API key environment variable: ${keyEnv}`);
     process.exit(2);
   }
-  let modelInst: import("./model.js").Model;
+  const providerOptions = { model, apiKey, baseURL: apiBase };
+  let modelInst: Model;
   if (protocol === "openai-chat")
-    modelInst = new ChatCompletionsModel({
-      model,
-      apiKey,
-      baseURL: apiBase,
-    }) as unknown as import("./model.js").Model;
+    modelInst = new ChatCompletionsModel(providerOptions);
   else if (protocol === "openai-responses")
-    modelInst = new ResponsesModel({
-      model,
-      apiKey,
-      baseURL: apiBase,
-    }) as unknown as import("./model.js").Model;
+    modelInst = new ResponsesModel(providerOptions);
   else if (protocol === "anthropic")
-    modelInst = new AnthropicMessagesModel({
-      model,
-      apiKey,
-      baseURL: apiBase,
-    }) as unknown as import("./model.js").Model;
+    modelInst = new AnthropicMessagesModel(providerOptions);
   else throw new Error(`unsupported protocol: ${protocol}`);
   const limitOverrides: Record<string, number> = {};
   if (maxModelTurnsRaw != null) {
@@ -210,7 +189,7 @@ export async function runCli(argv: string[]): Promise<void> {
   const executor = new DockerExecutor({ networkMode: ch.networkMode });
   const loop = new AgentLoop({
     model: modelInst,
-    executor: executor as unknown as import("./tools.js").Executor,
+    executor,
     verifier: new ExactStringVerifier(ch.expectedFlag),
     challenge: {
       identity: ch.identity,
@@ -245,7 +224,6 @@ export async function runCli(argv: string[]): Promise<void> {
   }
   if (exitCode !== 0) process.exit(exitCode);
 }
-
 {
   let shouldRun = false;
   try {
