@@ -153,9 +153,11 @@ export class AgentLoop {
     reason: string,
     operation: string,
     callId?: string,
+    detail?: string,
   ): { status: string; reason: string; unprocessed: string[] } {
     const payload: Record<string, unknown> = { reason, operation };
     if (callId != null) payload.call_id = callId;
+    if (detail != null) payload.detail = detail;
     this.artifacts.appendEvent("error", payload as Record<string, unknown>);
     return { status: "error", reason, unprocessed: [] };
   }
@@ -502,7 +504,7 @@ export class AgentLoop {
             return r;
           }
           if (e instanceof SandboxError) {
-            const err = this.error("sandbox_error", "sandbox");
+            const err = this.error("sandbox_error", "sandbox", undefined, e.message);
             const r = this.terminal(err.status, err.reason, err.unprocessed);
             terminalWritten = true;
             return r;
@@ -966,7 +968,7 @@ export class AgentLoop {
       if (this.expired())
         return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
       if (e instanceof SandboxError) {
-        const err = this.error("sandbox_error", "sandbox", callId);
+        const err = this.error("sandbox_error", "sandbox", callId, e.message);
         return { status: err.status, reason: err.reason, unprocessed: err.unprocessed };
       }
       const err = this.error("tool_error", "executor", callId);
