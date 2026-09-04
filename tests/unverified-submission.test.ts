@@ -295,6 +295,50 @@ describe("unverified submission", () => {
     }
   });
 
+  it("wall deadline after unverified bookkeeping still wins over submitted", async () => {
+    const tmp = mkdtempSync(join(tmpdir(), "flagagent-"));
+    try {
+      let loopRef: AgentLoop | null = null;
+      const monotonic = () => {
+        const subs =
+          (loopRef as unknown as { flagSubmissions?: number } | null)
+            ?.flagSubmissions ?? 0;
+        return subs > 0 ? 1000 : 0;
+      };
+      const loop = new AgentLoop({
+        model: new ScriptedModel([
+          new ModelResponse("", [
+            new ToolCall("c1", "submit_flag", { candidate: "  Flag{x}  " }),
+          ]),
+        ]) as never,
+        executor: { execute: async () => new ShellResult("ok", "", 0, false) } as never,
+        verifier: null,
+        challenge: { identity: "fixture", description: "test" },
+        limits: new Limits({
+          maxModelTurns: 5,
+          wallTimeoutSeconds: 5,
+          commandTimeoutSeconds: 10,
+        }),
+        runsRoot: tmp,
+        monotonic,
+        utcNow: () => NOW,
+        runId: "FA-20260814T161530Z-a13f4c2d",
+      });
+      loopRef = loop;
+      const result = await loop.run();
+      expect(result["status:reason"]).toBe("unsolved:wall_limit");
+      expect("candidate_flag" in result).toBe(false);
+      const events = readEvents(
+        (loop as unknown as { artifacts: { eventsPath: string } }).artifacts.eventsPath,
+      );
+      expect(events.filter((e) => e.type === "flag_submission").length).toBe(1);
+      expect(events.filter((e) => e.type === "tool_result").length).toBe(1);
+      expect(events.filter((e) => e.type === "verifier_result").length).toBe(0);
+    } finally {
+      rmSync(tmp, { recursive: true, force: true });
+    }
+  });
+
   it("expected-flag isolation preserved", async () => {
     const tmp = mkdtempSync(join(tmpdir(), "flagagent-"));
     const SENTINEL = "Flag{SENTINEL_9f3a_isolation}";
@@ -332,7 +376,7 @@ describe("unverified submission", () => {
     }
   });
 
-  it("runtime reachable without verifier via loader and loop", async () => {
+  it("loader omits verifier and loop accepts absent verifier", async () => {
     const dir = makeChallengeDir({
       identity: "u",
       description: "d",
