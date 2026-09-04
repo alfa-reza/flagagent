@@ -61,8 +61,8 @@ jobs:
 
           installed_version="$(
             "${HOME}/.opencode/bin/opencode" --version |
-              tail -n 1 |
-              tr -d '\r'
+            tail -n 1 |
+            tr -d '\r'
           )"
 
           if [ "${installed_version}" != "${OPENCODE_VERSION}" ]; then
@@ -75,12 +75,9 @@ jobs:
       - name: Run OpenCode
         env:
           GITHUB_TOKEN: ${{ github.token }}
-
           OPENCODE_BASE_URL: ${{ secrets.OPENCODE_BASE_URL }}
           OPENCODE_API_KEY: ${{ secrets.OPENCODE_API_KEY }}
-
           MODEL: ${{ vars.OPENCODE_MODEL }}
           USE_GITHUB_TOKEN: "true"
           SHARE: "false"
-
-        run: opencode github run
+        run: opencode --print-logs --log-level DEBUG github run
