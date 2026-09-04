@@ -35,7 +35,7 @@ function requireString(payload: Record<string, unknown>, key: string): string {
 export function loadChallenge(challengeDir: string): {
   identity: string;
   description: string;
-  expectedFlag: string;
+  expectedFlag?: string;
   networkMode: "none" | "local";
   targetContext?: string;
   sourceDir?: string;
@@ -92,7 +92,14 @@ export function loadChallenge(challengeDir: string): {
   if (typeof description !== "string") {
     throw new TypeError("challenge descriptor requires string description");
   }
-  const expectedFlag = requireString(payload, "expected_flag");
+  const expectedRaw = payload.expected_flag;
+  let expectedFlag: string | undefined;
+  if (expectedRaw !== undefined) {
+    if (typeof expectedRaw !== "string" || expectedRaw.trim().length === 0) {
+      throw new Error("challenge descriptor requires non-empty expected_flag");
+    }
+    expectedFlag = expectedRaw;
+  }
   const networkMode = payload.network_mode;
   if (networkMode !== "none" && networkMode !== "local") {
     throw new Error("challenge network_mode must be none or local");
@@ -215,7 +222,8 @@ export async function runCli(argv: string[]): Promise<void> {
   const loop = new AgentLoop({
     model: modelInst,
     executor,
-    verifier: new ExactStringVerifier(ch.expectedFlag),
+    verifier:
+      ch.expectedFlag !== undefined ? new ExactStringVerifier(ch.expectedFlag) : null,
     challenge: {
       identity: ch.identity,
       description: ch.description,

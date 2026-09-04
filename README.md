@@ -11,7 +11,7 @@
 
 FlagAgent gives a language model a small interface for solving security challenges: run commands in a contained environment, inspect the results, and submit a candidate flag.
 
-A challenge only counts as solved when the trusted verifier accepts a submitted flag. Each run is recorded so the model's actions and the final result can be inspected afterwards.
+A challenge only counts as solved when the trusted verifier accepts a submitted flag. When no verifier is configured, the final candidate is recorded as submitted without verification. Each run is recorded so the model's actions and the final result can be inspected afterwards.
 
 > [!IMPORTANT]
 > FlagAgent is intended for CTFs, security labs, benchmarks, and systems you are explicitly authorized to test. Do not use it against systems without permission.
@@ -35,9 +35,9 @@ Run Artifacts
 The agent has two tools:
 
 - `shell` runs a command inside the Docker sandbox and returns its result.
-- `submit_flag` sends a candidate to the trusted verifier.
+- `submit_flag` submits a candidate for verification when a verifier exists, otherwise as the final submission.
 
-Only a verifier-accepted submission marks the run as solved.
+Only a verifier-accepted submission marks the run as solved. A submission without a verifier terminates as `submitted:unverified_flag` and is never treated as solved.
 
 ## Quick start
 
@@ -98,11 +98,11 @@ FlagAgent prints the run directory and terminal result when the attempt finishes
 
 FlagAgent currently exposes three protocol paths:
 
-| CLI value | Protocol |
-| --- | --- |
-| `openai-chat` | OpenAI-compatible Chat Completions |
-| `openai-responses` | OpenAI Responses |
-| `anthropic` | Anthropic Messages |
+| CLI value          | Protocol                           |
+| ------------------ | ---------------------------------- |
+| `openai-chat`      | OpenAI-compatible Chat Completions |
+| `openai-responses` | OpenAI Responses                   |
+| `anthropic`        | Anthropic Messages                 |
 
 `--api-base` can point an adapter at a compatible endpoint, while `--api-key-env` selects the environment variable containing its API key.
 
@@ -135,7 +135,7 @@ my-challenge/
     └── evidence.bin
 ```
 
-A minimal descriptor looks like this:
+A minimal known-answer descriptor looks like this:
 
 ```json
 {
@@ -145,6 +145,18 @@ A minimal descriptor looks like this:
   "network_mode": "none"
 }
 ```
+
+An unknown-answer descriptor omits `expected_flag`:
+
+```json
+{
+  "identity": "my-challenge",
+  "description": "Inspect the evidence and submit the flag.",
+  "network_mode": "none"
+}
+```
+
+When present, `expected_flag` must be a non-empty string. A run with a verifier terminates a correct candidate as `solved:verified_flag`; a run without a verifier terminates the first valid `submit_flag` as `submitted:unverified_flag` with the `trim()`-normalized `candidate_flag` in `result.json`. No `verifier_result` is emitted when no verifier ran.
 
 Then run it like any other challenge:
 
@@ -173,13 +185,13 @@ They exercise the harness itself; they are not a benchmark of general CTF capabi
 
 Challenge source ingestion is bounded before sandbox preparation:
 
-| Limit | Default |
-| --- | --- |
-| Maximum individual source file size | 10 MiB |
-| Maximum aggregate source content | 50 MiB |
-| Maximum regular source files | 1024 |
-| Maximum source entries | 2048 |
-| Maximum directory depth | 16 |
+| Limit                               | Default |
+| ----------------------------------- | ------- |
+| Maximum individual source file size | 10 MiB  |
+| Maximum aggregate source content    | 50 MiB  |
+| Maximum regular source files        | 1024    |
+| Maximum source entries              | 2048    |
+| Maximum directory depth             | 16      |
 
 A challenge source exceeding these limits is rejected as `error:invalid_challenge_source` before sandbox preparation or model execution.
 
@@ -218,15 +230,15 @@ runs/<run-id>/
 └── workspace/
 ```
 
-| Path | Purpose |
-| --- | --- |
-| `run.json` | Run configuration and provenance |
+| Path           | Purpose                                     |
+| -------------- | ------------------------------------------- |
+| `run.json`     | Run configuration and provenance            |
 | `events.jsonl` | Model, tool, verifier, and lifecycle events |
-| `result.json` | Authoritative terminal result |
-| `writeup.md` | Human-readable summary derived from the run |
-| `workspace/` | Writable workspace used by the agent |
+| `result.json`  | Authoritative terminal result               |
+| `writeup.md`   | Human-readable summary derived from the run |
+| `workspace/`   | Writable workspace used by the agent        |
 
-`result.json` distinguishes `solved`, `unsolved`, and `error`, so a solver failure is separate from a harness or infrastructure failure.
+`result.json` distinguishes `solved`, `submitted`, `unsolved`, and `error`, so a solver failure is separate from a harness or infrastructure failure. `submitted:unverified_flag` records the final unverified `candidate_flag`; it never means verified, correct, or solved.
 
 ## Security model
 

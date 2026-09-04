@@ -34,7 +34,8 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
   },
   {
     name: "submit_flag",
-    description: "Submit one candidate flag for authoritative verification.",
+    description:
+      "Submit one candidate flag for verification when available, otherwise as the final submission.",
     parameters: {
       type: "object",
       properties: { candidate: { type: "string" } },

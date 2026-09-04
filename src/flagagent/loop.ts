@@ -39,7 +39,7 @@ export interface AgentLoopOptions {
       Record<string, unknown> | Promise<Record<string, unknown>>;
     sandboxLifecycle?: () => Record<string, unknown>;
   };
-  verifier: Verifier;
+  verifier?: Verifier | null;
   challenge: ChallengeInput;
   limits: Limits;
   runsRoot: string;
@@ -72,7 +72,7 @@ function utcTimestamp(value: Date): string {
 export class AgentLoop {
   private model: Model;
   private executor: AgentLoopOptions["executor"];
-  private verifier: Verifier;
+  private verifier: Verifier | null;
   private challenge: ChallengeInput;
   private limits: Limits;
   private runsRoot: string;
@@ -105,7 +105,7 @@ export class AgentLoop {
   constructor(options: AgentLoopOptions) {
     this.model = options.model;
     this.executor = options.executor;
-    this.verifier = options.verifier;
+    this.verifier = options.verifier ?? null;
     this.challenge = options.challenge;
     this.limits = options.limits;
     this.runsRoot = options.runsRoot;
@@ -202,6 +202,7 @@ export class AgentLoop {
     status: string,
     reason: string,
     unprocessed: string[],
+    candidateFlag?: string,
   ): Record<string, unknown> {
     this.artifacts.appendEvent("terminal_decision", {
       status,
@@ -210,6 +211,7 @@ export class AgentLoop {
       unprocessed_call_ids: unprocessed,
     } as Record<string, unknown>);
     const result = this.buildResult(status, reason);
+    if (candidateFlag != null) result.candidate_flag = candidateFlag;
     this.artifacts.commitResult(result as Record<string, unknown>);
     return result;
   }
@@ -543,7 +545,12 @@ export class AgentLoop {
       const active = await this.runActive();
       // If runActive returned wall_limit directly, terminal handles it
       try {
-        const result = this.terminal(active.status, active.reason, active.unprocessed);
+        const result = this.terminal(
+          active.status,
+          active.reason,
+          active.unprocessed,
+          active.candidateFlag,
+        );
         terminalWritten = true;
         return result;
       } catch (e) {
@@ -611,6 +618,7 @@ export class AgentLoop {
     status: string;
     reason: string;
     unprocessed: string[];
+    candidateFlag?: string;
   }> {
     while (true) {
       if (this.expired())
@@ -848,9 +856,12 @@ export class AgentLoop {
     return null;
   }
 
-  private async dispatch(
-    response: ModelResponse,
-  ): Promise<{ status: string; reason: string; unprocessed: string[] } | null> {
+  private async dispatch(response: ModelResponse): Promise<{
+    status: string;
+    reason: string;
+    unprocessed: string[];
+    candidateFlag?: string;
+  } | null> {
     const calls = response.toolCalls;
     for (let index = 0; index < calls.length; index++) {
       const call = calls[index]!;
@@ -899,20 +910,30 @@ export class AgentLoop {
         }
         continue;
       }
-      let terminal: { status: string; reason: string; unprocessed: string[] } | null =
-        null;
+      let terminal: {
+        status: string;
+        reason: string;
+        unprocessed: string[];
+        candidateFlag?: string;
+      } | null = null;
       if (call.name === "shell") {
         terminal = await this.shell(call.callId, args.command);
       } else {
         terminal = await this.submit(call.callId, args.candidate);
       }
       if (terminal != null) {
-        if (terminal.status === "solved" && terminal.reason === "verified_flag") {
+        if (
+          (terminal.status === "solved" && terminal.reason === "verified_flag") ||
+          (terminal.status === "submitted" && terminal.reason === "unverified_flag")
+        ) {
           const remaining = calls.slice(index + 1).map((c) => c.callId);
           return {
             status: terminal.status,
             reason: terminal.reason,
             unprocessed: remaining,
+            ...(terminal.candidateFlag != null
+              ? { candidateFlag: terminal.candidateFlag }
+              : {}),
           };
         }
         return terminal;
@@ -924,7 +945,12 @@ export class AgentLoop {
   private async shell(
     callId: string,
     command: string,
-  ): Promise<{ status: string; reason: string; unprocessed: string[] } | null> {
+  ): Promise<{
+    status: string;
+    reason: string;
+    unprocessed: string[];
+    candidateFlag?: string;
+  } | null> {
     if (this.expired() || this.remaining() <= 0) {
       return { status: "unsolved", reason: "wall_limit", unprocessed: [callId] };
     }
@@ -979,7 +1005,12 @@ export class AgentLoop {
   private async submit(
     callId: string,
     candidate: string,
-  ): Promise<{ status: string; reason: string; unprocessed: string[] } | null> {
+  ): Promise<{
+    status: string;
+    reason: string;
+    unprocessed: string[];
+    candidateFlag?: string;
+  } | null> {
     if (this.expired()) {
       return { status: "unsolved", reason: "wall_limit", unprocessed: [callId] };
     }
@@ -992,6 +1023,17 @@ export class AgentLoop {
       candidate: stripped,
     } as Record<string, unknown>);
     this.flagSubmissions += 1;
+    if (this.verifier == null) {
+      this.toolResult(callId, "submit_flag", { outcome: "submitted" }, true);
+      if (this.expired())
+        return { status: "unsolved", reason: "wall_limit", unprocessed: [] };
+      return {
+        status: "submitted",
+        reason: "unverified_flag",
+        unprocessed: [],
+        candidateFlag: stripped,
+      };
+    }
     let outcome: string;
     try {
       if (this.expired()) {
