@@ -7,6 +7,7 @@ import {
   SandboxError,
   Verifier,
   TOOL_DEFINITIONS,
+  buildToolDefinitions,
   normalizeShellResult,
   validateToolArguments,
   UnknownToolError,
@@ -138,6 +139,28 @@ export class AgentLoop {
         .digest("hex");
       if (this.promptSha256 !== expected)
         throw new Error("prompt_sha256 does not match system_prompt");
+    }
+  }
+
+  private executionContract(): string {
+    const network =
+      this.challenge.networkMode === "local"
+        ? "local. Only the run-scoped internal challenge network is available; there is no external Internet access."
+        : "none. No challenge network or external Internet access is available.";
+    return (
+      `Execution constraints:\n` +
+      `- Network mode: ${network}\n` +
+      `- Per-command timeout: ${this.limits.commandTimeoutSeconds} seconds.\n` +
+      `- Overall Run timeout: ${this.limits.wallTimeoutSeconds} seconds.\n` +
+      `- Maximum model turns: ${this.limits.maxModelTurns}.`
+    );
+  }
+
+  private toolDefinitions(): Record<string, unknown>[] {
+    try {
+      return buildToolDefinitions(this.limits) as unknown as Record<string, unknown>[];
+    } catch {
+      return TOOL_DEFINITIONS as unknown as Record<string, unknown>[];
     }
   }
 
@@ -350,6 +373,7 @@ export class AgentLoop {
     let userContent = this.challenge.description;
     if (this.challenge.targetContext)
       userContent = `${userContent}\n\nTarget context:\n${this.challenge.targetContext}`;
+    userContent = `${userContent}\n\n${this.executionContract()}`;
     this.messages = [];
     if (this.systemPrompt != null)
       this.messages.push({ role: "system", content: this.systemPrompt });
@@ -825,7 +849,7 @@ export class AgentLoop {
     // For determinism with fakes, just await.
     const result = this.model.generate(
       this.messages as unknown as Record<string, unknown>[],
-      TOOL_DEFINITIONS as unknown as Record<string, unknown>[],
+      this.toolDefinitions(),
     );
     // Support both sync and async return
     return await result;
