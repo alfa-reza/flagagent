@@ -45,6 +45,33 @@ export const TOOL_DEFINITIONS: readonly ToolDefinition[] = [
   },
 ];
 
+export function buildToolDefinitions(limits: {
+  commandTimeoutSeconds: number;
+}): ToolDefinition[] {
+  return [
+    {
+      name: "shell",
+      description: `Run one non-interactive shell command. Each command is terminated after ${limits.commandTimeoutSeconds} seconds.`,
+      parameters: {
+        type: "object",
+        properties: { command: { type: "string" } },
+        required: ["command"],
+        additionalProperties: false,
+      },
+    },
+    {
+      name: "submit_flag",
+      description:
+        "Submit one candidate flag for verification when available, otherwise as the final submission.",
+      parameters: {
+        type: "object",
+        properties: { candidate: { type: "string" } },
+        required: ["candidate"],
+        additionalProperties: false,
+      },
+    },
+  ];
+}
 export class UnknownToolError extends Error {
   constructor(name: string) {
     super(name);
