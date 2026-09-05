@@ -347,7 +347,7 @@ export class AgentLoop {
     }
 
     // Build messages
-    let userContent = this.challenge.description;
+    let userContent = `Challenge:\n${this.challenge.identity}\n\nDescription:\n${this.challenge.description}`;
     if (this.challenge.targetContext)
       userContent = `${userContent}\n\nTarget context:\n${this.challenge.targetContext}`;
     this.messages = [];
@@ -356,7 +356,6 @@ export class AgentLoop {
     this.messages.push({
       role: "user",
       content: userContent,
-      challenge_identity: this.challenge.identity,
     });
 
     this.started = this.monotonic();
