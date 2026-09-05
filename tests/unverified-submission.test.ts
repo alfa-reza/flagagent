@@ -83,14 +83,23 @@ describe("descriptor optional expected_flag", () => {
       network_mode: "none",
     });
     try {
-      expect(loadChallenge(dir3).expectedFlag).toBe("  Flag{spaced}  ");
+      expect(() => loadChallenge(dir3)).toThrow(/leading or trailing whitespace/);
     } finally {
       rmSync(join(dir3, ".."), { recursive: true, force: true });
     }
   });
 
   it("invalid present values rejected", () => {
-    for (const bad of ["", "   ", null, 123]) {
+    for (const bad of [
+      "",
+      "   ",
+      " Flag{known}",
+      "Flag{known} ",
+      "\nFlag{known}\n",
+      "\tFlag{known}\t",
+      null,
+      123,
+    ]) {
       const dir = makeChallengeDir({
         identity: "x",
         description: "d",

@@ -156,7 +156,7 @@ An unknown-answer descriptor omits `expected_flag`:
 }
 ```
 
-When present, `expected_flag` must be a non-empty string. A run with a verifier terminates a correct candidate as `solved:verified_flag`; a run without a verifier terminates the first valid `submit_flag` as `submitted:unverified_flag` with the `trim()`-normalized `candidate_flag` in `result.json`. No `verifier_result` is emitted when no verifier ran.
+When present, `expected_flag` must be a non-empty string without leading or trailing whitespace. A run with a verifier terminates a correct candidate as `solved:verified_flag`; a run without a verifier terminates the first valid `submit_flag` as `submitted:unverified_flag` with the `trim()`-normalized `candidate_flag` in `result.json`. No `verifier_result` is emitted when no verifier ran.
 
 Then run it like any other challenge:
 

@@ -98,6 +98,11 @@ export function loadChallenge(challengeDir: string): {
     if (typeof expectedRaw !== "string" || expectedRaw.trim().length === 0) {
       throw new Error("challenge descriptor requires non-empty expected_flag");
     }
+    if (expectedRaw !== expectedRaw.trim()) {
+      throw new Error(
+        "challenge descriptor requires expected_flag without leading or trailing whitespace",
+      );
+    }
     expectedFlag = expectedRaw;
   }
   const networkMode = payload.network_mode;
