@@ -14,7 +14,6 @@
 # The harness runs this as a numeric host UID:GID with --cap-drop ALL,
 # no-new-privileges, 2g/2cpu/pids 256, network none/internal, -w /workspace.
 # Test under those exact constraints, never with a plain `docker run`.
-
 # 1) Rust tools. Same Kali base as runtime keeps glibc compatible.
 # Versions pinned; cargo verifies registry checksums. yara-x-cli (not the
 # `yara-x` crate) provides the `yr` binary.
@@ -25,14 +24,13 @@ RUN set -eux; \
     apt-get install --no-install-recommends --yes cargo pkg-config libssl-dev; \
     rm -rf /var/lib/apt/lists/*
 RUN set -eux; \
-    cargo install --root /opt/rust-out --version 1.20.0 yara-x-cli; \
+    cargo install --root /opt/rust-out --git https://github.com/VirusTotal/yara-x.git --tag v1.20.0 --locked yara-x-cli; \
     cargo install --root /opt/rust-out --version 3.3.3 pwninit; \
     cargo install --root /opt/rust-out --version 0.0.9 checksec; \
     cargo install --root /opt/rust-out --version 0.2.26 ropr; \
     cargo install --root /opt/rust-out --version 4.3.2 x8; \
     cargo install --root /opt/rust-out --version 0.12.0 ciphey; \
     ls /opt/rust-out/bin
-
 # 2) Go tools. The SDK is purged afterwards so it never reaches runtime.
 FROM kalilinux/kali-rolling@sha256:c6d78f57ebfdd9fec428a8b04f74876e66fddd08dfd328c076224a552e7332a3 AS go-builder
 ARG DEBIAN_FRONTEND=noninteractive
@@ -42,7 +40,6 @@ RUN set -eux; \
     rm -rf /var/lib/apt/lists/*; \
     GOBIN=/opt/go-out go install github.com/wader/fq@v0.18.0; \
     ls /opt/go-out/bin
-
 # 3) Native tools. Every source is pinned to a full commit SHA; the rev-parse
 # guard fails the build on drift instead of silently tracking HEAD.
 FROM kalilinux/kali-rolling@sha256:c6d78f57ebfdd9fec428a8b04f74876e66fddd08dfd328c076224a552e7332a3 AS native-builder
@@ -87,7 +84,7 @@ RUN set -eux; \
     make -C /tmp/hash_extender -j"$(nproc)"; \
     install -m0755 /tmp/hash_extender/hash_extender /opt/stage/bin/hash_extender; \
     rm -rf /tmp/hash_extender
-# Official YAFU build: cp config.mk.example config.mk && make yafu.
+# Official YAFU build: cp config.mk.example config.mk and make yafu.
 RUN set -eux; \
     git init -q /tmp/yafu; \
     git -C /tmp/yafu fetch --depth=1 --no-tags https://github.com/bbuhrow/yafu.git 825c5db3f9f6d141bde88f67571479a96c9cd35b; \
@@ -98,7 +95,6 @@ RUN set -eux; \
     make -C /tmp/yafu yafu -j"$(nproc)"; \
     install -m0755 /tmp/yafu/yafu /opt/stage/bin/yafu; \
     rm -rf /tmp/yafu
-
 # 4) Runtime. Per-category layers: one bad package name fails one layer,
 # never the whole install.
 FROM kalilinux/kali-rolling@sha256:c6d78f57ebfdd9fec428a8b04f74876e66fddd08dfd328c076224a552e7332a3
@@ -106,12 +102,10 @@ LABEL flagagent.managed=true \
       flagagent.version=0.2.0 \
       flagagent.profile=head
 ARG DEBIAN_FRONTEND=noninteractive
-
 # Non-root user matching the old image; the harness overrides it at runtime
 # with the invoking host UID:GID, so this only sets workspace ownership.
 RUN groupadd --gid 1000 agent \
     && useradd --uid 1000 --gid 1000 --create-home --shell /bin/bash agent
-
 # ---- APT: one category per layer ----
 RUN set -eux; \
     apt-get update; \
@@ -187,7 +181,6 @@ RUN set -eux; \
     apt-get update; \
     apt-get install --no-install-recommends --yes apkid androguard redis-tools; \
     rm -rf /var/lib/apt/lists/*
-
 # 5) Builder artifacts into place (bin->bin, lib->lib, then ldconfig).
 COPY --from=rust-builder /opt/rust-out/bin/ /usr/local/bin/
 COPY --from=go-builder /opt/go-out/bin/ /usr/local/bin/
@@ -196,7 +189,6 @@ COPY --from=native-builder /opt/stage/usr/bin/ /usr/local/bin/
 COPY --from=native-builder /opt/stage/usr/lib/ /usr/local/lib/
 COPY --from=native-builder /opt/stage/sha/ /opt/build-sha/
 RUN set -eux; ldconfig; chmod 0755 /usr/local/bin/*; ls /usr/local/bin
-
 # 6) Project-owned venv. --system-site-packages keeps the venv python aware
 # of APT libraries (pwntools, z3, impacket) while venv entry points
 # (RsaCtfTool, xortool, floss) win on PATH. Without it the venv is blind.
@@ -209,10 +201,8 @@ RUN set -eux; \
         requests termcolor beautifulsoup4 PySocks dulwich requests-pkcs12; \
     chmod -R a+rX /opt/flagagent-py
 ENV PATH="/opt/flagagent-py/bin:/usr/local/bin:/usr/bin:/bin"
-
 # 7) Ruby gems (pure-Ruby tools, no native build risk).
 RUN set -eux; gem install --no-document zsteg seccomp-tools one_gadget
-
 # 8) Pinned manual sources (git fetch by SHA + rev-parse guard, BUILD_SHA receipt).
 # RsaCtfTool has no release: install the pinned commit as a package so the
 # rsacrack/RsaCtfTool entry points exist (a bare symlink no longer works).
@@ -265,7 +255,6 @@ RUN set -eux; \
     chmod -R a+rX /opt/DidierStevensSuite /opt/jwt_tool /opt/git-dumper
 # Gopherus is intentionally excluded: upstream is Python 2 and Python 2 will
 # not be installed for a single tool (same rule excluded tplmap).
-
 # 9) nuclei-templates pinned to a release SHA (never -update-templates:
 # the rule corpus must not drift between rebuilds).
 RUN set -eux; \
@@ -276,7 +265,6 @@ RUN set -eux; \
     echo "e5f19e6144135e107962bb943231413796fd7fe7 (tag v10.4.8)" > /opt/build-sha/nuclei-templates.BUILD_SHA; \
     test "$(find /opt/nuclei-templates -name '*.yaml' | wc -l)" -gt 1000; \
     chmod -R a+rX /opt/nuclei-templates
-
 # 10) Agent manifest: concrete invocations, one per line. This is the single
 # source of truth shared with the health-check below.
 RUN set -eux; \
@@ -317,7 +305,6 @@ RUN set -eux; \
     api v1 v2 login dashboard uploads files images assets static backup.zip \
     .git flag.txt flag robots.txt sitemap.xml config.php info.php \
     > /usr/share/wordlists/flagagent-common.txt
-
 # 11) Fail-closed verification: presence sweep plus functional smoke tests.
 # A missing binary or a failing tool breaks the build — never a silent gap.
 RUN set -eux; \
@@ -360,13 +347,12 @@ RUN set -eux; \
     ciphey --help > /dev/null; ropr --help > /dev/null; \
     pwninit --help > /dev/null; x8 --help > /dev/null; \
     gdb --batch -nx -ex 'source /opt/pwndbg/gdbinit.py' -ex quit /bin/true; \
-    yafu 'factor(91)' | grep -qE '\b(7|13)\b'; \
+    yafu 'factor(91)' | grep -qE '\\b(7|13)\\b'; \
     hashcat -I > /dev/null; \
     john --list=formats | grep -q raw-md5; \
     nuclei --version; \
     rm -f /tmp/t.yar /tmp/s.bin /tmp/t.pcap /tmp/unblob.deps; \
     echo SMOKE-OK
-
 RUN set -eux; \
     for b in flatter bkcrack hash_extender yafu RsaCtfTool yr fq checksec ropr pwninit; do \
         ldd "$(command -v "$b")" 2>/dev/null | grep 'not found' && exit 1 || true; \
