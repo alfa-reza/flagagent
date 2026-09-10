@@ -14,34 +14,88 @@
 # The harness runs this as a numeric host UID:GID with --cap-drop ALL,
 # no-new-privileges, 2g/2cpu/pids 256, network none/internal, -w /workspace.
 # Test under those exact constraints, never with a plain `docker run`.
-# 1) Rust tools. Same Kali base as runtime keeps glibc compatible.
-# Versions pinned; cargo verifies registry checksums. yara-x-cli (not the
-# `yara-x` crate) provides the `yr` binary.
-FROM kalilinux/kali-rolling@sha256:c6d78f57ebfdd9fec428a8b04f74876e66fddd08dfd328c076224a552e7332a3 AS rust-builder
+# 1) Prebuilt upstream tools — no Cargo/crates.io in the image build.
+# Current GitHub Actions image is amd64; these pinned release assets are the
+# amd64 artifacts verified below. Keep this stage isolated from the runtime.
+FROM kalilinux/kali-rolling@sha256:c6d78f57ebfdd9fec428a8b04f74876e66fddd08dfd328c076224a552e7332a3 AS release-builder
 ARG DEBIAN_FRONTEND=noninteractive
 RUN set -eux; \
+    test "$(dpkg --print-architecture)" = amd64; \
     apt-get update; \
-    apt-get install --no-install-recommends --yes cargo pkg-config libssl-dev ca-certificates; \
-    update-ca-certificates; \
-    test -s /etc/ssl/certs/ca-certificates.crt; \
-    rm -rf /var/lib/apt/lists/*
+    apt-get install --no-install-recommends --yes ca-certificates curl gzip tar dpkg; \
+    rm -rf /var/lib/apt/lists/*; \
+    mkdir -p /opt/release/bin
+# Use official release artifacts where upstream publishes them. Every artifact
+# that provides a release checksum is verified before installation.
+#
+# YARA-X: official x86_64 Linux release tarball; installs the `yr` CLI.
 RUN set -eux; \
-    cargo install --root /opt/rust-out --git https://github.com/VirusTotal/yara-x.git --tag v1.20.0 --locked yara-x-cli; \
-    cargo install --root /opt/rust-out --version 3.3.3 pwninit; \
-    cargo install --root /opt/rust-out --version 0.0.9 checksec; \
-    cargo install --root /opt/rust-out --version 0.2.26 ropr; \
-    cargo install --root /opt/rust-out --version 4.3.2 x8; \
-    cargo install --root /opt/rust-out --version 0.12.0 ciphey; \
-    ls /opt/rust-out/bin
-# 2) Go tools. The SDK is purged afterwards so it never reaches runtime.
+    tmp="$(mktemp -d)"; \
+    curl -fsSL "https://github.com/VirusTotal/yara-x/releases/download/v1.20.0/yara-x-v1.20.0-x86_64-unknown-linux-gnu.tar.gz" \
+        -o "$tmp/yara-x.tar.gz"; \
+    echo "cabb8df46492fff59c51261302c71ed9cb2cef393d3f0ca560801a34a8e24cbe  $tmp/yara-x.tar.gz" \
+        | sha256sum -c -; \
+    tar -xzf "$tmp/yara-x.tar.gz" -C "$tmp"; \
+    yr_bin="$(find "$tmp" -type f -name yr -perm -111 -print -quit)"; \
+    test -n "$yr_bin"; \
+    install -m0755 "$yr_bin" /opt/release/bin/yr; \
+    rm -rf "$tmp"; \
+    /opt/release/bin/yr --version
+# pwninit: official statically linked musl release binary.
+RUN set -eux; \
+    curl -fsSL "https://github.com/io12/pwninit/releases/download/3.3.3/pwninit" \
+        -o /opt/release/bin/pwninit; \
+    echo "f124b6645b01b0fc4adacabe61438fe73eef517dc3e4696a08e1250a8f47eec3  /opt/release/bin/pwninit" \
+        | sha256sum -c -; \
+    chmod 0755 /opt/release/bin/pwninit; \
+    /opt/release/bin/pwninit --help >/dev/null
+# checksec: maintained upstream release, shipped as a self-contained Debian package.
+RUN set -eux; \
+    tmp="$(mktemp -d)"; \
+    curl -fsSL "https://github.com/slimm609/checksec/releases/download/3.1.0/checksec_3.1.0_amd64.deb" \
+        -o "$tmp/checksec.deb"; \
+    echo "6d1b6cdc69b567ef7f16ebbe259af37594f93fbbd6a963eb37597898e86d13d5  $tmp/checksec.deb" \
+        | sha256sum -c -; \
+    dpkg-deb -x "$tmp/checksec.deb" "$tmp/checksec-root"; \
+    install -m0755 "$tmp/checksec-root/usr/bin/checksec" /opt/release/bin/checksec; \
+    rm -rf "$tmp"; \
+    /opt/release/bin/checksec --help >/dev/null
+# x8: upstream publishes an x86_64 Linux release binary. v4.3.0 is the
+# release asset confirmed upstream; do not claim the cargo-only 4.3.2 as a
+# release binary when it is not published on the Releases page.
+RUN set -eux; \
+    tmp="$(mktemp -d)"; \
+    curl -fsSL "https://github.com/Sh1Yo/x8/releases/download/v4.3.0/x86_64-linux-x8.gz" \
+        | gzip -dc > "$tmp/x8"; \
+    test -s "$tmp/x8"; \
+    install -m0755 "$tmp/x8" /opt/release/bin/x8; \
+    rm -rf "$tmp"; \
+    /opt/release/bin/x8 --help >/dev/null
+# Ciphey: official Linux x86_64 release tarball plus upstream checksum file.
+RUN set -eux; \
+    tmp="$(mktemp -d)"; \
+    curl -fsSL "https://github.com/bee-san/Ciphey/releases/download/v0.12.1/ciphey-linux-x86_64.tar.gz" \
+        -o "$tmp/ciphey.tar.gz"; \
+    curl -fsSL "https://github.com/bee-san/Ciphey/releases/download/v0.12.1/ciphey-linux-x86_64.tar.gz.sha256" \
+        -o "$tmp/ciphey.tar.gz.sha256"; \
+    sed "s#ciphey-linux-x86_64.tar.gz#$tmp/ciphey.tar.gz#" "$tmp/ciphey.tar.gz.sha256" \
+        | sha256sum -c -; \
+    tar -xzf "$tmp/ciphey.tar.gz" -C "$tmp"; \
+    ciphey_bin="$(find "$tmp" -type f -name ciphey -perm -111 -print -quit)"; \
+    test -n "$ciphey_bin"; \
+    install -m0755 "$ciphey_bin" /opt/release/bin/ciphey; \
+    rm -rf "$tmp"; \
+    /opt/release/bin/ciphey --help >/dev/null
+# 2) Go tools. GOBIN is the directory containing the output binary.
 FROM kalilinux/kali-rolling@sha256:c6d78f57ebfdd9fec428a8b04f74876e66fddd08dfd328c076224a552e7332a3 AS go-builder
 ARG DEBIAN_FRONTEND=noninteractive
 RUN set -eux; \
     apt-get update; \
     apt-get install --no-install-recommends --yes golang-go ca-certificates; \
     rm -rf /var/lib/apt/lists/*; \
-    GOBIN=/opt/go-out go install github.com/wader/fq@v0.18.0; \
-    ls /opt/go-out/bin
+    mkdir -p /opt/go-out/bin; \
+    GOBIN=/opt/go-out/bin go install github.com/wader/fq@v0.18.0; \
+    test -x /opt/go-out/bin/fq
 # 3) Native tools. Every source is pinned to a full commit SHA; the rev-parse
 # guard fails the build on drift instead of silently tracking HEAD.
 FROM kalilinux/kali-rolling@sha256:c6d78f57ebfdd9fec428a8b04f74876e66fddd08dfd328c076224a552e7332a3 AS native-builder
@@ -184,7 +238,7 @@ RUN set -eux; \
     apt-get install --no-install-recommends --yes apkid androguard redis-tools; \
     rm -rf /var/lib/apt/lists/*
 # 5) Builder artifacts into place (bin->bin, lib->lib, then ldconfig).
-COPY --from=rust-builder /opt/rust-out/bin/ /usr/local/bin/
+COPY --from=release-builder /opt/release/bin/ /usr/local/bin/
 COPY --from=go-builder /opt/go-out/bin/ /usr/local/bin/
 COPY --from=native-builder /opt/stage/bin/ /usr/local/bin/
 COPY --from=native-builder /opt/stage/usr/bin/ /usr/local/bin/
@@ -197,7 +251,7 @@ RUN set -eux; ldconfig; chmod 0755 /usr/local/bin/*; ls /usr/local/bin
 RUN set -eux; \
     python3 -m venv --system-site-packages /opt/flagagent-py; \
     /opt/flagagent-py/bin/pip install --no-cache-dir \
-        xortool randcrack keystone-engine flare-floss volatility3 \
+        xortool randcrack keystone-engine flare-floss volatility3 ropper \
         jefferson ubi-reader \
         cprint pycryptodomex ratelimit \
         requests termcolor beautifulsoup4 PySocks dulwich requests-pkcs12; \
@@ -273,11 +327,11 @@ RUN set -eux; \
     printf '%s\n' \
     'BINWALK3 carving triage: binwalk3 <file>  (Rust v3; not binwalk)' \
     'YARA-X scan: yr scan <rule.yar> <target>  (binary is yr)' \
-    'CHECKSEC mitigations ELF/PE/Mach-O: checksec --help  (Rust; JSON-capable)' \
+    'CHECKSEC mitigations ELF/PE/Mach-O: checksec --help  (static release binary; JSON-capable)' \
     'DIEC packer/compiler: diec --json <file>' \
     'PCAP offline: tshark -r <file.pcap>  (live capture blocked by cap-drop)' \
     'UNBLOB extraction: unblob <blob>  (check: unblob --show-external-dependencies)' \
-    'PWN: pwninit (setup) | ropr (fast x86 gadgets) | pwntools ROP (general/ARM fallback)' \
+    'PWN: pwninit (setup) | ropper (multi-architecture gadgets) | pwntools ROP (general/ARM fallback)' \
     'GDB: gdb --batch ... | pwndbg: source /opt/pwndbg/gdbinit.py inside gdb' \
     'WEB: ffuf (fuzz) + feroxbuster (recursive) | -w /usr/share/wordlists/flagagent-common.txt' \
     'WEB trio: httpx-toolkit (probe) | katana (crawl) | nuclei (scan)' \
@@ -317,7 +371,7 @@ RUN set -eux; \
         tcpflow ngrep pcapfix mmls ewfinfo sqlite3 testdisk photorec qemu-img vol mutool qpdf \
         pdftotext pdfid pdf-parser oledump ffmpeg ffprobe sox multimon-ng \
         convert chainsaw hashid hashcat john fcrackzip RsaCtfTool yafu xortool floss \
-        bkcrack hash_extender ciphey pwninit checksec ropr patchelf r2 \
+        bkcrack hash_extender ciphey pwninit checksec ropper patchelf r2 \
         qemu-aarch64 diec upx zsteg seccomp-tools one_gadget stegseek steghide pngcheck tesseract \
         zbarimg ffuf feroxbuster httpx-toolkit katana x8 sqlmap whatweb testssl \
         nuclei nikto dalfox commix jwt_tool git-dumper phpggc wpscan websocat mitmdump \
@@ -346,7 +400,7 @@ RUN set -eux; \
     impacket-secretsdump --help > /dev/null; \
     httpx-toolkit -version > /dev/null; \
     testssl --banner > /dev/null 2>&1; \
-    ciphey --help > /dev/null; ropr --help > /dev/null; \
+    ciphey --help > /dev/null; ropper --help > /dev/null; \
     pwninit --help > /dev/null; x8 --help > /dev/null; \
     gdb --batch -nx -ex 'source /opt/pwndbg/gdbinit.py' -ex quit /bin/true; \
     yafu 'factor(91)' | grep -qE '\\b(7|13)\\b'; \
@@ -356,7 +410,7 @@ RUN set -eux; \
     rm -f /tmp/t.yar /tmp/s.bin /tmp/t.pcap /tmp/unblob.deps; \
     echo SMOKE-OK
 RUN set -eux; \
-    for b in flatter bkcrack hash_extender yafu RsaCtfTool yr fq checksec ropr pwninit; do \
+    for b in flatter bkcrack hash_extender yafu RsaCtfTool yr fq checksec ropper pwninit; do \
         ldd "$(command -v "$b")" 2>/dev/null | grep 'not found' && exit 1 || true; \
     done; \
     echo LDD-OK
