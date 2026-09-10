@@ -53,6 +53,7 @@ RUN apt-get update \
         patchelf \
         pdf-parser \
         pdfid \
+        ncat \
         phpggc \
         pngcheck \
         poppler-utils \
