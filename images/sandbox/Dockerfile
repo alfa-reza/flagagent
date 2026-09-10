@@ -21,7 +21,9 @@ FROM kalilinux/kali-rolling@sha256:c6d78f57ebfdd9fec428a8b04f74876e66fddd08dfd32
 ARG DEBIAN_FRONTEND=noninteractive
 RUN set -eux; \
     apt-get update; \
-    apt-get install --no-install-recommends --yes cargo pkg-config libssl-dev; \
+    apt-get install --no-install-recommends --yes cargo pkg-config libssl-dev ca-certificates; \
+    update-ca-certificates; \
+    test -s /etc/ssl/certs/ca-certificates.crt; \
     rm -rf /var/lib/apt/lists/*
 RUN set -eux; \
     cargo install --root /opt/rust-out --git https://github.com/VirusTotal/yara-x.git --tag v1.20.0 --locked yara-x-cli; \
