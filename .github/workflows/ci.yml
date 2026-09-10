@@ -46,12 +46,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
       - name: Build sandbox image
-        run: |  
-          docker build \
-          --no-cache \
-          --progress=plain \
-          -t flagagent-sandbox:dev \
-            images/sandbox
+        run: docker build -t flagagent-sandbox:dev images/sandbox
       - name: Build target image
         run: docker build -t flagagent-target:dev images/target
       - name: Real Docker integration
