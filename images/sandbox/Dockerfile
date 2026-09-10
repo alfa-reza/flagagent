@@ -96,6 +96,7 @@ RUN apt-get update \
         yara \
         zip \
         zstd \
+    && ln -s /usr/bin/binwalk3 /usr/local/bin/binwalk \
     && rm -rf /var/lib/apt/lists/*
 
 # FlagAgent supplies its own long-lived container command; do not add an
@@ -110,11 +111,13 @@ RUN printf '%s\n' \
     > /tools.txt
 
 # Verify that every executable expected by FlagAgent actually exists.
-RUN while IFS= read -r tool; do \
+RUN missing=0; \
+    while IFS= read -r tool; do \
         if ! command -v "$tool" >/dev/null 2>&1; then \
             echo "ERROR: required tool not found: $tool" >&2; \
-            exit 1; \
+            missing=1; \
         fi; \
-    done < /tools.txt
+    done < /tools.txt; \
+    exit "$missing"
 
 CMD ["sleep", "infinity"]
