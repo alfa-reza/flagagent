@@ -1,22 +1,98 @@
 FROM kalilinux/kali-rolling
 
 ARG DEBIAN_FRONTEND=noninteractive
+
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        7zip 7zip-rar afftools androguard binutils binwalk3 bulk-extractor \
-        build-essential capstone-tool chainsaw cmake commix cryptography curl \
-        detect-it-easy exiftool ffmpeg ffuf foremost fplll fpylll fq feroxbuster \
-        file gdb gdb-multiarch git gmpy2 grep hashcat hashid hashcat-utils \
-        imagemagick impacket-scripts jq keystone-engine katana ltrace lz4 make \
-        mergecap multimon-ng nasm netcat-openbsd nikto nmap oletools openssl \
-        patchelf pdf-parser pdfid phpggc pngcheck poppler-utils pwntools \
-        python3 python3-cryptography python3-pycryptodome python3-sympy \
-        python3-z3 qemu-utils qpdf radare2 readpe ripgrep ropper sleuthkit \
-        socat sqlite3 strace steghide stegseek subfinder sympy testdisk \
-        testssl.sh tshark tcpdump tcpflow tesseract-ocr unzip unblob upx-ucl \
-        vim-common wget whatweb xxd yara zip zstd \
+        7zip \
+        7zip-rar \
+        androguard \
+        binutils \
+        binwalk3 \
+        bulk-extractor \
+        build-essential \
+        capstone-tool \
+        chainsaw \
+        cmake \
+        commix \
+        curl \
+        detect-it-easy \
+        exiftool \
+        ffmpeg \
+        ffuf \
+        foremost \
+        fplll-tools \
+        fq \
+        feroxbuster \
+        file \
+        gdb \
+        gdb-multiarch \
+        git \
+        grep \
+        hashcat \
+        hashid \
+        hashcat-utils \
+        imagemagick \
+        impacket-scripts \
+        jq \
+        katana \
+        ltrace \
+        lz4 \
+        make \
+        multimon-ng \
+        nasm \
+        netcat-openbsd \
+        nikto \
+        nmap \
+        oletools \
+        openssl \
+        patchelf \
+        pdf-parser \
+        pdfid \
+        phpggc \
+        pngcheck \
+        poppler-utils \
+        python3 \
+        python3-cryptography \
+        python3-fpylll \
+        python3-gmpy2 \
+        python3-keystone-engine \
+        python3-pycryptodome \
+        python3-pwntools \
+        python3-sympy \
+        python3-z3 \
+        qemu-utils \
+        qpdf \
+        radare2 \
+        readpe \
+        ripgrep \
+        ropper \
+        sleuthkit \
+        socat \
+        sqlite3 \
+        strace \
+        steghide \
+        stegseek \
+        subfinder \
+        testdisk \
+        testssl.sh \
+        tshark \
+        tcpdump \
+        tcpflow \
+        tesseract-ocr \
+        unzip \
+        unblob \
+        upx-ucl \
+        vim-common \
+        wget \
+        whatweb \
+        wireshark-common \
+        xxd \
+        yara \
+        zip \
+        zstd \
     && rm -rf /var/lib/apt/lists/*
 
 # FlagAgent supplies its own long-lived container command; do not add an
@@ -29,5 +105,13 @@ RUN printf '%s\n' \
     ffmpeg ffprobe convert tesseract hashcat r2 ropper patchelf ffuf \
     feroxbuster nikto nmap whatweb subfinder katana phpggc commix chainsaw \
     > /tools.txt
+
+# Verify that every executable expected by FlagAgent actually exists.
+RUN while IFS= read -r tool; do \
+        if ! command -v "$tool" >/dev/null 2>&1; then \
+            echo "ERROR: required tool not found: $tool" >&2; \
+            exit 1; \
+        fi; \
+    done < /tools.txt
 
 CMD ["sleep", "infinity"]
