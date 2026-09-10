@@ -57,8 +57,8 @@ RUN set -eux; \
     mkdir -p /opt/stage/bin /opt/stage/lib /opt/stage/sha
 RUN set -eux; \
     git init -q /tmp/flatter; \
-    git -C /tmp/flatter fetch --depth 1 origin d2b8026f29b4a69e987b15d4b240f8a5053275d3; \
-    git -C /tmp/flatter checkout -q FETCH_HEAD; \
+    git -C /tmp/flatter fetch --depth=1 --no-tags https://github.com/keeganryan/flatter.git d2b8026f29b4a69e987b15d4b240f8a5053275d3; \
+    git -C /tmp/flatter checkout --detach -q FETCH_HEAD; \
     test "$(git -C /tmp/flatter rev-parse HEAD)" = "d2b8026f29b4a69e987b15d4b240f8a5053275d3"; \
     echo d2b8026f29b4a69e987b15d4b240f8a5053275d3 > /opt/stage/sha/flatter.BUILD_SHA; \
     cmake -S /tmp/flatter -B /tmp/flatter/build -DCMAKE_BUILD_TYPE=Release; \
@@ -70,8 +70,8 @@ RUN set -eux; \
 # Canonical upstream kimci86 (not the owenjamesbecker fork).
 RUN set -eux; \
     git init -q /tmp/bkcrack; \
-    git -C /tmp/bkcrack fetch --depth 1 origin f7e61bab2dd5976e252d8451527c66a6342b68d2; \
-    git -C /tmp/bkcrack checkout -q FETCH_HEAD; \
+    git -C /tmp/bkcrack fetch --depth=1 --no-tags https://github.com/kimci86/bkcrack.git f7e61bab2dd5976e252d8451527c66a6342b68d2; \
+    git -C /tmp/bkcrack checkout --detach -q FETCH_HEAD; \
     test "$(git -C /tmp/bkcrack rev-parse HEAD)" = "f7e61bab2dd5976e252d8451527c66a6342b68d2"; \
     echo f7e61bab2dd5976e252d8451527c66a6342b68d2 > /opt/stage/sha/bkcrack.BUILD_SHA; \
     cmake -S /tmp/bkcrack -B /tmp/bkcrack/build -DCMAKE_BUILD_TYPE=Release; \
@@ -80,8 +80,8 @@ RUN set -eux; \
     rm -rf /tmp/bkcrack
 RUN set -eux; \
     git init -q /tmp/hash_extender; \
-    git -C /tmp/hash_extender fetch --depth 1 origin f00b1a02eca02b0907e26726f7efe437bc396aa4; \
-    git -C /tmp/hash_extender checkout -q FETCH_HEAD; \
+    git -C /tmp/hash_extender fetch --depth=1 --no-tags https://github.com/iagox86/hash_extender.git f00b1a02eca02b0907e26726f7efe437bc396aa4; \
+    git -C /tmp/hash_extender checkout --detach -q FETCH_HEAD; \
     test "$(git -C /tmp/hash_extender rev-parse HEAD)" = "f00b1a02eca02b0907e26726f7efe437bc396aa4"; \
     echo f00b1a02eca02b0907e26726f7efe437bc396aa4 > /opt/stage/sha/hash_extender.BUILD_SHA; \
     make -C /tmp/hash_extender -j"$(nproc)"; \
@@ -90,8 +90,8 @@ RUN set -eux; \
 # Official YAFU build: cp config.mk.example config.mk && make yafu.
 RUN set -eux; \
     git init -q /tmp/yafu; \
-    git -C /tmp/yafu fetch --depth 1 origin 825c5db3f9f6d141bde88f67571479a96c9cd35b; \
-    git -C /tmp/yafu checkout -q FETCH_HEAD; \
+    git -C /tmp/yafu fetch --depth=1 --no-tags https://github.com/bbuhrow/yafu.git 825c5db3f9f6d141bde88f67571479a96c9cd35b; \
+    git -C /tmp/yafu checkout --detach -q FETCH_HEAD; \
     test "$(git -C /tmp/yafu rev-parse HEAD)" = "825c5db3f9f6d141bde88f67571479a96c9cd35b"; \
     echo 825c5db3f9f6d141bde88f67571479a96c9cd35b > /opt/stage/sha/yafu.BUILD_SHA; \
     cp /tmp/yafu/config.mk.example /tmp/yafu/config.mk; \
@@ -218,8 +218,8 @@ RUN set -eux; gem install --no-document zsteg seccomp-tools one_gadget
 # rsacrack/RsaCtfTool entry points exist (a bare symlink no longer works).
 RUN set -eux; \
     git init -q /opt/RsaCtfTool; \
-    git -C /opt/RsaCtfTool fetch --depth 1 origin af87bb487666b1bf3070e1bb058d97b78a342808; \
-    git -C /opt/RsaCtfTool checkout -q FETCH_HEAD; \
+    git -C /opt/RsaCtfTool fetch --depth=1 --no-tags https://github.com/RsaCtfTool/RsaCtfTool.git af87bb487666b1bf3070e1bb058d97b78a342808; \
+    git -C /opt/RsaCtfTool checkout --detach -q FETCH_HEAD; \
     test "$(git -C /opt/RsaCtfTool rev-parse HEAD)" = "af87bb487666b1bf3070e1bb058d97b78a342808"; \
     echo af87bb487666b1bf3070e1bb058d97b78a342808 > /opt/build-sha/RsaCtfTool.BUILD_SHA; \
     /opt/flagagent-py/bin/pip install --no-cache-dir /opt/RsaCtfTool; \
@@ -231,8 +231,8 @@ RUN set -eux; \
     apt-get install --no-install-recommends --yes git sudo; \
     rm -rf /var/lib/apt/lists/*; \
     git init -q /opt/pwndbg; \
-    git -C /opt/pwndbg fetch --depth 1 origin f4de22244b7e9f0aeda26a92208c42edaca2f8d8; \
-    git -C /opt/pwndbg checkout -q FETCH_HEAD; \
+    git -C /opt/pwndbg fetch --depth=1 --no-tags https://github.com/pwndbg/pwndbg.git f4de22244b7e9f0aeda26a92208c42edaca2f8d8; \
+    git -C /opt/pwndbg checkout --detach -q FETCH_HEAD; \
     test "$(git -C /opt/pwndbg rev-parse HEAD)" = "f4de22244b7e9f0aeda26a92208c42edaca2f8d8"; \
     echo "f4de22244b7e9f0aeda26a92208c42edaca2f8d8 (tag 2026.07.29)" > /opt/build-sha/pwndbg.BUILD_SHA; \
     /opt/pwndbg/setup.sh; \
@@ -243,21 +243,21 @@ RUN set -eux; \
 # wrappers force that interpreter because `env python3` cannot see the venv.
 RUN set -eux; \
     git init -q /opt/DidierStevensSuite; \
-    git -C /opt/DidierStevensSuite fetch --depth 1 origin dea6816048fb2fd3a3597f2e131449fc87f60138; \
-    git -C /opt/DidierStevensSuite checkout -q FETCH_HEAD; \
+    git -C /opt/DidierStevensSuite fetch --depth=1 --no-tags https://github.com/DidierStevens/DidierStevensSuite.git dea6816048fb2fd3a3597f2e131449fc87f60138; \
+    git -C /opt/DidierStevensSuite checkout --detach -q FETCH_HEAD; \
     test "$(git -C /opt/DidierStevensSuite rev-parse HEAD)" = "dea6816048fb2fd3a3597f2e131449fc87f60138"; \
     echo dea6816048fb2fd3a3597f2e131449fc87f60138 > /opt/build-sha/DidierStevensSuite.BUILD_SHA; \
     ln -sf /opt/DidierStevensSuite/oledump.py /usr/local/bin/oledump; \
     git init -q /opt/jwt_tool; \
-    git -C /opt/jwt_tool fetch --depth 1 origin 3bc7407cf2222d6a821dcc19c776e5a1b1cb9a9b; \
-    git -C /opt/jwt_tool checkout -q FETCH_HEAD; \
+    git -C /opt/jwt_tool fetch --depth=1 --no-tags https://github.com/ticarpi/jwt_tool.git 3bc7407cf2222d6a821dcc19c776e5a1b1cb9a9b; \
+    git -C /opt/jwt_tool checkout --detach -q FETCH_HEAD; \
     test "$(git -C /opt/jwt_tool rev-parse HEAD)" = "3bc7407cf2222d6a821dcc19c776e5a1b1cb9a9b"; \
     echo 3bc7407cf2222d6a821dcc19c776e5a1b1cb9a9b > /opt/build-sha/jwt_tool.BUILD_SHA; \
     printf '#!/bin/sh\nexec /opt/flagagent-py/bin/python /opt/jwt_tool/jwt_tool.py "$@"\n' > /usr/local/bin/jwt_tool; \
     chmod 0755 /usr/local/bin/jwt_tool; \
     git init -q /opt/git-dumper; \
-    git -C /opt/git-dumper fetch --depth 1 origin 2b47da1973a9f0640b47e0a1ac2a6567751fe253; \
-    git -C /opt/git-dumper checkout -q FETCH_HEAD; \
+    git -C /opt/git-dumper fetch --depth=1 --no-tags https://github.com/arthaud/git-dumper.git 2b47da1973a9f0640b47e0a1ac2a6567751fe253; \
+    git -C /opt/git-dumper checkout --detach -q FETCH_HEAD; \
     test "$(git -C /opt/git-dumper rev-parse HEAD)" = "2b47da1973a9f0640b47e0a1ac2a6567751fe253"; \
     echo 2b47da1973a9f0640b47e0a1ac2a6567751fe253 > /opt/build-sha/git-dumper.BUILD_SHA; \
     printf '#!/bin/sh\nexec /opt/flagagent-py/bin/python /opt/git-dumper/git_dumper.py "$@"\n' > /usr/local/bin/git-dumper; \
@@ -270,8 +270,8 @@ RUN set -eux; \
 # the rule corpus must not drift between rebuilds).
 RUN set -eux; \
     git init -q /opt/nuclei-templates; \
-    git -C /opt/nuclei-templates fetch --depth 1 origin e5f19e6144135e107962bb943231413796fd7fe7; \
-    git -C /opt/nuclei-templates checkout -q FETCH_HEAD; \
+    git -C /opt/nuclei-templates fetch --depth=1 --no-tags https://github.com/projectdiscovery/nuclei-templates.git e5f19e6144135e107962bb943231413796fd7fe7; \
+    git -C /opt/nuclei-templates checkout --detach -q FETCH_HEAD; \
     test "$(git -C /opt/nuclei-templates rev-parse HEAD)" = "e5f19e6144135e107962bb943231413796fd7fe7"; \
     echo "e5f19e6144135e107962bb943231413796fd7fe7 (tag v10.4.8)" > /opt/build-sha/nuclei-templates.BUILD_SHA; \
     test "$(find /opt/nuclei-templates -name '*.yaml' | wc -l)" -gt 1000; \
