@@ -8,6 +8,8 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         7zip \
         7zip-rar \
+        openssh-client \
+        bsdextrautils \
         androguard \
         binutils \
         binwalk3 \
