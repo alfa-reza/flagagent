@@ -10,13 +10,17 @@ RUN apt-get update \
         7zip-rar \
         openssh-client \
         bsdextrautils \
+        afflib-tools \
         androguard \
         binutils \
         binwalk3 \
         bulk-extractor \
         build-essential \
         capstone-tool \
+        smbclient \
         chainsaw \
+        ewf-tools \
+        netexec \
         cmake \
         commix \
         curl \
@@ -39,6 +43,10 @@ RUN apt-get update \
         imagemagick \
         impacket-scripts \
         jq \
+        john \
+        httpx-toolkit \
+        wpscan \
+        sqlmap \
         katana \
         ltrace \
         lz4 \
@@ -68,6 +76,7 @@ RUN apt-get update \
         python3-z3 \
         qemu-utils \
         qpdf \
+        pcapfix \
         radare2 \
         readpe \
         ripgrep \
