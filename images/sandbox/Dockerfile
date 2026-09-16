@@ -1,7 +1,10 @@
+ARG UV_VERSION=0.12.15
+
+FROM ghcr.io/astral-sh/uv:${UV_VERSION} AS uv
+
 FROM kalilinux/kali-rolling
 
 ARG DEBIAN_FRONTEND=noninteractive
-ARG UV_VERSION=0.12.15
 
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
@@ -129,8 +132,8 @@ RUN missing=0; \
         fi; \
     done < /tools.txt; \
     exit "$missing"
-
-COPY --from=ghcr.io/astral-sh/uv:${UV_VERSION} /uv /uvx /usr/local/bin/
+    
+COPY --from=uv /uv /uvx /usr/local/bin/
 
 ENV UV_TOOL_BIN_DIR=/opt/uv-bin \
     UV_TOOL_DIR=/opt/uv-tools \
@@ -141,8 +144,6 @@ RUN mkdir -p /opt/uv-bin /opt/uv-tools \
 RUN uv tool install xortool
 RUN uv tool install git-dumper
 RUN uv tool install apkid
-
-# jwt_tool: install into its own venv and expose a thin CLI wrapper on PATH.
 RUN git clone --depth 1 https://github.com/ticarpi/jwt_tool.git /opt/jwt_tool \
     && uv venv --python 3 /opt/jwt_tool/.venv \
     && uv pip install \
@@ -154,6 +155,7 @@ RUN git clone --depth 1 https://github.com/ticarpi/jwt_tool.git /opt/jwt_tool \
     && chmod +x /usr/local/bin/jwt_tool
 
 # Verify Python tools
+
 RUN set -eux; \
     command -v uv; \
     command -v uvx; \
