@@ -143,7 +143,7 @@ RUN mkdir -p /opt/uv-bin /opt/uv-tools \
     && uv --version
 RUN uv tool install xortool
 RUN uv tool install git-dumper
-RUN uv tool install apkid
+RUN uv tool install apkid --with "yara-python-dex @ git+https://github.com/MobSF/yara-python-dex.git"
 RUN git clone --depth 1 https://github.com/ticarpi/jwt_tool.git /opt/jwt_tool \
     && uv venv --python 3 /opt/jwt_tool/.venv \
     && uv pip install \
