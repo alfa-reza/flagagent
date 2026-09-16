@@ -148,7 +148,8 @@ RUN git clone --depth 1 https://github.com/ticarpi/jwt_tool.git /opt/jwt_tool \
         -r /opt/jwt_tool/requirements.txt \
     && chmod +x /opt/jwt_tool/jwt_tool.py \
     && ln -s /opt/jwt_tool/.venv/bin/python /usr/local/bin/jwt-tool-python \
-    && cat > /usr/local/bin/jwt_tool <<'EOF'
+    && printf '#!/bin/sh\nexec /opt/jwt_tool/.venv/bin/python /opt/jwt_tool/jwt_tool.py "$@"\n' > /usr/local/bin/jwt_tool \
+    && chmod +x /usr/local/bin/jwt_tool
 #!/bin/sh
 exec /opt/jwt_tool/.venv/bin/python /opt/jwt_tool/jwt_tool.py "$@"
 EOF
