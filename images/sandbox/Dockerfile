@@ -129,7 +129,7 @@ RUN missing=0; \
         fi; \
     done < /tools.txt; \
     exit "$missing"
-    
+
 COPY --from=ghcr.io/astral-sh/uv:${UV_VERSION} /uv /uvx /usr/local/bin/
 
 ENV UV_TOOL_BIN_DIR=/opt/uv-bin \
@@ -141,6 +141,8 @@ RUN mkdir -p /opt/uv-bin /opt/uv-tools \
 RUN uv tool install xortool
 RUN uv tool install git-dumper
 RUN uv tool install apkid
+
+# jwt_tool: install into its own venv and expose a thin CLI wrapper on PATH.
 RUN git clone --depth 1 https://github.com/ticarpi/jwt_tool.git /opt/jwt_tool \
     && uv venv --python 3 /opt/jwt_tool/.venv \
     && uv pip install \
@@ -150,13 +152,8 @@ RUN git clone --depth 1 https://github.com/ticarpi/jwt_tool.git /opt/jwt_tool \
     && ln -s /opt/jwt_tool/.venv/bin/python /usr/local/bin/jwt-tool-python \
     && printf '#!/bin/sh\nexec /opt/jwt_tool/.venv/bin/python /opt/jwt_tool/jwt_tool.py "$@"\n' > /usr/local/bin/jwt_tool \
     && chmod +x /usr/local/bin/jwt_tool
-#!/bin/sh
-exec /opt/jwt_tool/.venv/bin/python /opt/jwt_tool/jwt_tool.py "$@"
-EOF
-    && chmod +x /usr/local/bin/jwt_tool
 
 # Verify Python tools
-
 RUN set -eux; \
     command -v uv; \
     command -v uvx; \
@@ -177,100 +174,5 @@ RUN printf '%s\n' \
     "apkid" \
     "jwt_tool" \
     > /python-tools.txt
-
-CMD ["sleep", "infinity"]        gdb-multiarch \
-        git \
-        grep \
-        hashcat \
-        hashid \
-        hashcat-utils \
-        imagemagick \
-        impacket-scripts \
-        jq \
-        john \
-        httpx-toolkit \
-        wpscan \
-        sqlmap \
-        katana \
-        ltrace \
-        lz4 \
-        make \
-        multimon-ng \
-        nasm \
-        netcat-openbsd \
-        nikto \
-        nmap \
-        oletools \
-        openssl \
-        patchelf \
-        pdf-parser \
-        pdfid \
-        ncat \
-        phpggc \
-        pngcheck \
-        poppler-utils \
-        python3 \
-        python3-cryptography \
-        python3-fpylll \
-        python3-gmpy2 \
-        python3-keystone-engine \
-        python3-pycryptodome \
-        python3-pwntools \
-        python3-sympy \
-        python3-z3 \
-        qemu-utils \
-        qpdf \
-        pcapfix \
-        radare2 \
-        readpe \
-        ripgrep \
-        ropper \
-        sleuthkit \
-        socat \
-        sqlite3 \
-        strace \
-        steghide \
-        stegseek \
-        subfinder \
-        testdisk \
-        testssl.sh \
-        tshark \
-        tcpdump \
-        tcpflow \
-        tesseract-ocr \
-        unzip \
-        unblob \
-        upx-ucl \
-        vim-common \
-        wget \
-        whatweb \
-        wireshark-common \
-        xxd \
-        yara \
-        zip \
-        zstd \
-    && ln -s /usr/bin/binwalk3 /usr/local/bin/binwalk \
-    && rm -rf /var/lib/apt/lists/*
-
-# FlagAgent supplies its own long-lived container command; do not add an
-# ENTRYPOINT that would conflict with docker exec / the executor lifecycle.
-RUN printf '%s\n' \
-    file grep rg xxd hexdump dd jq fq 7z zip unzip tar gzip xz zstd lz4 \
-    curl wget git ssh openssl nc nmap ncat socat python3 gcc g++ make cmake \
-    nasm gdb gdb-multiarch strace ltrace exiftool binwalk unblob \
-    bulk_extractor foremost tshark tcpdump tcpflow sqlite3 qemu-img \
-    ffmpeg ffprobe convert tesseract hashcat r2 ropper patchelf ffuf \
-    feroxbuster nikto nmap whatweb subfinder katana phpggc commix chainsaw \
-    > /tools.txt
-
-# Verify that every executable expected by FlagAgent actually exists.
-RUN missing=0; \
-    while IFS= read -r tool; do \
-        if ! command -v "$tool" >/dev/null 2>&1; then \
-            echo "ERROR: required tool not found: $tool" >&2; \
-            missing=1; \
-        fi; \
-    done < /tools.txt; \
-    exit "$missing"
 
 CMD ["sleep", "infinity"]
