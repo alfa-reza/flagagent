@@ -70,6 +70,7 @@ RUN apt-get update \
         pngcheck \
         poppler-utils \
         python3 \
+        python3-dev \
         python3-cryptography \
         python3-fpylll \
         python3-gmpy2 \
